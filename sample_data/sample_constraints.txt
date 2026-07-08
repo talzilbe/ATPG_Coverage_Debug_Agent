@@ -1,0 +1,21 @@
+# ---------------------------------------------------------------------------
+# sample_data/sample_constraints.txt
+# Synthetic constraint file. The parser detects intent by keyword.
+# Recognised keywords include:
+#   force / constant / tie / disable / block / constrain
+#   clock / reset / test_en / scan_en
+# Tessent-style "add_input_constraints <signal> C0|C1|CX" is also accepted.
+# ---------------------------------------------------------------------------
+
+# Hold test scan-enable inactive during capture (affects controllability).
+constrain test_se C0
+
+# Tie the select line to a constant for this ATPG run.
+force sel 0
+
+# Clock/reset are restricted (handled by the test procedure, not ATPG).
+clock clk
+reset rst_n
+
+# Block a control path that we know is unused in this mode.
+block din

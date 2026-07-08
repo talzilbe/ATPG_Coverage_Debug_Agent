@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# sample_data/sample_faults.txt
+# Synthetic Tessent-style fault list.
+# Format used here: <class> <stuck_value> <hierarchical_object_path>
+# Supported classes: DS DI TI AU UO UC
+# Lines starting with '#' or '//' are comments.
+# ---------------------------------------------------------------------------
+
+DS 0 top/u_alu/U1/Y
+DS 1 top/u_alu/U2/Y
+DI 0 top/u_alu/U3/Y
+
+# Tied/constant hardware
+TI 0 top/u_alu/U_tie/Y
+
+# Coverage-loss faults to be root-caused:
+UC 1 top/u_alu/reg_scan/SE        # controllability tied to test-enable
+UO 0 top/u_ctrl/reg_nonscan/Q     # non-scan flop blocks observation
+AU 1 top/u_ctrl/U5/Y              # ATPG-untestable in control cone
+UC 0 top/u_alu/U3/S               # select line constrained
+AU 0 top/u_ctrl/U4/Y              # blocked propagation through non-scan
+UO 1 top/u_alu/U2/A               # observation blocked downstream

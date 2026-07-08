@@ -1,0 +1,11 @@
+# Core GUI framework
+PySide6>=6.5
+
+# Optional but recommended: faster connectivity graph handling.
+networkx>=3.0
+
+# Optional: convenient CSV/table generation (a pure-stdlib fallback exists).
+pandas>=2.0
+
+# Testing
+pytest>=7.0

@@ -1,0 +1,22 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / local history
+.history
+.history/
+.vscode/
+
+# Generated analysis outputs
+report.csv
+report.md
+
+# OS / misc
+.DS_Store
+Thumbs.db
