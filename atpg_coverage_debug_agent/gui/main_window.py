@@ -29,6 +29,7 @@ from ..models import AnalysisReport, FaultAnalysisResult
 from ..reporting.csv_report import write_csv
 from ..reporting.html_report import build_html_report
 from ..reporting.markdown_report import write_markdown
+from ..reporting.session_report import load_report, save_report
 from ..skills.manager import SkillManager
 from .details_panel import DetailsPanel
 from .skills_panel import SkillsPanel
@@ -153,10 +154,21 @@ class MainWindow(QMainWindow):
         self.md_btn.clicked.connect(self.on_export_md)
         self.csv_btn = QPushButton("Export CSV")
         self.csv_btn.clicked.connect(self.on_export_csv)
+        self.save_report_btn = QPushButton("Save Report")
+        self.save_report_btn.setToolTip(
+            "Save the full analysis to a JSON file you can reload later "
+            "without re-running Analyze.")
+        self.save_report_btn.clicked.connect(self.on_save_report)
+        self.load_report_btn = QPushButton("Load Report")
+        self.load_report_btn.setToolTip(
+            "Load a previously saved report and work on it (tables + AI agent) "
+            "without re-analyzing.")
+        self.load_report_btn.clicked.connect(self.on_load_report)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.on_clear)
         for b in (self.analyze_btn, self.cancel_btn, self.md_btn,
-                  self.csv_btn, self.clear_btn):
+                  self.csv_btn, self.save_report_btn, self.load_report_btn,
+                  self.clear_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         outer.addLayout(btn_row)
@@ -379,20 +391,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def _on_finished(self, report: AnalysisReport) -> None:
-        self._report = report
-        self._results = report.fault_results
         self.progress.setVisible(False)
         self.analyze_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self._apply_report(report)
+        n_skills = len(report.skill_results) if report.skill_results else 0
+        self.statusBar().showMessage(
+            f"Done. {report.summary.coverage_loss_count} coverage-loss faults. "
+            f"{n_skills} skill(s) ran.")
+
+    def _apply_report(self, report: AnalysisReport) -> None:
+        """Populate all views from *report* (shared by Analyze and Load)."""
+        self._report = report
+        self._results = report.fault_results
         self._set_export_enabled(True)
         self._populate(report)
         if report.skill_results:
             self.skills_panel.show_results(report.skill_results)
         self.agent_panel.set_report(report, self._skill_manager)
-        n_skills = len(report.skill_results) if report.skill_results else 0
-        self.statusBar().showMessage(
-            f"Done. {report.summary.coverage_loss_count} coverage-loss faults. "
-            f"{n_skills} skill(s) ran.")
 
     def _on_failed(self, message: str) -> None:
         self.progress.setVisible(False)
@@ -762,6 +778,40 @@ class MainWindow(QMainWindow):
     def _set_export_enabled(self, enabled: bool) -> None:
         self.md_btn.setEnabled(enabled)
         self.csv_btn.setEnabled(enabled)
+        self.save_report_btn.setEnabled(enabled)
+
+    def on_save_report(self) -> None:
+        if not self._report:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save report (JSON)",
+            self._default_path("atpg_report.json"), "ATPG report (*.json)")
+        if not path:
+            return
+        try:
+            save_report(self._report, path)
+        except OSError as exc:
+            self._error(f"Could not save report:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Report saved: {path}")
+
+    def on_load_report(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load report (JSON)",
+            self._default_path("atpg_report.json"),
+            "ATPG report (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            report = load_report(path)
+        except (OSError, ValueError) as exc:
+            self._error(f"Could not load report:\n{exc}")
+            return
+        self._apply_report(report)
+        self.statusBar().showMessage(
+            f"Report loaded: {path} — "
+            f"{report.summary.coverage_loss_count} coverage-loss faults. "
+            "Work on it without re-analyzing.")
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)

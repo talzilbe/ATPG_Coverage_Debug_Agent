@@ -257,3 +257,6 @@ class AnalysisReport:
     netlist: Any = None            # VerilogNetlist
     faults: Any = None             # List[FaultRecord]
     constraints: Any = None        # List[ConstraintRecord]
+    #: Compact instance-name adjacency (set for reloaded reports whose live
+    #: netlist object is gone, so path tracing still works).
+    adjacency: Any = None
