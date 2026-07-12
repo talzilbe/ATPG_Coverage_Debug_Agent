@@ -89,6 +89,58 @@ Then:
 
 ---
 
+## Using the AI Debug Agent
+
+The GUI includes an **AI Debug Agent** tab that turns the structural report into
+a natural-language, evidence-driven diagnosis and lets you **chat** about it.
+Two backends are supported:
+
+- **GitHub Copilot CLI** (default) — runs a local `copilot` subprocess; no
+  endpoint URL to configure.
+- **OpenAI-compatible HTTP endpoint** — e.g. an internal LLM gateway
+  (`base URL` + `model` + optional API key).
+
+### One-time setup for the Copilot CLI backend
+
+The Copilot CLI is **not** bundled with the repo (it is a large binary and is
+git-ignored). Install it yourself:
+
+```bash
+npm install -g @github/copilot
+# or download a release binary from https://github.com/github/copilot-cli/releases
+```
+
+Optionally keep the CLI's config/state off a quota-limited home directory:
+
+```bash
+export COPILOT_HOME=/path/with/space/copilot-home   # tcsh: setenv COPILOT_HOME ...
+```
+
+### Steps
+
+1. Run an analysis first (see **Running the GUI**) so a report exists.
+2. Open the **AI Debug Agent** tab → set **Backend** to *GitHub Copilot CLI*.
+3. Set the **Copilot CLI** path to your `copilot` executable (use **Browse…**).
+   Optionally pick a **CLI model** (`auto` is fine; the list is editable).
+4. Open the **Authentication** tab and sign in once (only for the CLI backend):
+   - **Sign in with device code** — open the shown URL, enter the code. On a
+     headless host with no system keychain, instead run `copilot login` in a
+     terminal and **accept plaintext storage**; **or**
+   - paste a **fine-grained PAT** (with the *Copilot Requests* permission) into
+     **Option A**. Classic `ghp_` tokens are not supported.
+   - Click **Check authentication** to confirm.
+5. Tick **Agentic mode** and click **Run Agentic Agent**. The analysis skills
+   run and the agent produces its A–F diagnosis. (Untick it for a single-shot
+   run, or use **Build Prompt Only** to copy the prompt into your own chat.)
+6. Use the **Follow-up Chat** box to ask questions about the diagnosis — the
+   conversation keeps the full analysis context.
+
+> Data leaves your machine only when you explicitly configure a backend. With
+> the Copilot CLI, prompts go through GitHub Copilot's authenticated service;
+> for an internal-only setup, use the HTTP backend pointed at your own gateway.
+
+---
+
 ## Running the CLI
 
 ```powershell
