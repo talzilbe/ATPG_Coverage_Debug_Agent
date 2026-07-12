@@ -54,6 +54,7 @@ class _InvestigativeSkill(SkillBase):
                 constraints=ctx.constraints,
                 netlist=ctx.netlist,
                 adjacency=getattr(ctx, "adjacency", None),
+                compare=getattr(ctx, "compare", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -174,3 +175,41 @@ class TracePathSkill(_InvestigativeSkill):
                 description=data["note"],
                 confidence="medium",
             )
+
+
+@register
+class RegressionSummarySkill(_InvestigativeSkill):
+    skill_id = "regression_summary"
+    tool_name = "regression_summary"
+    display_name = "Regression Summary (query)"
+    description = investigate.TOOL_SPECS["regression_summary"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        c = data.get("counts", {})
+        return (f"regression: +{c.get('regressed', 0)} regressed, "
+                f"-{c.get('fixed', 0)} fixed, {c.get('changed', 0)} changed "
+                f"(net {c.get('net_delta', 0)}).")
+
+
+@register
+class ListRegressedSkill(_InvestigativeSkill):
+    skill_id = "list_regressed"
+    tool_name = "list_regressed"
+    display_name = "List Regressed (query)"
+    description = investigate.TOOL_SPECS["list_regressed"]["description"]
+
+
+@register
+class ListFixedSkill(_InvestigativeSkill):
+    skill_id = "list_fixed"
+    tool_name = "list_fixed"
+    display_name = "List Fixed (query)"
+    description = investigate.TOOL_SPECS["list_fixed"]["description"]
+
+
+@register
+class ListChangedSkill(_InvestigativeSkill):
+    skill_id = "list_changed"
+    tool_name = "list_changed"
+    display_name = "List Changed (query)"
+    description = investigate.TOOL_SPECS["list_changed"]["description"]

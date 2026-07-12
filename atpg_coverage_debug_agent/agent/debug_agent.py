@@ -433,7 +433,8 @@ class DebugAgent:
             {"role": "system", "content": AGENTIC_SYSTEM_PROMPT},
             {"role": "user",
              "content": build_user_payload(report, self.config.max_faults,
-                                           agentic=True)},
+                                           agentic=True)
+             + _regression_note(getattr(ctx, "compare", None))},
         ]
 
         # Loop budget: cap total tool calls and cache identical calls so the
@@ -591,7 +592,8 @@ class DebugAgent:
         """
         evidence = investigate.export_evidence(
             ctx.fault_results, ctx.constraints, ctx.netlist,
-            adjacency=getattr(ctx, "adjacency", None))
+            adjacency=getattr(ctx, "adjacency", None),
+            compare=getattr(ctx, "compare", None))
         ev_fd, ev_path = tempfile.mkstemp(prefix="atpg_evidence_", suffix=".json")
         with os.fdopen(ev_fd, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)
@@ -629,6 +631,7 @@ class DebugAgent:
             "why_blocked(fault=...), trace_path(from_instance=..., "
             "to_instance=...)). Every result is Observed/Derived structural "
             "fact. When you have enough evidence, produce the full A-F report.")
+        payload += _regression_note(getattr(ctx, "compare", None))
 
         emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")
         try:
@@ -811,6 +814,20 @@ def is_cli_auth_error(message: str) -> bool:
         "copilot_github_token",
     )
     return any(sig in low for sig in signatures)
+
+
+def _regression_note(compare: Optional[dict]) -> str:
+    """Prompt note telling the model a baseline is loaded (regression mode)."""
+    if not compare:
+        return ""
+    label = compare.get("label") or "baseline"
+    n = len(compare.get("faults", []) or [])
+    return (
+        "\n\n## REGRESSION MODE\n"
+        f"A baseline report '{label}' ({n} coverage-loss faults) is loaded. "
+        "Use the regression tools (regression_summary, list_regressed, "
+        "list_fixed, list_changed) to determine what changed versus the "
+        "baseline before concluding.")
 
 
 def _serialize_skill_result(result: Any) -> str:

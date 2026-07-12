@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from . import regression
+
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers
@@ -364,23 +366,28 @@ def build_adjacency(netlist: Any) -> Dict[str, List[str]]:
 
 def export_evidence(fault_results: Any, constraints: Any,
                     netlist: Any,
-                    adjacency: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+                    adjacency: Optional[Dict[str, List[str]]] = None,
+                    compare: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Serialise everything the investigative tools need into a plain dict.
 
     The result is JSON-serialisable so it can be written to a file and read by a
     separate MCP server process. When *netlist* is None, a caller-supplied
-    *adjacency* (e.g. from a reloaded report) is used for path tracing.
+    *adjacency* (e.g. from a reloaded report) is used for path tracing. When a
+    *compare* baseline payload is given, the regression tools are enabled.
     """
     if netlist is not None:
         adj = build_adjacency(netlist)
     else:
         adj = adjacency or {}
-    return {
+    evidence = {
         "faults": [serialize_fault_result(fr, full=True)
                    for fr in (fault_results or [])],
         "constraints": [serialize_constraint(c) for c in (constraints or [])],
         "adjacency": adj,
     }
+    if compare:
+        evidence["compare"] = compare
+    return evidence
 
 
 class _Bag:
@@ -515,18 +522,77 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                           "description": "max hops to search"},
         },
     },
+    "regression_summary": {
+        "description": (
+            "Summarise the regression vs the loaded baseline report: counts of "
+            "regressed / fixed / changed coverage-loss faults, net delta, and "
+            "per-class deltas. Requires a comparison report to be loaded."),
+        "params": {},
+    },
+    "list_regressed": {
+        "description": (
+            "List faults that are coverage-loss now but were NOT in the "
+            "baseline report (new coverage loss). Requires a comparison "
+            "report."),
+        "params": {
+            "limit": {"type": "int", "default": 50,
+                      "description": "max rows to return"},
+        },
+    },
+    "list_fixed": {
+        "description": (
+            "List faults that were coverage-loss in the baseline report but no "
+            "longer are (improvements). Requires a comparison report."),
+        "params": {
+            "limit": {"type": "int", "default": 50,
+                      "description": "max rows to return"},
+        },
+    },
+    "list_changed": {
+        "description": (
+            "List faults present in both reports whose fault class or root "
+            "cause changed. Requires a comparison report."),
+        "params": {
+            "limit": {"type": "int", "default": 50,
+                      "description": "max rows to return"},
+        },
+    },
 }
+
+
+def serialize_report_for_compare(fault_results: Any, summary: Any,
+                                 constraints: Any,
+                                 label: str = "") -> Dict[str, Any]:
+    """Serialise a report into the compact 'compare' payload used by the
+    regression tools (baseline side)."""
+    faults = [serialize_fault_result(fr, full=False)
+              for fr in (fault_results or [])]
+    summ = {}
+    if summary is not None:
+        summ = {
+            "total_faults": getattr(summary, "total_faults", 0),
+            "coverage_loss_count": getattr(summary, "coverage_loss_count", 0),
+            "class_counts": dict(getattr(summary, "class_counts", {}) or {}),
+        }
+    return {
+        "label": label,
+        "faults": faults,
+        "summary": summ,
+        "constraints": [serialize_constraint(c) for c in (constraints or [])],
+    }
 
 
 def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              constraints: Any, netlist: Any,
-             adjacency: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+             adjacency: Optional[Dict[str, List[str]]] = None,
+             compare: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
     Unknown parameters are ignored; missing ones fall back to defaults. When
     *adjacency* is provided (out-of-process MCP server), ``trace_path`` uses it
-    instead of a live netlist.
+    instead of a live netlist. When *compare* (a baseline report payload) is
+    provided, the regression tools become available.
     """
     args = dict(args or {})
     if name == "list_faults":
@@ -560,4 +626,32 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
             return trace_path_adjacency(adjacency, frm, to, depth)
         return trace_path(netlist, from_instance=frm, to_instance=to,
                           max_depth=depth)
+    if name in ("regression_summary", "list_regressed", "list_fixed",
+                "list_changed"):
+        if not compare:
+            return {"error": ("No baseline/comparison report loaded. Use "
+                              "'Compare Report' to load one first.")}
+        current = [serialize_fault_result(fr) for fr in (fault_results or [])]
+        baseline = compare.get("faults", [])
+        if name == "regression_summary":
+            return regression.summary(
+                baseline, current, compare.get("summary"),
+                {"class_counts": _current_class_counts(fault_results)},
+                label=compare.get("label", ""))
+        d = regression.diff(baseline, current)
+        limit = max(1, int(args.get("limit", 50) or 50))
+        if name == "list_regressed":
+            return {"total": d["counts"]["regressed"],
+                    "faults": d["regressed"][:limit]}
+        if name == "list_fixed":
+            return {"total": d["counts"]["fixed"], "faults": d["fixed"][:limit]}
+        return {"total": d["counts"]["changed"], "faults": d["changed"][:limit]}
     return {"error": f"Unknown tool '{name}'."}
+
+
+def _current_class_counts(fault_results: Any) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for fr in (fault_results or []):
+        cls = _enum_value(fr.fault.fault_class)
+        counts[cls] = counts.get(cls, 0) + 1
+    return counts

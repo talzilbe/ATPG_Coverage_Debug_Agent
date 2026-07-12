@@ -46,14 +46,18 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
             with open(path, "r", encoding="utf-8") as fh:
                 evidence = json.load(fh)
             faults, constraints, adjacency = investigate.rehydrate(evidence)
+            compare = evidence.get("compare")
         except Exception as exc:  # noqa: BLE001
             load_error = f"Failed to load evidence file '{path}': {exc}"
+            compare = None
     else:
         load_error = f"Evidence file not found: {path!r}"
+        compare = None
     return {
         "faults": faults,
         "constraints": constraints,
         "adjacency": adjacency,
+        "compare": compare,
         "load_error": load_error,
         "initialized": False,
     }
@@ -137,6 +141,7 @@ def handle_message(msg: Dict[str, Any],
                 constraints=state["constraints"],
                 netlist=None,
                 adjacency=state["adjacency"],
+                compare=state.get("compare"),
             )
         except Exception as exc:  # noqa: BLE001
             return _result(msg_id, {

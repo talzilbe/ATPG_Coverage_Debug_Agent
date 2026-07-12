@@ -96,6 +96,8 @@ class AnalysisContext:
     #: Optional serialised adjacency used when ``netlist`` is unavailable
     #: (e.g. after loading a saved report) so path tracing still works.
     adjacency: Any = None
+    #: Optional baseline report payload for regression tools (or ``None``).
+    compare: Any = None
 
 
 # ---------------------------------------------------------------------------

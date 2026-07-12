@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..app import AnalysisInputs
+from ..analysis import investigate, regression
 from ..config.settings import AppSettings
 from ..models import AnalysisReport, FaultAnalysisResult
 from ..reporting.csv_report import write_csv
@@ -164,11 +165,17 @@ class MainWindow(QMainWindow):
             "Load a previously saved report and work on it (tables + AI agent) "
             "without re-analyzing.")
         self.load_report_btn.clicked.connect(self.on_load_report)
+        self.compare_btn = QPushButton("Compare Report")
+        self.compare_btn.setToolTip(
+            "Load a baseline report (a previous run) and diff it against the "
+            "current one — regressed / fixed / changed faults — then ask the AI "
+            "agent what changed.")
+        self.compare_btn.clicked.connect(self.on_compare_report)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.on_clear)
         for b in (self.analyze_btn, self.cancel_btn, self.md_btn,
                   self.csv_btn, self.save_report_btn, self.load_report_btn,
-                  self.clear_btn):
+                  self.compare_btn, self.clear_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         outer.addLayout(btn_row)
@@ -828,6 +835,49 @@ class MainWindow(QMainWindow):
         self.md_btn.setEnabled(enabled)
         self.csv_btn.setEnabled(enabled)
         self.save_report_btn.setEnabled(enabled)
+        self.compare_btn.setEnabled(enabled)
+
+    def on_compare_report(self) -> None:
+        if not self._report:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load baseline report to compare (JSON)",
+            self._default_path("atpg_report.json"),
+            "ATPG report (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            baseline = load_report(path)
+        except (OSError, ValueError) as exc:
+            self._error(f"Could not load baseline report:\n{exc}")
+            return
+        label = os.path.basename(path)
+        compare = investigate.serialize_report_for_compare(
+            baseline.fault_results, baseline.summary, baseline.constraints,
+            label=label)
+        current = [investigate.serialize_fault_result(fr)
+                   for fr in self._report.fault_results]
+        summ = regression.summary(
+            compare["faults"], current, compare.get("summary"),
+            {"class_counts": dict(self._report.summary.class_counts)},
+            label=label)
+        c = summ["counts"]
+        self.agent_panel.set_compare(compare)
+        self._switch_to_tab("AI Debug Agent")
+        QMessageBox.information(
+            self, "Regression vs baseline",
+            f"Baseline: {label}\n\n"
+            f"Baseline coverage-loss: {c['baseline_loss']}\n"
+            f"Current coverage-loss:  {c['current_loss']}\n"
+            f"Net delta: {c['net_delta']:+d}\n\n"
+            f"Regressed (new loss): {c['regressed']}\n"
+            f"Fixed (improved):     {c['fixed']}\n"
+            f"Changed (class/root): {c['changed']}\n\n"
+            "The AI agent can now use the regression tools — ask it "
+            "'what changed vs the baseline?'")
+        self.statusBar().showMessage(
+            f"Compared against {label}: +{c['regressed']} regressed, "
+            f"-{c['fixed']} fixed, {c['changed']} changed.")
 
     def on_save_report(self) -> None:
         if not self._report:

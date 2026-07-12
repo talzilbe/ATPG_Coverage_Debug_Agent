@@ -177,6 +177,7 @@ class AgentPanel(QWidget):
         self._chat_worker = None
         self._last_response: str = ""
         self._chat_turns: list = []
+        self._compare = None
         self._build()
 
     # -- UI ------------------------------------------------------------------
@@ -531,6 +532,16 @@ class AgentPanel(QWidget):
                 f"Report ready: {report.summary.coverage_loss_count} "
                 "coverage-loss faults available for the agent.")
 
+    def set_compare(self, compare) -> None:
+        """Attach (or clear) a baseline report payload for regression tools."""
+        self._compare = compare
+        if compare:
+            label = compare.get("label") or "baseline"
+            n = len(compare.get("faults", []) or [])
+            self.status_label.setText(
+                f"Regression mode: baseline '{label}' ({n} faults) loaded — "
+                "ask the agent what changed, or run agentic mode.")
+
     def clear(self) -> None:
         self._report = None
         self.prompt_view.clear()
@@ -539,6 +550,7 @@ class AgentPanel(QWidget):
         self.chat_view.clear()
         self._last_response = ""
         self._chat_turns = []
+        self._compare = None
         self._session_id = None
         self._chat_messages = []
         self._set_chat_enabled(False)
@@ -687,6 +699,7 @@ class AgentPanel(QWidget):
             pattern_groups=r.pattern_groups,
             summary=r.summary,
             adjacency=getattr(r, "adjacency", None),
+            compare=getattr(self, "_compare", None),
         )
 
     def on_run(self) -> None:
