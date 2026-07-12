@@ -468,6 +468,13 @@ class AgentPanel(QWidget):
             self._form.setRowVisible(w, is_cli)
         for w in (self.base_url_edit, self.model_edit, self.api_key_edit):
             self._form.setRowVisible(w, not is_cli)
+        # Temperature / max-tokens are only honored by the HTTP backend; the
+        # Copilot CLI manages its own sampling and output limits.
+        na_tip = ("Not used by the GitHub Copilot CLI backend — the CLI manages "
+                  "this itself. Applies to the HTTP endpoint backend only.")
+        for w in (self.temp_spin, self.maxtok_spin):
+            w.setEnabled(not is_cli)
+            w.setToolTip(na_tip if is_cli else "")
         self.config_changed.emit()
 
     def _on_browse_cli(self) -> None:
