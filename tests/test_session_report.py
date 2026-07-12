@@ -67,6 +67,20 @@ def test_load_rejects_foreign_json(tmp_path):
         load_report(bad)
 
 
+def test_sources_metadata_roundtrip(tmp_path, sample_netlist_path,
+                                    sample_faults_path,
+                                    sample_constraints_path):
+    rep = run_analysis(sample_netlist_path, sample_faults_path,
+                       sample_constraints_path)
+    assert rep.sources and rep.sources.get("netlist") == sample_netlist_path
+    path = os.path.join(tmp_path, "r.json")
+    save_report(rep, path)
+    loaded = load_report(path)
+    assert loaded.sources.get("netlist") == sample_netlist_path
+    assert loaded.sources.get("faults") == sample_faults_path
+    assert loaded.sources.get("design")  # design name derived from netlist
+
+
 def test_export_evidence_uses_adjacency_fallback(sample_netlist_path,
                                                  sample_faults_path,
                                                  sample_constraints_path):

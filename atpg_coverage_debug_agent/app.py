@@ -36,6 +36,28 @@ def _validate(path: str, label: str) -> None:
         raise FileNotFoundError(f"{label} file not found: {path}")
 
 
+def _design_name(netlist_path: Optional[str]) -> Optional[str]:
+    """Derive a design name from a netlist file path (strip common suffixes)."""
+    if not netlist_path:
+        return None
+    base = os.path.basename(netlist_path)
+    for ext in (".v.gz", ".gz", ".v"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    return base or None
+
+
+def _source_metadata(inputs: "AnalysisInputs") -> dict:
+    """Source paths + design name recorded on the report for the cover header."""
+    return {
+        "design": _design_name(inputs.netlist_path),
+        "netlist": inputs.netlist_path,
+        "faults": inputs.faults_path,
+        "constraints": inputs.constraints_path,
+    }
+
+
 def analyze_paths(inputs: AnalysisInputs, progress=None,
                   skill_manager=None) -> AnalysisReport:
     """Parse the three artefacts and run the analysis pipeline.
@@ -88,6 +110,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report.netlist = netlist
     report.faults = faults
     report.constraints = constraints
+    report.sources = _source_metadata(inputs)
 
     if skill_manager is not None:
         if progress:

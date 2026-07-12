@@ -260,3 +260,6 @@ class AnalysisReport:
     #: Compact instance-name adjacency (set for reloaded reports whose live
     #: netlist object is gone, so path tracing still works).
     adjacency: Any = None
+    #: Source metadata for the report cover header: design name and the
+    #: netlist / faults / constraints file paths the analysis was run on.
+    sources: Any = None

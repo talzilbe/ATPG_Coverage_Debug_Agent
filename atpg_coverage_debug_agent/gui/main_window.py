@@ -428,8 +428,14 @@ class MainWindow(QMainWindow):
         self._populate_logs(report)
 
     def _populate_summary(self, report: AnalysisReport) -> None:
+        # Prefer the current file pickers; fall back to source metadata stored
+        # in the report (so a loaded report still shows its cover header).
+        sources = getattr(report, "sources", None) or {}
+        netlist = self.netlist_picker.path() or sources.get("netlist") or ""
+        faults = self.faults_picker.path() or sources.get("faults") or ""
+        constraints = (self.constraints_picker.path()
+                       or sources.get("constraints") or "")
         design = None
-        netlist = self.netlist_picker.path()
         if netlist:
             base = os.path.basename(netlist)
             for ext in (".v.gz", ".gz", ".v"):
@@ -437,13 +443,15 @@ class MainWindow(QMainWindow):
                     base = base[: -len(ext)]
                     break
             design = base or None
+        if not design:
+            design = sources.get("design")
         try:
             html = build_html_report(
                 report,
                 design_name=design,
                 netlist_path=netlist or None,
-                faults_path=self.faults_picker.path() or None,
-                constraints_path=self.constraints_picker.path() or None,
+                faults_path=faults or None,
+                constraints_path=constraints or None,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("Failed to build HTML report: %s", exc)

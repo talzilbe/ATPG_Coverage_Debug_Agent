@@ -123,6 +123,7 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         "warnings": list(report.warnings),
         "constraints": [_constraint_to_dict(c) for c in (report.constraints or [])],
         "adjacency": adjacency or {},
+        "sources": getattr(report, "sources", None) or {},
     }
 
 
@@ -230,6 +231,7 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     report.faults = [r.fault for r in report.fault_results]
     report.netlist = None
     report.adjacency = data.get("adjacency", {})
+    report.sources = data.get("sources", {}) or {}
     return report
 
 
