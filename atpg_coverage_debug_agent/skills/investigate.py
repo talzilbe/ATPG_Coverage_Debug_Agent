@@ -156,6 +156,28 @@ class ListConstraintsSkill(_InvestigativeSkill):
 
 
 @register
+class SuggestTestPointsSkill(_InvestigativeSkill):
+    skill_id = "suggest_test_points"
+    tool_name = "suggest_test_points"
+    display_name = "Suggest Test Points (query)"
+    description = investigate.TOOL_SPECS["suggest_test_points"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        return f"suggest_test_points: {data.get('total', 0)} suggestion(s)."
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for s in data.get("suggestions", [])[:10]:
+            result.add_finding(
+                title=f"[{s['kind']}] {s['instance']} (score {s['score']})",
+                description=s["suggested_action"],
+                evidence=[s["rationale"],
+                          f"fan_in={s['fan_in']} fan_out={s['fan_out']}"],
+                affected_objects=[s.get("instance") or s["fault_object"]],
+                confidence="medium",
+                recommendation=s["suggested_action"])
+
+
+@register
 class TracePathSkill(_InvestigativeSkill):
     skill_id = "trace_path"
     tool_name = "trace_path"

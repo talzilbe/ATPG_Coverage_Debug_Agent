@@ -41,6 +41,7 @@ from ..agent.debug_agent import (
     build_user_payload,
     is_cli_auth_error,
 )
+from ..analysis import investigate
 from ..skills.base import AnalysisContext
 
 logger = logging.getLogger(__name__)
@@ -326,9 +327,15 @@ class AgentPanel(QWidget):
             "confirm every fault it references exists and show its true "
             "class / root-cause, and flag any invented fault paths.")
         self.verify_btn.clicked.connect(self.on_verify)
+        self.suggest_btn = QPushButton("Suggest Fixes")
+        self.suggest_btn.setToolTip(
+            "Deterministically rank coverage-loss faults by impact and propose "
+            "concrete DFT fixes (observation/control points, constraint "
+            "relaxation, scan insertion) — no LLM used.")
+        self.suggest_btn.clicked.connect(self.on_suggest_fixes)
         for b in (self.run_btn, self.build_btn, self.copy_prompt_btn,
                   self.save_prompt_btn, self.copy_resp_btn, self.save_resp_btn,
-                  self.verify_btn):
+                  self.verify_btn, self.suggest_btn):
             btns.addWidget(b)
         btns.addStretch(1)
         layout.addLayout(btns)
@@ -914,6 +921,38 @@ class AgentPanel(QWidget):
             self.status_label.setText(
                 "Run the agent once to start a chat; this question is ready to "
                 "send afterwards.")
+
+    def on_suggest_fixes(self) -> None:
+        """Run the deterministic test-point suggester and show ranked fixes."""
+        if self._report is None:
+            self.status_label.setText("Run or load an analysis first.")
+            return
+        ctx = self._build_context()
+        if ctx is None:
+            self.status_label.setText("No analysis context available.")
+            return
+        data = investigate.run_tool(
+            "suggest_test_points", {},
+            fault_results=ctx.fault_results, constraints=ctx.constraints,
+            netlist=ctx.netlist, adjacency=getattr(ctx, "adjacency", None))
+        suggestions = data.get("suggestions", [])
+        lines = [f"# Suggested Test Points / DFT Fixes "
+                 f"({data.get('total', 0)} total, showing {len(suggestions)})",
+                 ""]
+        for i, s in enumerate(suggestions, 1):
+            lines.append(
+                f"{i}. [{s['kind']}] {s['fault_object']} "
+                f"(score {s['score']}, fan_in={s['fan_in']}, "
+                f"fan_out={s['fan_out']})")
+            lines.append(f"   Action: {s['suggested_action']}")
+            lines.append(f"   Why:    {s['rationale']}")
+            lines.append("")
+        if not suggestions:
+            lines.append("No coverage-loss faults to suggest fixes for.")
+        self._set_response("\n".join(lines))
+        self.status_label.setText(
+            f"{data.get('total', 0)} deterministic test-point suggestion(s) — "
+            "no LLM used. Fault ids are clickable.")
 
     def on_verify(self) -> None:
         """Cross-check the agent answer against the deterministic report."""

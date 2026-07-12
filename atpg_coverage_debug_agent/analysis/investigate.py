@@ -195,6 +195,89 @@ def why_blocked(fault_results: Any, fault: str) -> Dict[str, Any]:
     return {"query": fault, "total_matched": len(out), "faults": out}
 
 
+def suggest_test_points(fault_results: Any, limit: int = 20,
+                        min_fanout: int = 0,
+                        focus: str = "all") -> Dict[str, Any]:
+    """Rank coverage-loss faults by impact and propose a concrete DFT fix.
+
+    Each coverage-loss fault is assigned a primary *lever* (observability,
+    controllability, constraint, or scan-boundary), a concrete recommended
+    action, and an impact score derived from its fan-in / fan-out, then the
+    suggestions are returned highest-impact first.
+    """
+    focus = (focus or "all").strip().lower()
+    items: List[Dict[str, Any]] = []
+    for fr in (fault_results or []):
+        fo = fr.fault.fault_object
+        inst = fr.mapping.instance_name or "-"
+        fan_in = len(fr.fan_in)
+        fan_out = len(fr.fan_out)
+        if fan_out < int(min_fanout):
+            continue
+        cls = _enum_value(fr.fault.fault_class)
+        obsv = bool(fr.observability_issue) or cls == "UO"
+        ctrl = bool(fr.controllability_issue) or cls == "UC"
+
+        if obsv:
+            kind = "observability"
+            action = (f"Add an observation/test point downstream of instance "
+                      f"'{inst}' so this node becomes observable in test mode.")
+            score = fan_out * 2 + fan_in
+            rationale = (f"Unobserved with fan-out={fan_out}; an observe point "
+                         "recovers this node and amplifies coverage over its "
+                         "downstream cone.")
+        elif ctrl:
+            kind = "controllability"
+            action = (f"Add a control/test point to make instance '{inst}' "
+                      "controllable in test mode.")
+            score = fan_in * 2 + fan_out
+            rationale = (f"Uncontrolled with fan-in={fan_in}; a control point "
+                         "enables fault activation.")
+        elif bool(fr.constraint_related):
+            kind = "constraint"
+            action = (f"Review and, if safe, relax the constraint blocking "
+                      f"instance '{inst}'.")
+            score = fan_out + fan_in
+            rationale = ("Fault is constraint-related; relaxing the blocking "
+                         "constraint may recover it.")
+        elif bool(fr.scan_boundary_involved):
+            kind = "scan"
+            action = (f"Insert scan at the non-scan boundary near instance "
+                      f"'{inst}'.")
+            score = fan_out + fan_in
+            rationale = ("A scan/non-scan boundary is involved; scan insertion "
+                         "improves access.")
+        else:
+            kind = "other"
+            action = (f"Investigate instance '{inst}' manually; no dominant "
+                      "test-point lever was detected.")
+            score = fan_out + fan_in
+            rationale = ("No single controllability/observability/constraint "
+                         "lever dominates.")
+
+        if focus != "all" and focus != kind:
+            continue
+        items.append({
+            "fault_object": fo,
+            "instance": inst,
+            "kind": kind,
+            "suggested_action": action,
+            "rationale": rationale,
+            "root_cause": _enum_value(fr.root_cause),
+            "fan_in": fan_in,
+            "fan_out": fan_out,
+            "score": score,
+        })
+
+    items.sort(key=lambda x: x["score"], reverse=True)
+    total = len(items)
+    return {
+        "total": total,
+        "returned": min(total, int(limit)),
+        "suggestions": items[: max(1, int(limit))],
+    }
+
+
 def list_constraints(constraints: Any, name: Optional[str] = None,
                      kind: Optional[str] = None,
                      limit: int = 100) -> Dict[str, Any]:
@@ -508,6 +591,21 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                       "description": "max rows to return"},
         },
     },
+    "suggest_test_points": {
+        "description": (
+            "Rank coverage-loss faults by impact and propose concrete DFT "
+            "fixes (observation points, control points, constraint relaxation, "
+            "or scan insertion), highest-impact first."),
+        "params": {
+            "limit": {"type": "int", "default": 20,
+                      "description": "max suggestions to return"},
+            "min_fanout": {"type": "int", "default": 0,
+                           "description": "only faults with fan-out >= this"},
+            "focus": {"type": "str", "default": "all",
+                      "description": ("observability | controllability | "
+                                      "constraint | scan | all")},
+        },
+    },
     "trace_path": {
         "description": (
             "Structurally trace a driver->load path between two instances "
@@ -618,6 +716,12 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
         return list_constraints(
             constraints, name=args.get("name"), kind=args.get("kind"),
             limit=int(args.get("limit", 100) or 100))
+    if name == "suggest_test_points":
+        return suggest_test_points(
+            fault_results,
+            limit=int(args.get("limit", 20) or 20),
+            min_fanout=int(args.get("min_fanout", 0) or 0),
+            focus=str(args.get("focus", "all") or "all"))
     if name == "trace_path":
         frm = str(args.get("from_instance", ""))
         to = str(args.get("to_instance", ""))
