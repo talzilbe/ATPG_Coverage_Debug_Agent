@@ -68,6 +68,37 @@ def test_ask_about_fault_prefills_chat(panel_with_report):
     assert fo in panel.chat_input.text()
 
 
+def test_response_token_streams_then_finalizes(panel_with_report):
+    panel, rep = panel_with_report
+    fo = rep.fault_results[0].fault.fault_object
+    panel.response_view.clear()
+    panel._stream_buf = ""
+    panel._on_response_token("Coverage lost at ")
+    panel._on_response_token(fo)
+    assert panel._stream_buf == f"Coverage lost at {fo}"
+    assert fo in panel.response_view.toPlainText()
+    # Finalizing re-renders with clickable links.
+    panel._on_finished("")  # empty -> uses the streamed buffer
+    assert 'href="fault:' in panel.response_view.toHtml()
+
+
+def test_chat_token_streaming_rebuilds_transcript(panel_with_report):
+    panel, rep = panel_with_report
+    panel._chat_backend = "cli"
+    panel._chat_turns = []
+    panel.chat_view.clear()
+    panel._append_chat("You", "why?")
+    panel._chat_stream_buf = ""
+    panel._on_chat_token("because ")
+    panel._on_chat_token("of a constraint")
+    panel._on_chat_finished("")  # empty -> uses streamed buffer
+    text = panel.chat_view.toPlainText()
+    assert "why?" in text
+    assert "because of a constraint" in text
+    assert panel._chat_turns[-1][0] == "Agent"
+
+
+
 def test_investigation_export_import(panel_with_report, qapp,
                                      sample_netlist_path, sample_faults_path,
                                      sample_constraints_path):

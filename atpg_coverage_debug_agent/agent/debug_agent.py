@@ -348,13 +348,16 @@ class DebugAgent:
         """Return the full user payload (without calling any LLM)."""
         return build_user_payload(report, max_faults=self.config.max_faults)
 
-    def run(self, report: Any, session_id: Optional[str] = None) -> str:
+    def run(self, report: Any, session_id: Optional[str] = None,
+            on_chunk=None) -> str:
         """Call the LLM and return its completion text.
 
         Args:
             report:     Populated ``AnalysisReport``.
             session_id: Optional CLI session UUID so the conversation can be
                         resumed later for follow-up chat (CLI backend only).
+            on_chunk:   Optional ``callable(str)`` invoked with partial output
+                        as it streams in.
 
         Raises:
             RuntimeError: if the endpoint is not configured or the call fails.
@@ -368,8 +371,9 @@ class DebugAgent:
         user_payload = self.build_prompt(report)
         if self.config.backend == "cli":
             return self._call_cli(SYSTEM_PROMPT, user_payload,
-                                  session_id=session_id)
-        return self._call_chat_completions(SYSTEM_PROMPT, user_payload)
+                                  session_id=session_id, on_chunk=on_chunk)
+        return self._call_chat_completions(SYSTEM_PROMPT, user_payload,
+                                           on_chunk=on_chunk)
 
     def run_with_prompt(self, system_prompt: str, user_payload: str) -> str:
         """Call the LLM with an explicit system + user prompt pair."""
@@ -381,7 +385,7 @@ class DebugAgent:
 
     def run_agentic(self, report: Any, skill_manager: Any, ctx: Any,
                     on_event=None, max_iterations: int = 8,
-                    session_id: Optional[str] = None) -> str:
+                    session_id: Optional[str] = None, on_chunk=None) -> str:
         """Run a tool-using agent loop where skills are exposed as tools.
 
         The model is given the structural evidence plus a tool schema for every
@@ -419,7 +423,8 @@ class DebugAgent:
         # prompt, and let the CLI reason over that evidence in one shot.
         if self.config.backend == "cli":
             return self._run_agentic_cli(report, skill_manager, ctx, emit,
-                                         session_id=session_id)
+                                         session_id=session_id,
+                                         on_chunk=on_chunk)
 
         enabled = skill_manager.enabled_skills()
         tools = [s.to_tool_schema() for s in enabled]
@@ -516,7 +521,7 @@ class DebugAgent:
         return final.get("content") or "(no final answer produced)"
 
     def chat(self, message: str, session_id: Optional[str] = None,
-             history: Optional[List[dict]] = None) -> str:
+             history: Optional[List[dict]] = None, on_chunk=None) -> str:
         """Send a follow-up message and return the reply.
 
         CLI backend: resumes the prior CLI session (``session_id``) so the model
@@ -530,16 +535,19 @@ class DebugAgent:
                 raise RuntimeError(
                     "No CLI session to resume — run the agent first.")
             return self._call_cli("", message, session_id=session_id,
-                                  resume=True)
+                                  resume=True, on_chunk=on_chunk)
         if not history:
             raise RuntimeError("No conversation history for HTTP chat.")
+        if on_chunk is not None:
+            return self._post_stream(history, on_chunk)
         reply = self._post_chat(history, tools=None)
         return reply.get("content") or ""
 
     # -- internal ------------------------------------------------------------
 
     def _run_agentic_cli(self, report: Any, skill_manager: Any, ctx: Any,
-                         emit, session_id: Optional[str] = None) -> str:
+                         emit, session_id: Optional[str] = None,
+                         on_chunk=None) -> str:
         """Agentic run for the Copilot CLI backend.
 
         When ``cli_use_mcp`` is set, the investigative tools are exposed to the
@@ -549,7 +557,8 @@ class DebugAgent:
         """
         if self.config.cli_use_mcp:
             try:
-                return self._run_agentic_cli_mcp(report, ctx, emit, session_id)
+                return self._run_agentic_cli_mcp(report, ctx, emit, session_id,
+                                                 on_chunk=on_chunk)
             except Exception as exc:  # noqa: BLE001
                 emit(f"⚠ MCP path failed ({exc}); falling back to local skills.")
 
@@ -577,10 +586,11 @@ class DebugAgent:
                         + "\n\n".join(evidence_blocks))
         emit("Calling GitHub Copilot CLI for the final diagnosis…")
         return self._call_cli(AGENTIC_SYSTEM_PROMPT, payload,
-                              session_id=session_id)
+                              session_id=session_id, on_chunk=on_chunk)
 
     def _run_agentic_cli_mcp(self, report: Any, ctx: Any, emit,
-                             session_id: Optional[str] = None) -> str:
+                             session_id: Optional[str] = None,
+                             on_chunk=None) -> str:
         """CLI agentic run where the model drives the investigative tools via a
         local MCP server.
 
@@ -637,7 +647,8 @@ class DebugAgent:
         try:
             return self._call_cli(
                 AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
-                extra_args=["--additional-mcp-config", "@" + cfg_path])
+                extra_args=["--additional-mcp-config", "@" + cfg_path],
+                on_chunk=on_chunk)
         finally:
             for p in (ev_path, cfg_path):
                 try:
@@ -648,7 +659,8 @@ class DebugAgent:
     def _call_cli(self, system_prompt: str, user_payload: str,
                   session_id: Optional[str] = None,
                   resume: bool = False,
-                  extra_args: Optional[List[str]] = None) -> str:
+                  extra_args: Optional[List[str]] = None,
+                  on_chunk=None) -> str:
         """Run the local GitHub Copilot CLI as a subprocess and return its text.
 
         The full system prompt and structural evidence are passed as a single
@@ -702,6 +714,9 @@ class DebugAgent:
         if extra_args:
             cmd += list(extra_args)
 
+        if on_chunk is not None:
+            return self._call_cli_streaming(cmd, env, scratch, on_chunk)
+
         try:
             proc = subprocess.run(
                 cmd, env=env, capture_output=True, text=True,
@@ -727,14 +742,57 @@ class DebugAgent:
                 + (f" stderr: {err[:400]}" if err else ""))
         return out
 
-    def _call_chat_completions(self, system_prompt: str, user_payload: str) -> str:
+    def _call_cli_streaming(self, cmd: List[str], env: dict, scratch: str,
+                            on_chunk) -> str:
+        """Run the CLI with :class:`subprocess.Popen`, emitting stdout as it
+        arrives via *on_chunk*, and return the full accumulated text."""
+        parts: List[str] = []
+        try:
+            proc = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1)
+        except FileNotFoundError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+        try:
+            assert proc.stdout is not None
+            for chunk in iter(lambda: proc.stdout.read(80), ""):
+                if chunk:
+                    parts.append(chunk)
+                    on_chunk(chunk)
+            try:
+                proc.wait(timeout=self.config.timeout)
+            except subprocess.TimeoutExpired as exc:
+                proc.kill()
+                raise RuntimeError(
+                    f"Copilot CLI timed out after {self.config.timeout}s") from exc
+            err = (proc.stderr.read() if proc.stderr else "") or ""
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+        if proc.returncode not in (0, None):
+            detail = (err or "".join(parts)).strip()
+            raise RuntimeError(
+                f"Copilot CLI exited {proc.returncode}: {detail[:800]}")
+        out = "".join(parts).strip()
+        if not out:
+            raise RuntimeError(
+                "Copilot CLI returned no output."
+                + (f" stderr: {err.strip()[:400]}" if err.strip() else ""))
+        return out
+
+    def _call_chat_completions(self, system_prompt: str, user_payload: str,
+                               on_chunk=None) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ]
+        if on_chunk is not None:
+            return self._post_stream(messages, on_chunk)
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         body = {
             "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
-            ],
+            "messages": messages,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
@@ -760,6 +818,48 @@ class DebugAgent:
             raise RuntimeError(
                 f"Unexpected LLM response format: {raw[:500]}"
             ) from exc
+
+    def _post_stream(self, messages: List[dict], on_chunk) -> str:
+        """Stream an OpenAI-compatible completion (SSE) and return full text."""
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        body = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": True,
+        }
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.config.api_key.strip()}"
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
+        parts: List[str] = []
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(payload)
+                        delta = obj["choices"][0].get("delta", {})
+                        chunk = delta.get("content") or ""
+                    except (KeyError, IndexError, json.JSONDecodeError):
+                        chunk = ""
+                    if chunk:
+                        parts.append(chunk)
+                        on_chunk(chunk)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
+            raise RuntimeError(f"LLM HTTP {exc.code}: {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"LLM connection error: {exc.reason}") from exc
+        return "".join(parts)
 
     def _post_chat(self, messages: List[dict],
                    tools: Optional[List[dict]] = None) -> dict:

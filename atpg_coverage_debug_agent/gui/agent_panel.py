@@ -79,6 +79,7 @@ class _AgentWorker(QObject):
 
     finished = Signal(str)
     failed = Signal(str)
+    token = Signal(str)
 
     def __init__(self, agent: DebugAgent, report, session_id=None) -> None:
         super().__init__()
@@ -88,7 +89,8 @@ class _AgentWorker(QObject):
 
     def run(self) -> None:
         try:
-            text = self._agent.run(self._report, session_id=self._session_id)
+            text = self._agent.run(self._report, session_id=self._session_id,
+                                   on_chunk=lambda c: self.token.emit(c))
         except Exception as exc:  # noqa: BLE001
             logger.exception("AI debug agent failed")
             self.failed.emit(str(exc))
@@ -102,6 +104,7 @@ class _AgenticWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
     trace = Signal(str)
+    token = Signal(str)
 
     def __init__(self, agent: DebugAgent, report, skill_manager, ctx,
                  session_id=None) -> None:
@@ -120,6 +123,7 @@ class _AgenticWorker(QObject):
                 self._ctx,
                 on_event=lambda msg: self.trace.emit(msg),
                 session_id=self._session_id,
+                on_chunk=lambda c: self.token.emit(c),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Agentic AI debug agent failed")
@@ -133,6 +137,7 @@ class _ChatWorker(QObject):
 
     finished = Signal(str)
     failed = Signal(str)
+    token = Signal(str)
 
     def __init__(self, agent: DebugAgent, message, session_id, history) -> None:
         super().__init__()
@@ -145,7 +150,8 @@ class _ChatWorker(QObject):
         try:
             text = self._agent.chat(
                 self._message, session_id=self._session_id,
-                history=self._history)
+                history=self._history,
+                on_chunk=lambda c: self.token.emit(c))
         except Exception as exc:  # noqa: BLE001
             logger.exception("Follow-up chat failed")
             self.failed.emit(str(exc))
@@ -179,6 +185,8 @@ class AgentPanel(QWidget):
         self._last_response: str = ""
         self._chat_turns: list = []
         self._compare = None
+        self._stream_buf: str = ""
+        self._chat_stream_buf: str = ""
         self._build()
 
     # -- UI ------------------------------------------------------------------
@@ -732,8 +740,10 @@ class AgentPanel(QWidget):
 
     def _run_single_shot(self, config: AgentConfig) -> None:
         self.run_btn.setEnabled(False)
-        self.status_label.setText("Calling LLM… this may take a while.")
+        self.status_label.setText("Calling LLM… streaming response below.")
         self._begin_session(config, agentic=False)
+        self.response_view.clear()
+        self._stream_buf = ""
 
         agent = DebugAgent(config)
         self._thread = QThread()
@@ -741,6 +751,7 @@ class AgentPanel(QWidget):
                                     session_id=self._session_id)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.token.connect(self._on_response_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._thread.quit)
@@ -764,6 +775,8 @@ class AgentPanel(QWidget):
         self.run_btn.setEnabled(False)
         self.status_label.setText("Agentic agent running — calling tools…")
         self._begin_session(config, agentic=True)
+        self.response_view.clear()
+        self._stream_buf = ""
 
         agent = DebugAgent(config)
         self._thread = QThread()
@@ -773,6 +786,7 @@ class AgentPanel(QWidget):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.trace.connect(self._append_trace)
+        self._worker.token.connect(self._on_response_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._thread.quit)
@@ -780,17 +794,24 @@ class AgentPanel(QWidget):
         self._thread.finished.connect(self._cleanup)
         self._thread.start()
 
+    def _on_response_token(self, chunk: str) -> None:
+        self._stream_buf += chunk
+        self.response_view.moveCursor(QTextCursor.End)
+        self.response_view.insertPlainText(chunk)
+        self.response_view.moveCursor(QTextCursor.End)
+
     def _append_trace(self, line: str) -> None:
         self.trace_view.appendPlainText(line)
 
     def _on_finished(self, text: str) -> None:
-        self._set_response(text)
+        final = text or getattr(self, "_stream_buf", "")
+        self._set_response(final)
         self.status_label.setText(
             "Agent response received — click a fault to focus it, or Verify.")
         self.run_btn.setEnabled(True)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
-        self._append_chat("Agent", text)
+        self._append_chat("Agent", final)
         if self._chat_backend != "cli":
             # HTTP backend: keep a running messages list for follow-ups.
             self._chat_messages.append({"role": "assistant", "content": text})
@@ -847,7 +868,8 @@ class AgentPanel(QWidget):
     def _chat_view_reset(self) -> None:
         self.chat_view.clear()
 
-    def _append_chat(self, role: str, text: str) -> None:
+    def _render_turn(self, role: str, text: str) -> None:
+        """Render one chat turn into the view (no bookkeeping)."""
         if role == "Agent":
             body = self._to_html(text)
         else:
@@ -857,7 +879,15 @@ class AgentPanel(QWidget):
         block = (f'<p style="margin:6px 0;"><b style="color:{colour};">'
                  f'{html.escape(role)}:</b><br>{body}</p>')
         self._append_html(self.chat_view, block)
+
+    def _append_chat(self, role: str, text: str) -> None:
         self._chat_turns.append((role, (text or "").strip()))
+        self._render_turn(role, text)
+
+    def _rebuild_chat_view(self) -> None:
+        self.chat_view.clear()
+        for role, text in self._chat_turns:
+            self._render_turn(role, text)
 
     # -- grounded evidence (clickable faults) --------------------------------
 
@@ -1026,12 +1056,18 @@ class AgentPanel(QWidget):
 
         self._set_chat_enabled(False)
         self.status_label.setText("Agent is replying…")
+        self._chat_stream_buf = ""
+        # Live streaming cue appended below the You turn; replaced on finish.
+        self._append_html(
+            self.chat_view,
+            '<p style="margin:6px 0;"><b style="color:#036;">Agent:</b><br></p>')
 
         agent = DebugAgent(config)
         self._chat_thread = QThread()
         self._chat_worker = _ChatWorker(agent, msg, self._session_id, history)
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_thread.started.connect(self._chat_worker.run)
+        self._chat_worker.token.connect(self._on_chat_token)
         self._chat_worker.finished.connect(self._on_chat_finished)
         self._chat_worker.failed.connect(self._on_chat_failed)
         self._chat_worker.finished.connect(self._chat_thread.quit)
@@ -1039,17 +1075,27 @@ class AgentPanel(QWidget):
         self._chat_thread.finished.connect(self._chat_cleanup)
         self._chat_thread.start()
 
+    def _on_chat_token(self, chunk: str) -> None:
+        self._chat_stream_buf += chunk
+        self.chat_view.moveCursor(QTextCursor.End)
+        self.chat_view.insertPlainText(chunk)
+        self.chat_view.moveCursor(QTextCursor.End)
+
     def _on_chat_finished(self, text: str) -> None:
-        self._append_chat("Agent", text)
+        final = text or getattr(self, "_chat_stream_buf", "")
+        self._chat_turns.append(("Agent", (final or "").strip()))
         if self._chat_backend != "cli":
-            self._chat_messages.append({"role": "assistant", "content": text})
+            self._chat_messages.append({"role": "assistant", "content": final})
+        # Rebuild so the streamed plain text becomes linkified transcript.
+        self._rebuild_chat_view()
         self._set_chat_enabled(True)
         self.status_label.setText(
             "Reply received — continue the conversation or re-run.")
         self.chat_input.setFocus()
 
     def _on_chat_failed(self, message: str) -> None:
-        self._append_chat("Error", message)
+        self._chat_turns.append(("Error", (message or "").strip()))
+        self._rebuild_chat_view()
         self._set_chat_enabled(True)
         if is_cli_auth_error(message):
             self.status_label.setText(
