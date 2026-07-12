@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+import re
 import uuid
 from typing import Optional
+from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QThread, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +28,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -153,6 +158,10 @@ class AgentPanel(QWidget):
     #: Emitted when the LLM connection settings change (for persistence).
     config_changed = Signal()
 
+    #: Emitted with a fault-object id when the user clicks a fault link in the
+    #: agent output — the main window focuses that row in the results table.
+    fault_referenced = Signal(str)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._report = None
@@ -166,6 +175,7 @@ class AgentPanel(QWidget):
         self._chat_backend: str = "cli"
         self._chat_thread: Optional[QThread] = None
         self._chat_worker = None
+        self._last_response: str = ""
         self._build()
 
     # -- UI ------------------------------------------------------------------
@@ -308,8 +318,15 @@ class AgentPanel(QWidget):
         self.copy_resp_btn.clicked.connect(self.on_copy_response)
         self.save_resp_btn = QPushButton("Save Response…")
         self.save_resp_btn.clicked.connect(self.on_save_response)
+        self.verify_btn = QPushButton("Verify")
+        self.verify_btn.setToolTip(
+            "Cross-check the agent's answer against the deterministic report: "
+            "confirm every fault it references exists and show its true "
+            "class / root-cause, and flag any invented fault paths.")
+        self.verify_btn.clicked.connect(self.on_verify)
         for b in (self.run_btn, self.build_btn, self.copy_prompt_btn,
-                  self.save_prompt_btn, self.copy_resp_btn, self.save_resp_btn):
+                  self.save_prompt_btn, self.copy_resp_btn, self.save_resp_btn,
+                  self.verify_btn):
             btns.addWidget(b)
         btns.addStretch(1)
         layout.addLayout(btns)
@@ -330,22 +347,25 @@ class AgentPanel(QWidget):
         prompt_layout.addWidget(self.prompt_view)
         splitter.addWidget(prompt_box)
 
-        trace_box = QGroupBox("Agent Tool Trace (agentic mode)")
+        trace_box = QGroupBox("Agent Tool Trace / Verification")
         trace_layout = QVBoxLayout(trace_box)
         self.trace_view = QPlainTextEdit()
         self.trace_view.setReadOnly(True)
         self.trace_view.setPlaceholderText(
             "In agentic mode, each skill/tool the agent calls is logged here "
-            "as it runs.")
+            "as it runs. 'Verify' results also appear here.")
         trace_layout.addWidget(self.trace_view)
         splitter.addWidget(trace_box)
 
-        resp_box = QGroupBox("Agent Response")
+        resp_box = QGroupBox("Agent Response (click a fault to focus it in the table)")
         resp_layout = QVBoxLayout(resp_box)
-        self.response_view = QPlainTextEdit()
-        self.response_view.setReadOnly(True)
+        self.response_view = QTextBrowser()
+        self.response_view.setOpenLinks(False)
+        self.response_view.setOpenExternalLinks(False)
+        self.response_view.anchorClicked.connect(self._on_anchor_clicked)
         self.response_view.setPlaceholderText(
-            "The agent's evidence-driven A–F diagnosis appears here.")
+            "The agent's evidence-driven A–F diagnosis appears here. Fault ids "
+            "are clickable.")
         resp_layout.addWidget(self.response_view)
         splitter.addWidget(resp_box)
 
@@ -357,8 +377,10 @@ class AgentPanel(QWidget):
         # --- Follow-up chat ---
         chat_box = QGroupBox("Follow-up Chat with the Agent")
         chat_layout = QVBoxLayout(chat_box)
-        self.chat_view = QPlainTextEdit()
-        self.chat_view.setReadOnly(True)
+        self.chat_view = QTextBrowser()
+        self.chat_view.setOpenLinks(False)
+        self.chat_view.setOpenExternalLinks(False)
+        self.chat_view.anchorClicked.connect(self._on_anchor_clicked)
         self.chat_view.setPlaceholderText(
             "After you run the agent, ask follow-up questions about its "
             "diagnosis here — the conversation keeps the full analysis context.")
@@ -514,6 +536,7 @@ class AgentPanel(QWidget):
         self.trace_view.clear()
         self.response_view.clear()
         self.chat_view.clear()
+        self._last_response = ""
         self._session_id = None
         self._chat_messages = []
         self._set_chat_enabled(False)
@@ -705,9 +728,9 @@ class AgentPanel(QWidget):
         self.trace_view.appendPlainText(line)
 
     def _on_finished(self, text: str) -> None:
-        self.response_view.setPlainText(text)
+        self._set_response(text)
         self.status_label.setText(
-            "Agent response received — you can now chat with the agent below.")
+            "Agent response received — click a fault to focus it, or Verify.")
         self.run_btn.setEnabled(True)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
@@ -719,7 +742,7 @@ class AgentPanel(QWidget):
         self.chat_input.setFocus()
 
     def _on_failed(self, message: str) -> None:
-        self.response_view.setPlainText(f"[ERROR] {message}")
+        self._set_response(f"[ERROR] {message}")
         self.run_btn.setEnabled(True)
         if is_cli_auth_error(message):
             self.status_label.setText(
@@ -768,9 +791,118 @@ class AgentPanel(QWidget):
         self.chat_view.clear()
 
     def _append_chat(self, role: str, text: str) -> None:
-        self.chat_view.appendPlainText(f"{role}:")
-        self.chat_view.appendPlainText((text or "").strip())
-        self.chat_view.appendPlainText("")
+        if role == "Agent":
+            body = self._to_html(text)
+        else:
+            body = html.escape((text or "").strip()).replace("\n", "<br>")
+        colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b"}.get(
+            role, "#555")
+        block = (f'<p style="margin:6px 0;"><b style="color:{colour};">'
+                 f'{html.escape(role)}:</b><br>{body}</p>')
+        self._append_html(self.chat_view, block)
+
+    # -- grounded evidence (clickable faults) --------------------------------
+
+    def _known_fault_objects(self) -> list:
+        r = self._report
+        if r is None:
+            return []
+        out = []
+        for fr in getattr(r, "fault_results", []) or []:
+            fo = getattr(getattr(fr, "fault", None), "fault_object", "")
+            if fo:
+                out.append(fo)
+        return out
+
+    def _to_html(self, text: str) -> str:
+        """HTML-escape *text* and turn known fault ids into clickable links."""
+        esc = html.escape(text or "")
+        faults = self._known_fault_objects()
+        if faults:
+            esc_map = {html.escape(fo): fo for fo in faults}
+            keys = sorted(esc_map, key=len, reverse=True)
+            pattern = re.compile("|".join(re.escape(k) for k in keys))
+
+            def _repl(m: "re.Match") -> str:
+                e = m.group(0)
+                fo = esc_map.get(e, e)
+                href = "fault:" + quote(fo, safe="")
+                return (f'<a href="{href}" style="color:#0055aa;">{e}</a>')
+
+            esc = pattern.sub(_repl, esc)
+        return esc.replace("\n", "<br>")
+
+    def _append_html(self, browser: QTextBrowser, html_str: str) -> None:
+        browser.moveCursor(QTextCursor.End)
+        browser.insertHtml(html_str)
+        browser.moveCursor(QTextCursor.End)
+
+    def _set_response(self, text: str) -> None:
+        self._last_response = text
+        self.response_view.setHtml(
+            f'<div style="font-family:monospace;white-space:pre-wrap;">'
+            f'{self._to_html(text)}</div>')
+
+    def _on_anchor_clicked(self, url) -> None:
+        s = url.toString()
+        if s.startswith("fault:"):
+            self.fault_referenced.emit(unquote(s[len("fault:"):]))
+
+    def ask_about_fault(self, fault_object: str) -> None:
+        """Pre-fill a follow-up question about *fault_object* (from the table)."""
+        self.tabs.setCurrentIndex(0)
+        question = (f"Explain why coverage is lost for fault "
+                    f"'{fault_object}'. Use why_blocked and get_fault_detail "
+                    "and cite the structural evidence.")
+        self.chat_input.setText(question)
+        if self.chat_input.isEnabled():
+            self.chat_input.setFocus()
+            self.status_label.setText(
+                "Question ready — press Enter/Send to ask about this fault.")
+        else:
+            self.status_label.setText(
+                "Run the agent once to start a chat; this question is ready to "
+                "send afterwards.")
+
+    def on_verify(self) -> None:
+        """Cross-check the agent answer against the deterministic report."""
+        text = getattr(self, "_last_response", "") or ""
+        if not text.strip():
+            self.status_label.setText("Nothing to verify — run the agent first.")
+            return
+        lookup = {}
+        for fr in (getattr(self._report, "fault_results", []) or []):
+            lookup[fr.fault.fault_object] = fr
+
+        # Tokens that look like hierarchical fault paths (contain a '/').
+        tokens = set(re.findall(r"[A-Za-z_][\w.$:\[\]-]*(?:/[\w.$:\[\]-]+)+",
+                                text))
+        grounded = sorted(t for t in tokens if t in lookup)
+        ungrounded = sorted(t for t in tokens if t not in lookup)
+
+        lines = ["=== VERIFICATION (deterministic ground-truth) ===",
+                 f"Fault-path references in answer: {len(tokens)}",
+                 f"  ✓ exact matches in report: {len(grounded)}",
+                 f"  ⚠ NOT in report (possible hallucination): "
+                 f"{len(ungrounded)}", ""]
+        for t in grounded:
+            fr = lookup[t]
+            lines.append(
+                f"  ✓ {t}: class={fr.fault.fault_class.value} "
+                f"root_cause={fr.root_cause.value} "
+                f"ctrl={'Y' if fr.controllability_issue else 'N'} "
+                f"obsv={'Y' if fr.observability_issue else 'N'}")
+        for t in ungrounded:
+            lines.append(f"  ⚠ {t}: not found in the report's faults")
+        self.trace_view.appendPlainText("\n".join(lines))
+        if ungrounded:
+            self.status_label.setText(
+                f"Verify: {len(grounded)} grounded, {len(ungrounded)} NOT in "
+                "report — review flagged references in the trace pane.")
+        else:
+            self.status_label.setText(
+                f"Verify: all {len(grounded)} referenced fault(s) exist in the "
+                "report.")
 
     def on_clear_chat(self) -> None:
         self.chat_view.clear()

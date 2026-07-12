@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStatusBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
     QWidget,
@@ -196,6 +196,7 @@ class MainWindow(QMainWindow):
 
         self.agent_panel = AgentPanel()
         self.agent_panel.config_changed.connect(self._save_settings)
+        self.agent_panel.fault_referenced.connect(self._focus_fault_in_table)
         self.tabs.addTab(self.agent_panel, "AI Debug Agent")
 
         outer.addWidget(self.tabs, 1)
@@ -270,6 +271,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         splitter.addWidget(self.table)
         self.details = DetailsPanel()
         splitter.addWidget(self.details)
@@ -540,6 +543,41 @@ class MainWindow(QMainWindow):
         if idx is None or idx >= len(self._results):
             return
         self.details.show_result(self._results[idx])
+
+    def _on_table_context_menu(self, pos) -> None:
+        item = self.table.itemAt(pos)
+        if item is None:
+            return
+        id_item = self.table.item(item.row(), 0)
+        if id_item is None:
+            return
+        fault_object = id_item.text()
+        menu = QMenu(self)
+        ask_act = menu.addAction("Ask AI agent about this fault")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == ask_act:
+            self._switch_to_tab("AI Debug Agent")
+            self.agent_panel.ask_about_fault(fault_object)
+
+    def _switch_to_tab(self, title: str) -> None:
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == title:
+                self.tabs.setCurrentIndex(i)
+                return
+
+    def _focus_fault_in_table(self, fault_object: str) -> None:
+        """Select and reveal the table row for *fault_object* (from an agent link)."""
+        self._switch_to_tab("Coverage Loss Table")
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.text() == fault_object:
+                self.table.clearSelection()
+                self.table.selectRow(row)
+                self.table.scrollToItem(item)
+                self.table.setFocus()
+                return
+        self.statusBar().showMessage(
+            f"'{fault_object}' is not a row in the current table.")
 
     def _default_path(self, name: str) -> str:
         outdir = self.outdir_picker.path()
