@@ -66,3 +66,34 @@ def test_ask_about_fault_prefills_chat(panel_with_report):
     fo = rep.fault_results[0].fault.fault_object
     panel.ask_about_fault(fo)
     assert fo in panel.chat_input.text()
+
+
+def test_investigation_export_import(panel_with_report, qapp,
+                                     sample_netlist_path, sample_faults_path,
+                                     sample_constraints_path):
+    panel, rep = panel_with_report
+    panel._set_response("Diagnosis text about a fault.")
+    panel._append_chat("You", "why is it lost?")
+    panel._append_chat("Agent", "because of a constraint")
+    panel.trace_view.setPlainText("=== VERIFICATION ===")
+
+    data = panel.export_investigation()
+    assert data["diagnosis"].startswith("Diagnosis text")
+    assert [t["role"] for t in data["chat"]] == ["You", "Agent"]
+    assert "VERIFICATION" in data["trace"]
+
+    # Import into a fresh panel restores the transcript.
+    fresh = AgentPanel()
+    fresh.set_report(rep, None)
+    fresh.import_investigation(data)
+    assert "Diagnosis text" in fresh.response_view.toPlainText()
+    chat_text = fresh.chat_view.toPlainText()
+    assert "why is it lost?" in chat_text
+    assert "because of a constraint" in chat_text
+    assert "VERIFICATION" in fresh.trace_view.toPlainText()
+
+    # Importing None clears everything.
+    fresh.import_investigation(None)
+    assert fresh.response_view.toPlainText().strip() == ""
+    assert fresh.chat_view.toPlainText().strip() == ""
+

@@ -124,6 +124,7 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         "constraints": [_constraint_to_dict(c) for c in (report.constraints or [])],
         "adjacency": adjacency or {},
         "sources": getattr(report, "sources", None) or {},
+        "investigation": getattr(report, "investigation", None),
     }
 
 
@@ -232,6 +233,7 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     report.netlist = None
     report.adjacency = data.get("adjacency", {})
     report.sources = data.get("sources", {}) or {}
+    report.investigation = data.get("investigation")
     return report
 
 

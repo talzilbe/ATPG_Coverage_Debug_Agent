@@ -67,6 +67,22 @@ def test_load_rejects_foreign_json(tmp_path):
         load_report(bad)
 
 
+def test_investigation_roundtrip(tmp_path, sample_netlist_path,
+                                 sample_faults_path, sample_constraints_path):
+    rep = run_analysis(sample_netlist_path, sample_faults_path,
+                       sample_constraints_path)
+    rep.investigation = {
+        "diagnosis": "Coverage lost at top/u_alu/reg_scan/SE.",
+        "chat": [{"role": "You", "text": "why?"},
+                 {"role": "Agent", "text": "constraint block"}],
+        "trace": "=== VERIFICATION ===\nok",
+    }
+    path = os.path.join(tmp_path, "r.json")
+    save_report(rep, path)
+    loaded = load_report(path)
+    assert loaded.investigation == rep.investigation
+
+
 def test_sources_metadata_roundtrip(tmp_path, sample_netlist_path,
                                     sample_faults_path,
                                     sample_constraints_path):

@@ -176,6 +176,7 @@ class AgentPanel(QWidget):
         self._chat_thread: Optional[QThread] = None
         self._chat_worker = None
         self._last_response: str = ""
+        self._chat_turns: list = []
         self._build()
 
     # -- UI ------------------------------------------------------------------
@@ -537,11 +538,46 @@ class AgentPanel(QWidget):
         self.response_view.clear()
         self.chat_view.clear()
         self._last_response = ""
+        self._chat_turns = []
         self._session_id = None
         self._chat_messages = []
         self._set_chat_enabled(False)
         self.status_label.setText("Run an analysis first, then run the AI agent.")
         self._update_button_state()
+
+    # -- investigation persistence (save/load with the report) ---------------
+
+    def export_investigation(self) -> Optional[dict]:
+        """Return the current diagnosis + chat transcript + trace, or None."""
+        diagnosis = getattr(self, "_last_response", "") or ""
+        chat = [{"role": r, "text": t} for r, t in self._chat_turns]
+        trace = self.trace_view.toPlainText()
+        if not diagnosis and not chat and not trace.strip():
+            return None
+        return {"diagnosis": diagnosis, "chat": chat, "trace": trace}
+
+    def import_investigation(self, data: Optional[dict]) -> None:
+        """Restore a saved investigation (view-only), or clear if *data* is None."""
+        self.response_view.clear()
+        self.chat_view.clear()
+        self.trace_view.clear()
+        self._chat_turns = []
+        self._last_response = ""
+        self._set_chat_enabled(False)
+        if not data:
+            return
+        diagnosis = data.get("diagnosis", "") or ""
+        if diagnosis:
+            self._set_response(diagnosis)
+        for turn in data.get("chat", []):
+            self._append_chat(turn.get("role", "Agent"), turn.get("text", ""))
+        trace = data.get("trace", "")
+        if trace:
+            self.trace_view.setPlainText(trace)
+        if diagnosis or data.get("chat"):
+            self.status_label.setText(
+                "Loaded saved investigation (view-only transcript). Press Run "
+                "to continue the conversation on this report.")
 
     def _on_mode_toggled(self, checked: bool) -> None:
         self.run_btn.setText(
@@ -768,6 +804,7 @@ class AgentPanel(QWidget):
         self._session_id = str(uuid.uuid4())
         self._chat_backend = config.backend
         self.chat_view.clear()
+        self._chat_turns = []
         self._set_chat_enabled(False)
         if config.backend == "cli":
             self._chat_messages = []
@@ -800,6 +837,7 @@ class AgentPanel(QWidget):
         block = (f'<p style="margin:6px 0;"><b style="color:{colour};">'
                  f'{html.escape(role)}:</b><br>{body}</p>')
         self._append_html(self.chat_view, block)
+        self._chat_turns.append((role, (text or "").strip()))
 
     # -- grounded evidence (clickable faults) --------------------------------
 

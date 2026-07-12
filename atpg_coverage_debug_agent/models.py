@@ -263,3 +263,6 @@ class AnalysisReport:
     #: Source metadata for the report cover header: design name and the
     #: netlist / faults / constraints file paths the analysis was run on.
     sources: Any = None
+    #: Saved agent investigation: diagnosis text, chat transcript, and the
+    #: tool-call / verification trace, so a reopened report is reproducible.
+    investigation: Any = None

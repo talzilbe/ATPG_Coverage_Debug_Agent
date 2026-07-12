@@ -412,6 +412,9 @@ class MainWindow(QMainWindow):
         if report.skill_results:
             self.skills_panel.show_results(report.skill_results)
         self.agent_panel.set_report(report, self._skill_manager)
+        # Restore a saved agent investigation (or clear stale agent output).
+        self.agent_panel.import_investigation(getattr(report, "investigation",
+                                                      None))
 
     def _on_failed(self, message: str) -> None:
         self.progress.setVisible(False)
@@ -834,6 +837,8 @@ class MainWindow(QMainWindow):
             self._default_path("atpg_report.json"), "ATPG report (*.json)")
         if not path:
             return
+        # Capture the current agent investigation (diagnosis, chat, trace).
+        self._report.investigation = self.agent_panel.export_investigation()
         try:
             save_report(self._report, path)
         except OSError as exc:
