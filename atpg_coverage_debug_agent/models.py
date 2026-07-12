@@ -266,3 +266,6 @@ class AnalysisReport:
     #: Saved agent investigation: diagnosis text, chat transcript, and the
     #: tool-call / verification trace, so a reopened report is reproducible.
     investigation: Any = None
+    #: Analyst edits applied to this report: excluded fault classes / ids and a
+    #: note (set by the Edit Report action). ``None`` when unedited.
+    edits: Any = None

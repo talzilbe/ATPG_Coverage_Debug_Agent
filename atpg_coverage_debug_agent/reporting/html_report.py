@@ -665,6 +665,7 @@ def build_html_report(
     netlist_path: Optional[str] = None,
     faults_path: Optional[str] = None,
     constraints_path: Optional[str] = None,
+    analyst_note: Optional[str] = None,
 ) -> str:
     """Return a complete, self-contained document-style HTML report.
 
@@ -673,15 +674,24 @@ def build_html_report(
         design_name: Optional design label for the cover (inferred otherwise).
         netlist_path / faults_path / constraints_path: Optional source file
             paths shown on the cover page.
+        analyst_note: Optional analyst note / edit banner shown at the top.
 
     Returns:
         A full ``<html>`` document string.
     """
     design = design_name or _guess_design_name(report)
 
+    note_html = ""
+    if analyst_note and analyst_note.strip():
+        note_html = _callout(
+            "warn",
+            "<b>Analyst note / edits:</b><br>"
+            + _esc(analyst_note.strip()).replace("\n", "<br>"))
+
     if report.fault_results:
         body = (
             _cover(design, netlist_path, faults_path, constraints_path)
+            + note_html
             + _section_constraints(report, constraints_path)
             + _section_fault_stats(report)
             + _section_hotspots(report)
@@ -692,6 +702,7 @@ def build_html_report(
     else:
         body = (
             _cover(design, netlist_path, faults_path, constraints_path)
+            + note_html
             + _section_fault_stats(report)
             + _callout(
                 "ok",

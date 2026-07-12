@@ -16,7 +16,7 @@ from typing import List, Optional
 from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStatusBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..app import AnalysisInputs
-from ..analysis import investigate, regression
+from ..analysis import investigate, regression, report_edit
 from ..config.settings import AppSettings
 from ..models import AnalysisReport, FaultAnalysisResult
 from ..reporting.csv_report import write_csv
@@ -89,6 +89,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
 
         self._report: Optional[AnalysisReport] = None
+        self._base_report: Optional[AnalysisReport] = None
         self._results: List[FaultAnalysisResult] = []
         self._report_html: Optional[str] = None
         self._thread: Optional[QThread] = None
@@ -171,11 +172,17 @@ class MainWindow(QMainWindow):
             "current one — regressed / fixed / changed faults — then ask the AI "
             "agent what changed.")
         self.compare_btn.clicked.connect(self.on_compare_report)
+        self.edit_btn = QPushButton("Edit Report")
+        self.edit_btn.setToolTip(
+            "Exclude fault classes (e.g. AU / waived faults) or add an analyst "
+            "note; the summary and tables recompute. Reversible and saved with "
+            "the report.")
+        self.edit_btn.clicked.connect(self.on_edit_report)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.on_clear)
         for b in (self.analyze_btn, self.cancel_btn, self.md_btn,
                   self.csv_btn, self.save_report_btn, self.load_report_btn,
-                  self.compare_btn, self.clear_btn):
+                  self.compare_btn, self.edit_btn, self.clear_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         outer.addLayout(btn_row)
@@ -404,6 +411,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.analyze_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self._base_report = report
         self._apply_report(report)
         n_skills = len(report.skill_results) if report.skill_results else 0
         self.statusBar().showMessage(
@@ -458,6 +466,14 @@ class MainWindow(QMainWindow):
             design = base or None
         if not design:
             design = sources.get("design")
+        edits = getattr(report, "edits", None) or {}
+        note_parts = []
+        banner = report_edit.edit_banner(edits)
+        if banner:
+            note_parts.append(f"Edits applied — {banner}.")
+        if edits.get("note"):
+            note_parts.append(edits["note"])
+        analyst_note = "\n".join(note_parts) if note_parts else None
         try:
             html = build_html_report(
                 report,
@@ -465,6 +481,7 @@ class MainWindow(QMainWindow):
                 netlist_path=netlist or None,
                 faults_path=faults or None,
                 constraints_path=constraints or None,
+                analyst_note=analyst_note,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("Failed to build HTML report: %s", exc)
@@ -799,6 +816,7 @@ class MainWindow(QMainWindow):
 
     def on_clear(self) -> None:
         self._report = None
+        self._base_report = None
         self._results = []
         self._report_html = None
         self.table.setRowCount(0)
@@ -836,6 +854,53 @@ class MainWindow(QMainWindow):
         self.csv_btn.setEnabled(enabled)
         self.save_report_btn.setEnabled(enabled)
         self.compare_btn.setEnabled(enabled)
+        self.edit_btn.setEnabled(enabled)
+
+    def on_edit_report(self) -> None:
+        if not self._base_report:
+            return
+        current_edits = getattr(self._report, "edits", None) or {}
+        ex_classes = set(current_edits.get("excluded_classes", []))
+        note = current_edits.get("note", "")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Report")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "Exclude coverage-loss fault classes (e.g. waive AU faults) and/or "
+            "record an analyst note. The summary and tables recompute; edits "
+            "are reversible and saved with the report."))
+        checks = {}
+        for cls in ("AU", "UO", "UC"):
+            cb = QCheckBox(f"Exclude all {cls} faults")
+            cb.setChecked(cls in ex_classes)
+            v.addWidget(cb)
+            checks[cls] = cb
+        v.addWidget(QLabel("Analyst note / annotation:"))
+        note_edit = QPlainTextEdit()
+        note_edit.setPlainText(note)
+        note_edit.setPlaceholderText(
+            "e.g. AU faults reviewed and waived as legitimately untestable "
+            "(black-box RAM boundary).")
+        v.addWidget(note_edit, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+        dlg.resize(520, 360)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        excluded = [cls for cls, cb in checks.items() if cb.isChecked()]
+        new_note = note_edit.toPlainText().strip()
+        edited = report_edit.apply_exclusions(
+            self._base_report, excluded_classes=excluded, note=new_note)
+        self._apply_report(edited)
+        banner = report_edit.edit_banner(edited.edits)
+        self.statusBar().showMessage(
+            "Report edited" + (f": {banner}" if banner else " (note updated).")
+            + f"  {edited.summary.coverage_loss_count} coverage-loss faults remain.")
 
     def on_compare_report(self) -> None:
         if not self._report:
@@ -908,6 +973,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self._error(f"Could not load report:\n{exc}")
             return
+        self._base_report = report
         self._apply_report(report)
         self.statusBar().showMessage(
             f"Report loaded: {path} — "
