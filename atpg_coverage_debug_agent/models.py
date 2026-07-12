@@ -251,3 +251,9 @@ class AnalysisReport:
     pattern_groups: List[PatternGroup] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     skill_results: List[Any] = field(default_factory=list)
+    # Source artefacts kept so the agentic AI layer can build a live skill
+    # context and invoke skills as tools on demand. Optional; ``None`` when the
+    # report was produced without retaining the parsed inputs.
+    netlist: Any = None            # VerilogNetlist
+    faults: Any = None             # List[FaultRecord]
+    constraints: Any = None        # List[ConstraintRecord]

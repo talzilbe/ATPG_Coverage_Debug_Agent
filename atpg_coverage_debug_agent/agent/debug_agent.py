@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -121,22 +125,61 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
 
 
 # ---------------------------------------------------------------------------
+# Agentic system prompt (tool-using variant)
+# ---------------------------------------------------------------------------
+AGENTIC_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+--- AGENTIC TOOL USE ---
+You are running in AGENTIC mode. In addition to the structural evidence
+provided, you have a set of analysis SKILLS available as callable tools. Each
+tool runs a deterministic structural analysis over the SAME parsed netlist,
+fault list, and constraints and returns audit-ready findings.
+
+Rules for tool use:
+- Prefer calling relevant skills to gather concrete structural evidence before
+  drawing conclusions. Do NOT fabricate evidence a skill could provide.
+- You may call multiple skills, and may call the same skill again with
+  different arguments if that sharpens the analysis.
+- Tool findings are Observed/Derived structural facts — treat them as evidence,
+  not as final conclusions; you still must reason over them.
+- When you have enough evidence, STOP calling tools and return the full A-F
+  report exactly as specified in the base system prompt.
+- Never claim a skill returned something it did not. If a tool returns no
+  findings, say so.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Agent configuration
 # ---------------------------------------------------------------------------
 @dataclass
 class AgentConfig:
     """Configuration for the LLM backend.
 
+    Two backends are supported:
+
+    * ``"http"`` — an OpenAI-compatible ``/chat/completions`` endpoint.
+    * ``"cli"``  — the local GitHub Copilot CLI, invoked as a subprocess so no
+      endpoint/URL configuration is required and requests go through the CLI's
+      own authenticated channel.
+
     Attributes:
+        backend:     ``"http"`` or ``"cli"``.
         base_url:    OpenAI-compatible base URL (e.g. ``https://host/v1``).
-        model:       Model name to request.
+        model:       Model name to request (HTTP backend).
         api_key:     Bearer token (kept in-session only; never persisted to disk).
         temperature: Sampling temperature.
         max_tokens:  Maximum completion tokens.
         max_faults:  Cap on coverage-loss faults serialised into the payload.
-        timeout:     HTTP timeout in seconds.
+        timeout:     HTTP / subprocess timeout in seconds.
+        cli_path:    Path to the ``copilot`` executable (CLI backend).
+        cli_home:    Value for ``COPILOT_HOME`` (config/state dir; CLI backend).
+        cli_model:   Optional model id passed to the CLI via ``--model``.
+        cli_token:   Optional GitHub token injected as ``COPILOT_GITHUB_TOKEN``
+                     for the CLI subprocess (kept in memory only).
     """
 
+    backend: str = "http"
     base_url: str = ""
     model: str = "gpt-4"
     api_key: str = ""
@@ -144,17 +187,24 @@ class AgentConfig:
     max_tokens: int = 4000
     max_faults: int = 200
     timeout: int = 120
+    cli_path: str = ""
+    cli_home: str = ""
+    cli_model: str = ""
+    cli_token: str = ""
 
     @property
     def configured(self) -> bool:
         """True when enough is set to attempt a live LLM call."""
+        if self.backend == "cli":
+            return bool(self.cli_path.strip())
         return bool(self.base_url.strip() and self.model.strip())
 
 
 # ---------------------------------------------------------------------------
 # Payload builder
 # ---------------------------------------------------------------------------
-def build_user_payload(report: Any, max_faults: int = 200) -> str:
+def build_user_payload(report: Any, max_faults: int = 200,
+                       agentic: bool = False) -> str:
     """Serialise an :class:`AnalysisReport` into a structured text payload.
 
     The structural analyser has already correlated faults to netlist objects;
@@ -164,6 +214,9 @@ def build_user_payload(report: Any, max_faults: int = 200) -> str:
     Args:
         report:     A populated ``AnalysisReport``.
         max_faults: Maximum number of coverage-loss faults to include.
+        agentic:    When ``True``, omit pre-computed skill findings and emit an
+                    agentic task that instructs the model to call skills as
+                    tools before concluding.
 
     Returns:
         A multi-section plain-text payload.
@@ -240,7 +293,7 @@ def build_user_payload(report: Any, max_faults: int = 200) -> str:
 
     # Skill findings (if any)
     skill_results = getattr(report, "skill_results", None)
-    if skill_results:
+    if skill_results and not agentic:
         lines.append("## Skill Findings (auxiliary structural skills)")
         for sr in skill_results:
             lines.append(f"### {sr.skill_id}: {sr.summary}")
@@ -249,12 +302,25 @@ def build_user_payload(report: Any, max_faults: int = 200) -> str:
         lines.append("")
 
     lines.append("## TASK")
-    lines.append(
-        "Using ONLY the structural evidence above, produce the full A-F output "
-        "described in the system prompt. Mark every ambiguous statement as "
-        "Observed / Derived / Likely / Unresolved. Do not invent connectivity "
-        "that is not present in this evidence."
-    )
+    if agentic:
+        lines.append(
+            "You have access to analysis SKILLS exposed as callable tools. "
+            "Decide which skills are relevant to the coverage loss above, CALL "
+            "them (you may call several, in any order, and call one again with "
+            "different arguments if useful), then use their structured findings "
+            "as additional evidence. When you have gathered enough evidence, "
+            "produce the full A-F output described in the system prompt. Mark "
+            "every ambiguous statement as Observed / Derived / Likely / "
+            "Unresolved. Do not invent connectivity that is not present in the "
+            "evidence or returned by a skill."
+        )
+    else:
+        lines.append(
+            "Using ONLY the structural evidence above, produce the full A-F output "
+            "described in the system prompt. Mark every ambiguous statement as "
+            "Observed / Derived / Likely / Unresolved. Do not invent connectivity "
+            "that is not present in this evidence."
+        )
     return "\n".join(lines)
 
 
@@ -271,27 +337,282 @@ class DebugAgent:
         """Return the full user payload (without calling any LLM)."""
         return build_user_payload(report, max_faults=self.config.max_faults)
 
-    def run(self, report: Any) -> str:
+    def run(self, report: Any, session_id: Optional[str] = None) -> str:
         """Call the LLM and return its completion text.
+
+        Args:
+            report:     Populated ``AnalysisReport``.
+            session_id: Optional CLI session UUID so the conversation can be
+                        resumed later for follow-up chat (CLI backend only).
 
         Raises:
             RuntimeError: if the endpoint is not configured or the call fails.
         """
         if not self.config.configured:
             raise RuntimeError(
-                "No LLM endpoint configured. Set a base URL and model, or use "
-                "'Build Prompt Only' to copy the prompt into your own chat model."
+                "No LLM backend configured. Set a base URL and model (HTTP) or a "
+                "Copilot CLI path, or use 'Build Prompt Only' to copy the prompt "
+                "into your own chat model."
             )
         user_payload = self.build_prompt(report)
+        if self.config.backend == "cli":
+            return self._call_cli(SYSTEM_PROMPT, user_payload,
+                                  session_id=session_id)
         return self._call_chat_completions(SYSTEM_PROMPT, user_payload)
 
     def run_with_prompt(self, system_prompt: str, user_payload: str) -> str:
         """Call the LLM with an explicit system + user prompt pair."""
         if not self.config.configured:
-            raise RuntimeError("No LLM endpoint configured.")
+            raise RuntimeError("No LLM backend configured.")
+        if self.config.backend == "cli":
+            return self._call_cli(system_prompt, user_payload)
         return self._call_chat_completions(system_prompt, user_payload)
 
+    def run_agentic(self, report: Any, skill_manager: Any, ctx: Any,
+                    on_event=None, max_iterations: int = 8,
+                    session_id: Optional[str] = None) -> str:
+        """Run a tool-using agent loop where skills are exposed as tools.
+
+        The model is given the structural evidence plus a tool schema for every
+        *enabled* skill. When the model requests a tool call, the corresponding
+        skill is executed against *ctx* and its findings are fed back. The loop
+        repeats until the model returns a final (tool-free) answer or
+        ``max_iterations`` is reached.
+
+        Args:
+            report:        Populated ``AnalysisReport`` (structural evidence).
+            skill_manager: SkillManager providing the callable skills/tools.
+            ctx:           ``AnalysisContext`` skills execute against.
+            on_event:      Optional ``callable(str)`` for streaming trace lines
+                           to the UI (tool calls, results, iteration markers).
+            max_iterations: Safety cap on tool-call rounds.
+
+        Returns:
+            The model's final natural-language A-F diagnosis.
+
+        Raises:
+            RuntimeError: if the endpoint is not configured or the call fails.
+        """
+        if not self.config.configured:
+            raise RuntimeError(
+                "No LLM backend configured. Set a base URL and model (HTTP) or a "
+                "Copilot CLI path to run the agentic agent.")
+
+        def emit(msg: str) -> None:
+            if on_event:
+                on_event(msg)
+
+        # The GitHub Copilot CLI runs its own internal tool-using loop, so we
+        # cannot hand it our OpenAI-style tool schema. Instead we run the
+        # enabled skills locally, fold their structural findings into the
+        # prompt, and let the CLI reason over that evidence in one shot.
+        if self.config.backend == "cli":
+            return self._run_agentic_cli(report, skill_manager, ctx, emit,
+                                         session_id=session_id)
+
+        enabled = skill_manager.enabled_skills()
+        tools = [s.to_tool_schema() for s in enabled]
+        skills_by_id = {s.skill_id: s for s in enabled}
+        emit(f"Agentic run started with {len(tools)} skill tool(s): "
+             + ", ".join(skills_by_id) if tools else
+             "Agentic run started with NO enabled skills (enable some in the "
+             "Skills tab for tool use).")
+
+        messages: List[dict] = [
+            {"role": "system", "content": AGENTIC_SYSTEM_PROMPT},
+            {"role": "user",
+             "content": build_user_payload(report, self.config.max_faults,
+                                           agentic=True)},
+        ]
+
+        for iteration in range(1, max_iterations + 1):
+            emit(f"— Iteration {iteration}/{max_iterations}: asking the model…")
+            message = self._post_chat(messages, tools=tools)
+            messages.append(message)
+            tool_calls = message.get("tool_calls") or []
+
+            if not tool_calls:
+                emit("Model returned a final answer (no tool calls).")
+                return message.get("content") or ""
+
+            for call in tool_calls:
+                fn = call.get("function", {})
+                name = fn.get("name", "")
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError:
+                    args = {}
+                emit(f"→ Tool call: {name}({', '.join(f'{k}={v}' for k, v in args.items())})")
+
+                skill = skills_by_id.get(name)
+                if skill is None:
+                    content = f"ERROR: unknown or disabled skill '{name}'."
+                    emit(f"   ⚠ {content}")
+                else:
+                    for key, value in args.items():
+                        try:
+                            skill.set_param(key, value)
+                        except KeyError:
+                            emit(f"   (ignored unknown param '{key}')")
+                    try:
+                        result = skill.run(ctx)
+                        content = _serialize_skill_result(result)
+                        emit(f"   ✓ {len(result.findings)} finding(s), "
+                             f"{len(result.warnings)} warning(s)")
+                    except Exception as exc:  # noqa: BLE001
+                        content = f"ERROR: skill '{name}' raised: {exc}"
+                        emit(f"   ⚠ {content}")
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": content,
+                })
+
+        emit("Reached max iterations — asking the model for a final answer.")
+        messages.append({
+            "role": "user",
+            "content": "Stop calling tools now and produce your final A-F "
+                       "diagnosis using the evidence gathered so far.",
+        })
+        final = self._post_chat(messages, tools=None)
+        return final.get("content") or "(no final answer produced)"
+
+    def chat(self, message: str, session_id: Optional[str] = None,
+             history: Optional[List[dict]] = None) -> str:
+        """Send a follow-up message and return the reply.
+
+        CLI backend: resumes the prior CLI session (``session_id``) so the model
+        keeps the full analysis context. HTTP backend: replays ``history`` (a
+        full OpenAI messages list already including the new user turn).
+        """
+        if not self.config.configured:
+            raise RuntimeError("No LLM backend configured.")
+        if self.config.backend == "cli":
+            if not session_id:
+                raise RuntimeError(
+                    "No CLI session to resume — run the agent first.")
+            return self._call_cli("", message, session_id=session_id,
+                                  resume=True)
+        if not history:
+            raise RuntimeError("No conversation history for HTTP chat.")
+        reply = self._post_chat(history, tools=None)
+        return reply.get("content") or ""
+
     # -- internal ------------------------------------------------------------
+
+    def _run_agentic_cli(self, report: Any, skill_manager: Any, ctx: Any,
+                         emit, session_id: Optional[str] = None) -> str:
+        """Agentic run for the Copilot CLI backend.
+
+        Runs every enabled skill locally against *ctx*, streams a trace of each
+        skill result, embeds the findings in the prompt, and issues a single
+        CLI call for the final A-F diagnosis.
+        """
+        enabled = skill_manager.enabled_skills()
+        emit(f"CLI agentic run: executing {len(enabled)} enabled skill(s) "
+             "locally, then handing evidence to the Copilot CLI.")
+
+        evidence_blocks: List[str] = []
+        for skill in enabled:
+            emit(f"→ Running skill: {skill.skill_id}")
+            try:
+                result = skill.run(ctx)
+            except Exception as exc:  # noqa: BLE001
+                emit(f"   ⚠ skill '{skill.skill_id}' raised: {exc}")
+                continue
+            emit(f"   ✓ {len(result.findings)} finding(s), "
+                 f"{len(result.warnings)} warning(s)")
+            evidence_blocks.append(_serialize_skill_result(result))
+
+        payload = build_user_payload(report, self.config.max_faults,
+                                     agentic=False)
+        if evidence_blocks:
+            payload += ("\n\n## Skill Tool Findings (executed locally)\n"
+                        + "\n\n".join(evidence_blocks))
+        emit("Calling GitHub Copilot CLI for the final diagnosis…")
+        return self._call_cli(AGENTIC_SYSTEM_PROMPT, payload,
+                              session_id=session_id)
+
+    def _call_cli(self, system_prompt: str, user_payload: str,
+                  session_id: Optional[str] = None,
+                  resume: bool = False) -> str:
+        """Run the local GitHub Copilot CLI as a subprocess and return its text.
+
+        The full system prompt and structural evidence are passed as a single
+        non-interactive prompt (``-p``) in silent mode (``-s``) so only the
+        model's answer is captured. The CLI runs in a throwaway scratch working
+        directory and is told not to modify files, so it acts purely as a
+        reasoning backend.
+
+        Args:
+            session_id: When set (and ``resume`` is False), starts a new session
+                        with this UUID so it can be resumed for follow-up chat.
+            resume:     When True, resumes ``session_id`` and sends only
+                        ``user_payload`` (the prior context is already in the
+                        session), enabling multi-turn conversation.
+        """
+        exe = self.config.cli_path.strip()
+        if not exe:
+            raise RuntimeError("No Copilot CLI path configured.")
+        if not os.path.isfile(exe):
+            raise RuntimeError(f"Copilot CLI not found at: {exe}")
+
+        if resume:
+            prompt = user_payload
+        else:
+            prompt = (
+                system_prompt
+                + "\n\n"
+                + user_payload
+                + "\n\nIMPORTANT: Do NOT create, modify, delete, or run anything "
+                "on disk. Treat the evidence above as your only inputs and "
+                "respond with the analysis text only."
+            )
+
+        env = dict(os.environ)
+        if self.config.cli_home.strip():
+            env["COPILOT_HOME"] = self.config.cli_home.strip()
+        if self.config.cli_token.strip():
+            env["COPILOT_GITHUB_TOKEN"] = self.config.cli_token.strip()
+
+        scratch = tempfile.mkdtemp(prefix="atpg_cop_")
+        cmd = [
+            exe, "-p", prompt, "-s", "--no-color", "--allow-all-tools",
+            "--no-remote", "--log-level", "error", "-C", scratch,
+        ]
+        if resume and session_id:
+            cmd += ["--resume", session_id]
+        elif session_id:
+            cmd += ["--session-id", session_id]
+        if self.config.cli_model.strip():
+            cmd += ["--model", self.config.cli_model.strip()]
+
+        try:
+            proc = subprocess.run(
+                cmd, env=env, capture_output=True, text=True,
+                timeout=self.config.timeout,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Copilot CLI timed out after {self.config.timeout}s") from exc
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(
+                f"Copilot CLI exited {proc.returncode}: {err[:800]}")
+        out = (proc.stdout or "").strip()
+        if not out:
+            err = (proc.stderr or "").strip()
+            raise RuntimeError(
+                "Copilot CLI returned no output."
+                + (f" stderr: {err[:400]}" if err else ""))
+        return out
 
     def _call_chat_completions(self, system_prompt: str, user_payload: str) -> str:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
@@ -326,3 +647,86 @@ class DebugAgent:
             raise RuntimeError(
                 f"Unexpected LLM response format: {raw[:500]}"
             ) from exc
+
+    def _post_chat(self, messages: List[dict],
+                   tools: Optional[List[dict]] = None) -> dict:
+        """POST a full messages list (optionally with tools) and return the
+        assistant *message* object (which may contain ``tool_calls``)."""
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        body: dict = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.config.api_key.strip()}"
+
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
+            raise RuntimeError(f"LLM HTTP {exc.code}: {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"LLM connection error: {exc.reason}") from exc
+
+        try:
+            payload = json.loads(raw)
+            return payload["choices"][0]["message"]
+        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Unexpected LLM response format: {raw[:500]}"
+            ) from exc
+
+
+def is_cli_auth_error(message: str) -> bool:
+    """True if *message* looks like a Copilot CLI authentication failure."""
+    if not message:
+        return False
+    low = message.lower()
+    signatures = (
+        "no authentication information found",
+        "authenticate with copilot",
+        "not authenticated",
+        "authentication failed",
+        "gh auth login",
+        "copilot_github_token",
+    )
+    return any(sig in low for sig in signatures)
+
+
+def _serialize_skill_result(result: Any) -> str:
+    """Render a :class:`SkillResult` into compact text for a tool response."""
+    lines: List[str] = [f"skill: {result.skill_id}"]
+    if getattr(result, "summary", ""):
+        lines.append(f"summary: {result.summary}")
+    lines.append(f"success: {getattr(result, 'success', True)}")
+    findings = getattr(result, "findings", []) or []
+    if not findings:
+        lines.append("findings: none")
+    else:
+        lines.append(f"findings ({len(findings)}):")
+        for i, f in enumerate(findings, 1):
+            lines.append(f"  {i}. [{f.confidence}] {f.title} — {f.description}")
+            if getattr(f, "evidence", None):
+                for ev in f.evidence[:6]:
+                    lines.append(f"       evidence: {ev}")
+            if getattr(f, "affected_objects", None):
+                objs = ", ".join(f.affected_objects[:10])
+                lines.append(f"       affected: {objs}")
+            if getattr(f, "recommendation", ""):
+                lines.append(f"       recommendation: {f.recommendation}")
+    warnings = getattr(result, "warnings", []) or []
+    if warnings:
+        lines.append(f"warnings ({len(warnings)}):")
+        for w in warnings[:10]:
+            lines.append(f"  - {w}")
+    return "\n".join(lines)

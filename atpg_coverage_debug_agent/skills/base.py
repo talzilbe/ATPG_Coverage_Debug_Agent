@@ -184,6 +184,47 @@ class SkillBase(ABC):
                 logger.warning("Skill %s: unknown param '%s' in saved config",
                                self.skill_id, k)
 
+    # -- tool exposure (agentic mode) ----------------------------------------
+
+    def to_tool_schema(self) -> Dict[str, Any]:
+        """Return an OpenAI-compatible tool (function) schema for this skill.
+
+        The schema exposes the skill as a callable tool so an LLM operating in
+        agentic mode can decide to invoke it. Configurable parameters from
+        :meth:`parameters_schema` become optional function arguments; the LLM
+        may omit them to use each skill's defaults.
+        """
+        _JSON_TYPES = {
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "str": "string",
+        }
+        properties: Dict[str, Any] = {}
+        for name, spec in self.parameters_schema().items():
+            json_type = _JSON_TYPES.get(spec.get("type", "str"), "string")
+            prop: Dict[str, Any] = {
+                "type": json_type,
+                "description": spec.get("description", ""),
+            }
+            if "default" in spec:
+                prop["description"] += f" (default: {spec['default']})"
+            properties[name] = prop
+        return {
+            "type": "function",
+            "function": {
+                "name": self.skill_id,
+                "description": (self.description or self.display_name
+                               or self.skill_id),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    # All params are optional — skills have sensible defaults.
+                    "required": [],
+                },
+            },
+        }
+
     # -- execution -----------------------------------------------------------
 
     @abstractmethod

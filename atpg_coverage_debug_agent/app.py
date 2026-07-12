@@ -83,6 +83,12 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report = build_report(netlist, faults, constraints, warnings,
                           progress=progress)
 
+    # Retain the parsed artefacts so the agentic AI layer can build a live
+    # AnalysisContext and invoke skills as tools on demand.
+    report.netlist = netlist
+    report.faults = faults
+    report.constraints = constraints
+
     if skill_manager is not None:
         if progress:
             progress(4, 5, "Running skills")

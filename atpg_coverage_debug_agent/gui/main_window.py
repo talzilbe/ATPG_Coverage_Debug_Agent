@@ -388,7 +388,7 @@ class MainWindow(QMainWindow):
         self._populate(report)
         if report.skill_results:
             self.skills_panel.show_results(report.skill_results)
-        self.agent_panel.set_report(report)
+        self.agent_panel.set_report(report, self._skill_manager)
         n_skills = len(report.skill_results) if report.skill_results else 0
         self.statusBar().showMessage(
             f"Done. {report.summary.coverage_loss_count} coverage-loss faults. "

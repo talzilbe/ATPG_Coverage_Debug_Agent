@@ -17,6 +17,11 @@ env/
 report.csv
 report.md
 
+# Bundled GitHub Copilot CLI binary (large) + local auth/session state
+tools/
+copilot-home/
+.copilot/
+
 # OS / misc
 .DS_Store
 Thumbs.db
