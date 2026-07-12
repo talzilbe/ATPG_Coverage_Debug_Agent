@@ -164,3 +164,26 @@ class ConnectivityModel:
             nkey = self.net_key(module, net_name)
             keys.extend(self._net_loads.get(nkey, []))
         return keys
+
+    def downstream(self, inst_key: str) -> List[str]:
+        """Public successor query: instance keys driven by *inst_key*.
+
+        The module is recovered from the key (``module::inst_name``) so callers
+        can navigate the graph without tracking the module separately.
+        """
+        module = inst_key.split("::", 1)[0]
+        out: List[str] = []
+        for lkey in self._downstream_keys(module, inst_key):
+            if lkey != inst_key:
+                out.append(lkey)
+        return out
+
+    def upstream(self, inst_key: str) -> List[str]:
+        """Public predecessor query: instance keys driving *inst_key*."""
+        module = inst_key.split("::", 1)[0]
+        out: List[str] = []
+        for dkey in self._upstream_keys(module, inst_key):
+            if dkey != inst_key:
+                out.append(dkey)
+        return out
+

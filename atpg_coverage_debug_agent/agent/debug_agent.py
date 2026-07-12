@@ -14,13 +14,21 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from ..analysis import investigate
+
 logger = logging.getLogger(__name__)
+
+#: Repository root (parent of the package dir) — used to set PYTHONPATH for the
+#: MCP server subprocess the Copilot CLI launches.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +199,9 @@ class AgentConfig:
     cli_home: str = ""
     cli_model: str = ""
     cli_token: str = ""
+    #: When True, the CLI agentic run exposes the investigative tools to the
+    #: Copilot CLI via a local MCP server so the model drives them itself.
+    cli_use_mcp: bool = True
 
     @property
     def configured(self) -> bool:
@@ -425,6 +436,12 @@ class DebugAgent:
                                            agentic=True)},
         ]
 
+        # Loop budget: cap total tool calls and cache identical calls so the
+        # model cannot burn the budget on repeated or runaway tool use.
+        max_tool_calls = max(len(tools) * 3, 12)
+        tool_calls_made = 0
+        call_cache: dict = {}
+
         for iteration in range(1, max_iterations + 1):
             emit(f"— Iteration {iteration}/{max_iterations}: asking the model…")
             message = self._post_chat(messages, tools=tools)
@@ -435,6 +452,7 @@ class DebugAgent:
                 emit("Model returned a final answer (no tool calls).")
                 return message.get("content") or ""
 
+            budget_hit = False
             for call in tool_calls:
                 fn = call.get("function", {})
                 name = fn.get("name", "")
@@ -445,30 +463,47 @@ class DebugAgent:
                     args = {}
                 emit(f"→ Tool call: {name}({', '.join(f'{k}={v}' for k, v in args.items())})")
 
-                skill = skills_by_id.get(name)
-                if skill is None:
-                    content = f"ERROR: unknown or disabled skill '{name}'."
+                cache_key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+                if cache_key in call_cache:
+                    content = ("(cached — identical call already made this run)\n"
+                               + call_cache[cache_key])
+                    emit("   ↺ duplicate call — returning cached result")
+                elif tool_calls_made >= max_tool_calls:
+                    content = (f"ERROR: tool-call budget ({max_tool_calls}) "
+                               "exhausted. Stop calling tools and answer now.")
                     emit(f"   ⚠ {content}")
+                    budget_hit = True
                 else:
-                    for key, value in args.items():
-                        try:
-                            skill.set_param(key, value)
-                        except KeyError:
-                            emit(f"   (ignored unknown param '{key}')")
-                    try:
-                        result = skill.run(ctx)
-                        content = _serialize_skill_result(result)
-                        emit(f"   ✓ {len(result.findings)} finding(s), "
-                             f"{len(result.warnings)} warning(s)")
-                    except Exception as exc:  # noqa: BLE001
-                        content = f"ERROR: skill '{name}' raised: {exc}"
+                    tool_calls_made += 1
+                    skill = skills_by_id.get(name)
+                    if skill is None:
+                        content = f"ERROR: unknown or disabled skill '{name}'."
                         emit(f"   ⚠ {content}")
+                    else:
+                        for key, value in args.items():
+                            try:
+                                skill.set_param(key, value)
+                            except KeyError:
+                                emit(f"   (ignored unknown param '{key}')")
+                        try:
+                            result = skill.run(ctx)
+                            content = _serialize_skill_result(result)
+                            call_cache[cache_key] = content
+                            emit(f"   ✓ {len(result.findings)} finding(s), "
+                                 f"{len(result.warnings)} warning(s) "
+                                 f"[{tool_calls_made}/{max_tool_calls}]")
+                        except Exception as exc:  # noqa: BLE001
+                            content = f"ERROR: skill '{name}' raised: {exc}"
+                            emit(f"   ⚠ {content}")
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "content": content,
                 })
+
+            if budget_hit:
+                break
 
         emit("Reached max iterations — asking the model for a final answer.")
         messages.append({
@@ -506,16 +541,24 @@ class DebugAgent:
                          emit, session_id: Optional[str] = None) -> str:
         """Agentic run for the Copilot CLI backend.
 
-        Runs every enabled skill locally against *ctx*, streams a trace of each
-        skill result, embeds the findings in the prompt, and issues a single
-        CLI call for the final A-F diagnosis.
+        When ``cli_use_mcp`` is set, the investigative tools are exposed to the
+        Copilot CLI via a local MCP server so the model drives them itself
+        (true agentic orchestration). Otherwise it falls back to running the
+        enabled bulk skills locally and folding their findings into the prompt.
         """
+        if self.config.cli_use_mcp:
+            try:
+                return self._run_agentic_cli_mcp(report, ctx, emit, session_id)
+            except Exception as exc:  # noqa: BLE001
+                emit(f"⚠ MCP path failed ({exc}); falling back to local skills.")
+
         enabled = skill_manager.enabled_skills()
-        emit(f"CLI agentic run: executing {len(enabled)} enabled skill(s) "
+        bulk = [s for s in enabled if not getattr(s, "on_demand", False)]
+        emit(f"CLI agentic run: executing {len(bulk)} enabled skill(s) "
              "locally, then handing evidence to the Copilot CLI.")
 
         evidence_blocks: List[str] = []
-        for skill in enabled:
+        for skill in bulk:
             emit(f"→ Running skill: {skill.skill_id}")
             try:
                 result = skill.run(ctx)
@@ -535,9 +578,74 @@ class DebugAgent:
         return self._call_cli(AGENTIC_SYSTEM_PROMPT, payload,
                               session_id=session_id)
 
+    def _run_agentic_cli_mcp(self, report: Any, ctx: Any, emit,
+                             session_id: Optional[str] = None) -> str:
+        """CLI agentic run where the model drives the investigative tools via a
+        local MCP server.
+
+        Serialises the analysis evidence to a temp file, writes an MCP server
+        config pointing at :mod:`atpg_coverage_debug_agent.mcp_server`, and runs
+        the Copilot CLI with that config so the model can call
+        ``list_faults`` / ``get_fault_detail`` / ``why_blocked`` /
+        ``list_constraints`` / ``trace_path`` itself.
+        """
+        evidence = investigate.export_evidence(
+            ctx.fault_results, ctx.constraints, ctx.netlist,
+            adjacency=getattr(ctx, "adjacency", None))
+        ev_fd, ev_path = tempfile.mkstemp(prefix="atpg_evidence_", suffix=".json")
+        with os.fdopen(ev_fd, "w", encoding="utf-8") as fh:
+            json.dump(evidence, fh)
+
+        server_env = {
+            "PYTHONPATH": _REPO_ROOT,
+            "ATPG_EVIDENCE_FILE": ev_path,
+        }
+        if self.config.cli_home.strip():
+            server_env["COPILOT_HOME"] = self.config.cli_home.strip()
+        mcp_cfg = {
+            "mcpServers": {
+                "atpg": {
+                    "tools": ["*"],
+                    "type": "local",
+                    "command": sys.executable,
+                    "args": ["-m", "atpg_coverage_debug_agent.mcp_server"],
+                    "env": server_env,
+                }
+            }
+        }
+        cfg_fd, cfg_path = tempfile.mkstemp(prefix="atpg_mcp_", suffix=".json")
+        with os.fdopen(cfg_fd, "w", encoding="utf-8") as fh:
+            json.dump(mcp_cfg, fh)
+
+        tool_names = ", ".join(investigate.TOOL_SPECS)
+        payload = build_user_payload(report, self.config.max_faults,
+                                     agentic=True)
+        payload += (
+            "\n\n## AVAILABLE MCP TOOLS (server 'atpg')\n"
+            "You can call these deterministic investigation tools to gather "
+            "exact structural evidence before concluding: " + tool_names + ".\n"
+            "Use them to drill into specific faults, constraints, and paths "
+            "(e.g. list_faults(fault_class='UO'), get_fault_detail(fault=...), "
+            "why_blocked(fault=...), trace_path(from_instance=..., "
+            "to_instance=...)). Every result is Observed/Derived structural "
+            "fact. When you have enough evidence, produce the full A-F report.")
+
+        emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")
+        try:
+            return self._call_cli(
+                AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
+                extra_args=["--additional-mcp-config", "@" + cfg_path])
+        finally:
+            for p in (ev_path, cfg_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
     def _call_cli(self, system_prompt: str, user_payload: str,
                   session_id: Optional[str] = None,
-                  resume: bool = False) -> str:
+                  resume: bool = False,
+                  extra_args: Optional[List[str]] = None) -> str:
         """Run the local GitHub Copilot CLI as a subprocess and return its text.
 
         The full system prompt and structural evidence are passed as a single
@@ -588,6 +696,8 @@ class DebugAgent:
             cmd += ["--session-id", session_id]
         if self.config.cli_model.strip():
             cmd += ["--model", self.config.cli_model.strip()]
+        if extra_args:
+            cmd += list(extra_args)
 
         try:
             proc = subprocess.run(

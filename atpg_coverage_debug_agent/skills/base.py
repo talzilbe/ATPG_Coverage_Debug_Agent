@@ -93,6 +93,9 @@ class AnalysisContext:
     fault_results: Any    # List[FaultAnalysisResult]
     pattern_groups: Any   # List[PatternGroup]
     summary: Any          # AnalysisSummary
+    #: Optional serialised adjacency used when ``netlist`` is unavailable
+    #: (e.g. after loading a saved report) so path tracing still works.
+    adjacency: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +117,10 @@ class SkillBase(ABC):
     description: str = ""
     #: Whether the skill is enabled by default.
     default_enabled: bool = True
+    #: On-demand tools take arguments and answer targeted questions; they are
+    #: exposed to the agent as callable tools but skipped in the bulk
+    #: "run all skills" pass (where they would run with empty arguments).
+    on_demand: bool = False
 
     def __init__(self) -> None:
         self._params: Dict[str, Any] = {}

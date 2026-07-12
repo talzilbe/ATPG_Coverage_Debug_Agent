@@ -221,6 +221,18 @@ class AgentPanel(QWidget):
             self._notify_config_changed)
         form.addRow("CLI model:", self.cli_model_combo)
 
+        self.cli_mcp_check = QCheckBox(
+            "Let the agent drive investigation tools (MCP)")
+        self.cli_mcp_check.setChecked(True)
+        self.cli_mcp_check.setToolTip(
+            "In agentic mode, expose the investigative tools (list_faults, "
+            "get_fault_detail, why_blocked, list_constraints, trace_path) to "
+            "the Copilot CLI via a local MCP server so the model calls them "
+            "itself and iterates. When off, the enabled skills are run locally "
+            "and their findings are folded into a single prompt.")
+        self.cli_mcp_check.toggled.connect(self._notify_config_changed)
+        form.addRow("Agentic tools:", self.cli_mcp_check)
+
         # -- HTTP endpoint fields --
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText(
@@ -464,7 +476,7 @@ class AgentPanel(QWidget):
         """Show only the fields relevant to the selected backend."""
         is_cli = self._current_backend() == "cli"
         for w in (self.cli_path_row_widget, self.cli_home_edit,
-                  self.cli_model_combo):
+                  self.cli_model_combo, self.cli_mcp_check):
             self._form.setRowVisible(w, is_cli)
         for w in (self.base_url_edit, self.model_edit, self.api_key_edit):
             self._form.setRowVisible(w, not is_cli)
@@ -540,6 +552,7 @@ class AgentPanel(QWidget):
             cli_home=self.cli_home_edit.text().strip(),
             cli_model=self.cli_model_combo.currentText().strip(),
             cli_token=self.auth_token_edit.text(),
+            cli_use_mcp=self.cli_mcp_check.isChecked(),
         )
 
     # -- settings persistence (no secrets) -----------------------------------
@@ -553,6 +566,7 @@ class AgentPanel(QWidget):
             "cli_path": self.cli_path_edit.text().strip(),
             "cli_home": self.cli_home_edit.text().strip(),
             "cli_model": self.cli_model_combo.currentText().strip(),
+            "cli_use_mcp": self.cli_mcp_check.isChecked(),
             "temperature": float(self.temp_spin.value()),
             "max_tokens": int(self.maxtok_spin.value()),
             "max_faults": int(self.maxfaults_spin.value()),
@@ -570,6 +584,7 @@ class AgentPanel(QWidget):
         if cfg.get("cli_home"):
             self.cli_home_edit.setText(cfg["cli_home"])
         self.cli_model_combo.setCurrentText(cfg.get("cli_model", "") or "auto")
+        self.cli_mcp_check.setChecked(bool(cfg.get("cli_use_mcp", True)))
         self.base_url_edit.setText(cfg.get("base_url", ""))
         self.model_edit.setText(cfg.get("model", "") or "")
         self.temp_spin.setValue(float(cfg.get("temperature", 0.0)))
@@ -612,6 +627,7 @@ class AgentPanel(QWidget):
             fault_results=r.fault_results,
             pattern_groups=r.pattern_groups,
             summary=r.summary,
+            adjacency=getattr(r, "adjacency", None),
         )
 
     def on_run(self) -> None:

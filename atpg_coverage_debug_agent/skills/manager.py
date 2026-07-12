@@ -106,6 +106,9 @@ class SkillManager:
         results: List[SkillResult] = []
         enabled = self.enabled_skills()
         for skill in enabled:
+            if getattr(skill, "on_demand", False):
+                # On-demand query tools need arguments; skip in the bulk pass.
+                continue
             if progress:
                 progress(f"Running skill: {skill.display_name}")
             try:
