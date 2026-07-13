@@ -22,23 +22,31 @@ _LOSS_CLASSES = ("AU", "UO", "UC")
 def apply_exclusions(report: AnalysisReport,
                      excluded_classes: Iterable[str] = (),
                      excluded_ids: Iterable[str] = (),
+                     excluded_subtypes: Iterable[str] = (),
                      note: str = "") -> AnalysisReport:
     """Return a new report with the given faults excluded and summary recomputed.
 
     Args:
-        report:           The base (unedited) report.
-        excluded_classes: Fault-class codes to drop entirely (e.g. ``["AU"]``).
-        excluded_ids:     Specific fault-object ids to drop.
-        note:             Analyst note stored on and shown in the report.
+        report:            The base (unedited) report.
+        excluded_classes:  Coarse fault-class codes to drop entirely
+            (e.g. ``["AU"]`` removes every AU fault regardless of subtype).
+        excluded_ids:      Specific fault-object ids/paths to drop.
+        excluded_subtypes: Dotted fault sub-class tokens to drop
+            (e.g. ``["AU.NOFAULTS", "AU.TC"]``) matched against the fault's
+            ``raw_class_token``.
+        note:              Analyst note stored on and shown in the report.
     """
     ex_classes = {c.strip().upper() for c in (excluded_classes or ()) if c}
     ex_ids = {i for i in (excluded_ids or ()) if i}
+    ex_subtypes = {s.strip().upper() for s in (excluded_subtypes or ()) if s}
 
     kept = []
     removed = 0
     for r in report.fault_results:
         cls = r.fault.fault_class.value
-        if cls in ex_classes or r.fault.fault_object in ex_ids:
+        subtype = (r.fault.raw_class_token or cls).upper()
+        if (cls in ex_classes or r.fault.fault_object in ex_ids
+                or subtype in ex_subtypes):
             removed += 1
             continue
         kept.append(r)
@@ -76,6 +84,7 @@ def apply_exclusions(report: AnalysisReport,
     edited.investigation = getattr(report, "investigation", None)
     edited.edits = {
         "excluded_classes": sorted(ex_classes),
+        "excluded_subtypes": sorted(ex_subtypes),
         "excluded_ids": sorted(ex_ids),
         "note": note or "",
         "removed_count": removed,
@@ -90,6 +99,9 @@ def edit_banner(edits: dict) -> str:
     parts = []
     if edits.get("excluded_classes"):
         parts.append("excluded classes: " + ", ".join(edits["excluded_classes"]))
+    if edits.get("excluded_subtypes"):
+        parts.append("excluded subtypes: "
+                     + ", ".join(edits["excluded_subtypes"]))
     if edits.get("excluded_ids"):
         parts.append(f"{len(edits['excluded_ids'])} fault(s) excluded by id")
     if edits.get("removed_count"):

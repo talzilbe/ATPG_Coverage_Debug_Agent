@@ -14,13 +14,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QThread, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStatusBar,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
-    QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSplitter, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from ..app import AnalysisInputs
@@ -44,6 +44,207 @@ _TABLE_HEADERS = [
     "Fault Object", "Class", "Mapped", "Confidence", "Instance", "Cell",
     "Fan-in", "Fan-out", "Ctrl", "Obsv", "Constraint", "Scan", "Root Cause",
 ]
+
+
+_HELP_HTML = """
+<html><head><style>
+  body { font-family: 'Segoe UI', sans-serif; color: #1f2933; line-height: 1.5;
+         padding: 8px 18px; }
+  h1 { color: #0b5394; font-size: 22px; margin: 4px 0 2px; }
+  h2 { color: #0b5394; font-size: 17px; margin: 20px 0 4px;
+       border-bottom: 2px solid #d0e2f2; padding-bottom: 3px; }
+  h3 { color: #1a5276; font-size: 14px; margin: 14px 0 3px; }
+  p, li { font-size: 13px; }
+  code { background: #eef2f7; padding: 1px 5px; border-radius: 3px;
+         font-family: Consolas, monospace; font-size: 12px; }
+  b.k { color: #0b5394; }
+  .tip { background: #e8f5e9; border-left: 4px solid #4CAF50;
+         padding: 6px 12px; margin: 8px 0; }
+  .warn { background: #fff8e1; border-left: 4px solid #FFC107;
+          padding: 6px 12px; margin: 8px 0; }
+  .step { margin: 2px 0; }
+  table { border-collapse: collapse; margin: 6px 0; }
+  td, th { border: 1px solid #cfd8e3; padding: 4px 9px; font-size: 12px;
+           text-align: left; vertical-align: top; }
+  th { background: #eef2f7; }
+</style></head><body>
+
+<h1>ATPG Coverage-Loss Debug Agent &mdash; Help</h1>
+<p>This tool analyses <b>structural</b> (non-simulation) ATPG coverage loss. It
+maps untestable / unobservable / uncontrollable faults onto your gate-level
+netlist, root-causes them, groups repeated patterns, and lets an AI agent
+explain the results. Everything below is organised in the order you would
+normally use it.</p>
+
+<div class="tip"><b>Quick start:</b> 1) pick a <b>Netlist</b> and a
+<b>Fault list</b> (constraints optional) &rarr; 2) click <b>Analyze</b> &rarr;
+3) read the <b>Summary</b> and <b>Coverage Loss Table</b> &rarr; 4) optionally
+run the <b>AI Debug Agent</b> for an explanation.</div>
+
+<h2>1. Input files (top of the window)</h2>
+<table>
+<tr><th>Field</th><th>What to load</th></tr>
+<tr><td><b class="k">Netlist (.v / .v.gz)</b></td>
+    <td>Gate-level Verilog structural netlist. Used to trace fan-in/fan-out,
+    map faults to instances, and find scan boundaries.</td></tr>
+<tr><td><b class="k">Fault list (.mtfi / .mtfi.gz / flat)</b></td>
+    <td>Tessent MTFI fault list or a flat <code>&lt;class&gt; &lt;value&gt;
+    &lt;path&gt;</code> list. Dotted subtypes (e.g. <code>AU.NOFAULTS</code>,
+    <code>AU.TC</code>) are preserved.</td></tr>
+<tr><td><b class="k">Constraints (optional .do)</b></td>
+    <td>Tessent constraint / dofile commands (force, disable, clock, reset,
+    tie…). Used to attribute constraint-induced coverage loss.</td></tr>
+<tr><td><b class="k">Output dir</b></td>
+    <td>Default folder for exported Markdown / CSV / JSON reports.</td></tr>
+</table>
+
+<h2>2. Action buttons</h2>
+<table>
+<tr><th>Button</th><th>Use</th></tr>
+<tr><td><b class="k">Analyze</b></td><td>Parse the inputs and build the report.
+    Runs in the background; watch the progress bar and status bar.</td></tr>
+<tr><td><b class="k">Cancel</b></td><td>Abort a running analysis.</td></tr>
+<tr><td><b class="k">Export Markdown / Export CSV</b></td>
+    <td>Save the report as Markdown, or the coverage-loss table as CSV.</td></tr>
+<tr><td><b class="k">Save Report / Load Report</b></td>
+    <td>Save the full analysis (including the AI investigation) to JSON and
+    reload it later &mdash; no need to re-run Analyze.</td></tr>
+<tr><td><b class="k">Compare Report</b></td>
+    <td>Load a previous (baseline) JSON report and diff it against the current
+    one: <b>regressed</b> (new loss), <b>fixed</b>, and <b>changed</b> faults.
+    You can then ask the AI agent &ldquo;what changed vs the baseline?&rdquo;</td></tr>
+<tr><td><b class="k">Edit Report</b></td>
+    <td>Waive faults and recompute coverage &mdash; see section 4.</td></tr>
+<tr><td><b class="k">Clear</b></td><td>Reset the views to start fresh.</td></tr>
+</table>
+
+<h2>3. Result tabs</h2>
+<h3>Summary</h3>
+<p>A full HTML report: coverage metric, fault-class / subtype breakdown, top
+root causes, module and instance hotspots, and any analyst note. Click
+<b>Open Report in Browser</b> for the full-fidelity version (and a shareable
+local link).</p>
+
+<h3>Coverage Loss Table</h3>
+<p>One row per coverage-loss fault with its class, mapped instance, mapping
+confidence, fan-in/out sizes, controllability / observability / constraint /
+scan-boundary flags, and the diagnosed root cause.</p>
+<ul>
+  <li class="step"><b>Filter</b> by substring, fault class, or mapping
+      confidence; <b>Export Filtered CSV</b> saves just the visible rows.</li>
+  <li class="step"><b>Click a row</b> to see full per-fault evidence in the
+      Details panel on the right.</li>
+  <li class="step"><b>Right-click a row</b> to <i>Ask the AI agent about this
+      fault</i> or <i>Exclude selected fault(s)</i> from the report.</li>
+</ul>
+
+<h3>Logs / Warnings</h3>
+<p>Parser and skill warnings (unrecognised lines, unresolved mappings, etc.).
+Check here first if a result looks incomplete.</p>
+
+<h3>Skills</h3>
+<p>Toggle and configure the deterministic analysis skills (coverage hotspots,
+constraint impact, fault-cone summary, scan-boundary, DFT/ATPG debug…). Each
+card has an enable checkbox and tunable parameters; changes persist.</p>
+
+<h3>Custom Skills</h3>
+<p>Load your own Python skills from a directory, or write one in the built-in
+editor from the provided template, to add project-specific detectors. Loaded
+custom skills appear on the Skills tab and become AI agent tools.</p>
+
+<h2>4. Edit Report &mdash; waiving faults &amp; recomputing coverage</h2>
+<p>Open with <b>Edit Report</b>. Excluded faults are removed from the totals so
+the coverage metric rises, while the report <b>layout stays identical</b>.
+Edits are reversible (they apply to a pristine base report) and are saved with
+the JSON report. You can waive at four levels:</p>
+<ul>
+  <li class="step"><b>Whole classes</b> &mdash; all <code>AU</code> /
+      <code>UO</code> / <code>UC</code> faults.</li>
+  <li class="step"><b>Specific subtypes</b> &mdash; tick e.g.
+      <code>AU.NOFAULTS</code> or <code>AU.TC</code> (each shown with its fault
+      count).</li>
+  <li class="step"><b>Individual faults by path</b> &mdash; type object paths,
+      one per line.</li>
+  <li class="step"><b>Table selection</b> &mdash; right-click selected rows in
+      the Coverage Loss Table &rarr; <i>Exclude selected fault(s)</i>.</li>
+</ul>
+<p>Add an <b>analyst note</b> to record <i>why</i> the waiver is legitimate; it
+appears on the report.</p>
+
+<h2>5. AI Debug Agent &mdash; usage guide</h2>
+<p>The agent explains coverage loss using an evidence-driven ATPG/DFT prompt.
+It reads only the deterministic report, so it cannot invent faults. Run an
+Analyze first, then open the <b>AI Debug Agent</b> tab.</p>
+
+<h3>Step 1 &mdash; choose a backend (LLM Backend box)</h3>
+<ul>
+  <li class="step"><b>GitHub Copilot CLI (local subprocess)</b> &mdash; the
+      default. Uses the bundled <code>copilot</code> CLI; data stays in the
+      CLI's authenticated channel. Set the <b>CLI model</b>
+      (<code>auto</code> lets Copilot choose).</li>
+  <li class="step"><b>OpenAI-compatible HTTP endpoint</b> &mdash; point at an
+      internal endpoint with a Base URL, Model id, and API key (kept in memory
+      only, never written to disk).</li>
+</ul>
+
+<h3>Step 2 &mdash; authenticate (CLI backend only)</h3>
+<p>On the agent's <b>Authentication</b> sub-tab, use <b>either</b>:</p>
+<ul>
+  <li class="step"><b>Option A &mdash; GitHub token:</b> paste a fine-grained
+      PAT with the <i>Copilot Requests</i> permission (or an OAuth token).
+      Classic <code>ghp_</code> tokens are not supported.</li>
+  <li class="step"><b>Option B &mdash; device login:</b> click <i>Sign in with
+      device code</i>, open the shown URL and enter the code.</li>
+</ul>
+<div class="warn">On a headless host with no keychain, the browser login can
+succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
+<b>Check authentication</b> to confirm you are signed in.</div>
+
+<h3>Step 3 &mdash; pick a mode</h3>
+<ul>
+  <li class="step"><b>Standard</b> (agentic off): the enabled skills run
+      locally and their findings are folded into a single prompt.</li>
+  <li class="step"><b>Agentic mode</b>: the model itself decides which
+      investigative tools to call (<code>list_faults</code>,
+      <code>get_fault_detail</code>, <code>why_blocked</code>,
+      <code>list_constraints</code>, <code>trace_path</code>) and iterates. For
+      the CLI backend this is driven through a local <b>MCP</b> server
+      (&ldquo;Agentic tools (MCP)&rdquo; checkbox). The HTTP backend needs an
+      endpoint that supports tool/function calling.</li>
+</ul>
+
+<h3>Step 4 &mdash; run &amp; review</h3>
+<table>
+<tr><th>Button</th><th>Use</th></tr>
+<tr><td><b class="k">Run AI Debug Agent</b></td><td>Generate the A&ndash;F
+    diagnosis. Output streams into the Agent Response pane; fault ids are
+    clickable and focus the row in the table.</td></tr>
+<tr><td><b class="k">Build Prompt Only</b></td><td>Preview exactly what would be
+    sent to the LLM, without calling it.</td></tr>
+<tr><td><b class="k">Verify</b></td><td>Cross-check the answer against the
+    report &mdash; confirms every referenced fault exists and flags invented
+    paths.</td></tr>
+<tr><td><b class="k">Suggest Fixes</b></td><td>Deterministically rank faults by
+    impact and propose concrete DFT fixes (observation/control points,
+    constraint relaxation, scan insertion). No LLM used.</td></tr>
+<tr><td>Copy / Save Prompt &amp; Response</td><td>Export the prompt or the
+    agent's answer.</td></tr>
+</table>
+
+<h3>Step 5 &mdash; follow-up chat</h3>
+<p>After a run, use <b>Follow-up Chat</b> to ask questions about the diagnosis;
+the conversation keeps the full analysis context (e.g. &ldquo;which module
+contributes the most loss?&rdquo;, &ldquo;how would a control point on X
+help?&rdquo;). <b>Max tokens</b>, <b>Temperature</b>, and <b>Max faults in
+prompt</b> tune size and determinism (temperature&nbsp;0 is most repeatable).</p>
+
+<div class="tip"><b>Recommended flow:</b> Analyze &rarr; skim Summary &rarr;
+run the agent in Agentic mode &rarr; <b>Verify</b> the answer &rarr; ask
+follow-ups &rarr; <b>Suggest Fixes</b> &rarr; waive legitimate faults via
+<b>Edit Report</b> &rarr; <b>Save Report</b>.</div>
+
+</body></html>
+"""
 
 
 class _QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
@@ -174,9 +375,9 @@ class MainWindow(QMainWindow):
         self.compare_btn.clicked.connect(self.on_compare_report)
         self.edit_btn = QPushButton("Edit Report")
         self.edit_btn.setToolTip(
-            "Exclude fault classes (e.g. AU / waived faults) or add an analyst "
-            "note; the summary and tables recompute. Reversible and saved with "
-            "the report.")
+            "Waive whole classes (AU/UO/UC), specific subtypes (e.g. "
+            "AU.NOFAULTS), or individual faults; coverage recomputes and the "
+            "layout is unchanged. Reversible and saved with the report.")
         self.edit_btn.clicked.connect(self.on_edit_report)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.on_clear)
@@ -308,6 +509,23 @@ class MainWindow(QMainWindow):
         self.logs_view.setReadOnly(True)
         return self.logs_view
 
+    def _show_help(self) -> None:
+        """Open the user guide in a scrollable dialog."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Help — User Guide")
+        dlg.resize(820, 720)
+        v = QVBoxLayout(dlg)
+        view = QTextBrowser()
+        view.setOpenExternalLinks(True)
+        view.setHtml(_HELP_HTML)
+        view.moveCursor(QTextCursor.Start)
+        v.addWidget(view, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        v.addWidget(buttons)
+        dlg.exec()
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         export_md = QAction("Export Markdown Report…", self)
@@ -332,6 +550,11 @@ class MainWindow(QMainWindow):
         reset_defaults = QAction("Reset Skill Defaults", self)
         reset_defaults.triggered.connect(self._on_reset_skill_defaults)
         skills_menu.addAction(reset_defaults)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        user_guide = QAction("User Guide…", self)
+        user_guide.triggered.connect(self._show_help)
+        help_menu.addAction(user_guide)
 
     def _on_enable_all_skills(self) -> None:
         self._skill_manager.enable_all()
@@ -581,10 +804,22 @@ class MainWindow(QMainWindow):
         fault_object = id_item.text()
         menu = QMenu(self)
         ask_act = menu.addAction("Ask AI agent about this fault")
+        rows = {idx.row() for idx in self.table.selectionModel().selectedRows()}
+        rows.add(item.row())
+        exclude_act = None
+        if self._base_report:
+            label = ("Exclude selected fault(s) from report" if len(rows) > 1
+                     else "Exclude this fault from report")
+            exclude_act = menu.addAction(label)
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == ask_act:
             self._switch_to_tab("AI Debug Agent")
             self.agent_panel.ask_about_fault(fault_object)
+        elif exclude_act is not None and chosen == exclude_act:
+            if not self.table.selectionModel().isRowSelected(
+                    item.row(), self.table.rootIndex()):
+                self.table.selectRow(item.row())
+            self._exclude_selected_faults()
 
     def _switch_to_tab(self, title: str) -> None:
         for i in range(self.tabs.count()):
@@ -861,46 +1096,135 @@ class MainWindow(QMainWindow):
             return
         current_edits = getattr(self._report, "edits", None) or {}
         ex_classes = set(current_edits.get("excluded_classes", []))
+        ex_subtypes = {s.upper() for s in current_edits.get("excluded_subtypes", [])}
+        ex_ids = list(current_edits.get("excluded_ids", []))
         note = current_edits.get("note", "")
+
+        # Loss subtypes present in the *base* report, with their fault counts.
+        subtype_counts = self._loss_subtype_counts(self._base_report)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Report")
         v = QVBoxLayout(dlg)
         v.addWidget(QLabel(
-            "Exclude coverage-loss fault classes (e.g. waive AU faults) and/or "
-            "record an analyst note. The summary and tables recompute; edits "
-            "are reversible and saved with the report."))
-        checks = {}
+            "Waive coverage-loss faults and/or record an analyst note. Excluded "
+            "faults are removed from the totals so the coverage metric recomputes; "
+            "the report layout is unchanged. Edits are reversible and saved with "
+            "the report."))
+
+        # --- Whole coarse classes -------------------------------------------
+        class_box = QGroupBox("Exclude whole fault classes")
+        class_layout = QVBoxLayout(class_box)
+        class_checks = {}
         for cls in ("AU", "UO", "UC"):
             cb = QCheckBox(f"Exclude all {cls} faults")
             cb.setChecked(cls in ex_classes)
-            v.addWidget(cb)
-            checks[cls] = cb
+            class_layout.addWidget(cb)
+            class_checks[cls] = cb
+        v.addWidget(class_box)
+
+        # --- Specific subtypes (e.g. AU.NOFAULTS) ---------------------------
+        subtype_checks = {}
+        if subtype_counts:
+            sub_box = QGroupBox("Exclude specific fault subtypes")
+            sub_outer = QVBoxLayout(sub_box)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            inner = QWidget()
+            inner_layout = QVBoxLayout(inner)
+            for token, count in subtype_counts:
+                cb = QCheckBox(f"{token}  ({count} fault{'s' if count != 1 else ''})")
+                cb.setChecked(token.upper() in ex_subtypes)
+                inner_layout.addWidget(cb)
+                subtype_checks[token] = cb
+            inner_layout.addStretch(1)
+            scroll.setWidget(inner)
+            scroll.setMinimumHeight(120)
+            sub_outer.addWidget(scroll)
+            v.addWidget(sub_box, 1)
+
+        # --- Specific faults by id / path -----------------------------------
+        v.addWidget(QLabel("Exclude specific faults by object path (one per line):"))
+        ids_edit = QPlainTextEdit()
+        ids_edit.setPlainText("\n".join(ex_ids))
+        ids_edit.setPlaceholderText("/top/u_seq/optlc_900/o")
+        ids_edit.setMaximumHeight(80)
+        v.addWidget(ids_edit)
+
         v.addWidget(QLabel("Analyst note / annotation:"))
         note_edit = QPlainTextEdit()
         note_edit.setPlainText(note)
         note_edit.setPlaceholderText(
-            "e.g. AU faults reviewed and waived as legitimately untestable "
+            "e.g. AU.NOFAULTS reviewed and waived as legitimately untestable "
             "(black-box RAM boundary).")
+        note_edit.setMaximumHeight(80)
         v.addWidget(note_edit, 1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         v.addWidget(buttons)
-        dlg.resize(520, 360)
+        dlg.resize(560, 560)
         if dlg.exec() != QDialog.Accepted:
             return
 
-        excluded = [cls for cls, cb in checks.items() if cb.isChecked()]
+        excluded = [cls for cls, cb in class_checks.items() if cb.isChecked()]
+        excluded_subtypes = [tok for tok, cb in subtype_checks.items()
+                             if cb.isChecked()]
+        excluded_ids = [ln.strip() for ln in ids_edit.toPlainText().splitlines()
+                        if ln.strip()]
         new_note = note_edit.toPlainText().strip()
         edited = report_edit.apply_exclusions(
-            self._base_report, excluded_classes=excluded, note=new_note)
+            self._base_report, excluded_classes=excluded,
+            excluded_subtypes=excluded_subtypes, excluded_ids=excluded_ids,
+            note=new_note)
         self._apply_report(edited)
         banner = report_edit.edit_banner(edited.edits)
         self.statusBar().showMessage(
             "Report edited" + (f": {banner}" if banner else " (note updated).")
             + f"  {edited.summary.coverage_loss_count} coverage-loss faults remain.")
+
+    @staticmethod
+    def _loss_subtype_counts(report: AnalysisReport) -> List[tuple]:
+        """Return ``[(subtype_token, count), ...]`` for coverage-loss subtypes.
+
+        Only dotted subtypes whose coarse class is a coverage-loss class
+        (``AU`` / ``UO`` / ``UC``) are offered for waiving; they are sorted by
+        descending count so the biggest contributors surface first.
+        """
+        from collections import Counter
+        counts: Counter = Counter()
+        for r in report.fault_results:
+            cls = r.fault.fault_class.value
+            if cls not in ("AU", "UO", "UC"):
+                continue
+            token = r.fault.raw_class_token or cls
+            if "." in token:
+                counts[token] += 1
+        return counts.most_common()
+
+    def _exclude_selected_faults(self) -> None:
+        """Waive the faults selected in the Coverage Loss Table."""
+        if not self._base_report:
+            return
+        objects = set()
+        for item in self.table.selectedItems():
+            if item.column() == 0:
+                objects.add(item.text())
+        if not objects:
+            return
+        current_edits = getattr(self._report, "edits", None) or {}
+        ex_ids = set(current_edits.get("excluded_ids", [])) | objects
+        edited = report_edit.apply_exclusions(
+            self._base_report,
+            excluded_classes=current_edits.get("excluded_classes", []),
+            excluded_subtypes=current_edits.get("excluded_subtypes", []),
+            excluded_ids=sorted(ex_ids),
+            note=current_edits.get("note", ""))
+        self._apply_report(edited)
+        self.statusBar().showMessage(
+            f"Excluded {len(objects)} fault(s).  "
+            f"{edited.summary.coverage_loss_count} coverage-loss faults remain.")
 
     def on_compare_report(self) -> None:
         if not self._report:
