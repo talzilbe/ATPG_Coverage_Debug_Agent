@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .analysis.summarizer import build_report
 from .models import AnalysisReport
@@ -140,3 +140,38 @@ def run_analysis(netlist_path: str, faults_path: str,
         progress=progress,
         skill_manager=skill_manager,
     )
+
+
+@dataclass
+class PartitionInputs:
+    """One named partition: a display name plus its resolved input paths."""
+
+    name: str
+    inputs: AnalysisInputs
+
+
+def analyze_partitions(partitions: List["PartitionInputs"], progress=None,
+                       skill_manager=None) -> List[Tuple[str, AnalysisReport]]:
+    """Analyse several partitions and return ``[(name, report), ...]``.
+
+    Each partition is analysed independently through :func:`analyze_paths`, so
+    the returned reports are self-contained and can be shown side by side. The
+    optional ``progress`` callback receives ``(done_partitions, total, msg)``
+    where the message is prefixed with the active partition name.
+
+    Raises:
+        FileNotFoundError / ValueError: propagated from the first partition
+        whose inputs are missing.
+    """
+    results: List[Tuple[str, AnalysisReport]] = []
+    total = len(partitions)
+    for i, part in enumerate(partitions):
+        def _sub(done, sub_total, msg, _i=i, _name=part.name):
+            if progress:
+                progress(_i, total, f"[{_name}] {msg}")
+        report = analyze_paths(part.inputs, progress=_sub,
+                               skill_manager=skill_manager)
+        results.append((part.name, report))
+    if progress:
+        progress(total, total, "All partitions complete")
+    return results

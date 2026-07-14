@@ -17,13 +17,13 @@ from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSplitter, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSplitter, QStatusBar, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from ..app import AnalysisInputs
+from ..app import AnalysisInputs, PartitionInputs, _design_name
 from ..analysis import investigate, regression, report_edit
 from ..config.settings import AppSettings
 from ..models import AnalysisReport, FaultAnalysisResult
@@ -36,7 +36,7 @@ from .details_panel import DetailsPanel
 from .skills_panel import SkillsPanel
 from .agent_panel import AgentPanel
 from .custom_skills_panel import CustomSkillsPanel
-from .workers import start_worker
+from .workers import start_worker, start_multi_worker
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +296,13 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker = None
 
+        # Multi-partition state: a queue of partitions to analyze, and the
+        # analyzed partitions (each keeps its own pristine base + current
+        # report) plus the index of the one currently shown in every tab.
+        self._queued: List[PartitionInputs] = []
+        self._partitions: List[dict] = []
+        self._active_idx: int = -1
+
         # Background HTTP server used to publish a shareable report link.
         self._report_server: Optional[ThreadingHTTPServer] = None
         self._report_server_thread: Optional[threading.Thread] = None
@@ -347,6 +354,36 @@ class MainWindow(QMainWindow):
                        self.constraints_picker, self.outdir_picker):
             outer.addWidget(picker)
 
+        # --- Partition queue (analyze several partitions together) ---
+        part_bar = QHBoxLayout()
+        part_bar.addWidget(QLabel("Partitions:"))
+        self.partition_list = QListWidget()
+        self.partition_list.setMaximumHeight(78)
+        self.partition_list.setToolTip(
+            "Partitions queued for analysis. Set the netlist / fault list / "
+            "constraints above, click 'Add Partition', then repeat for each "
+            "partition. 'Analyze' runs them all; leave empty to analyze the "
+            "single file set above.")
+        part_bar.addWidget(self.partition_list, 1)
+        part_btns = QVBoxLayout()
+        self.add_partition_btn = QPushButton("Add Partition")
+        self.add_partition_btn.setToolTip(
+            "Queue the current netlist / fault list / constraints as a named "
+            "partition.")
+        self.add_partition_btn.clicked.connect(self.on_add_partition)
+        self.remove_partition_btn = QPushButton("Remove")
+        self.remove_partition_btn.setToolTip(
+            "Remove the selected partition from the queue.")
+        self.remove_partition_btn.clicked.connect(self.on_remove_partition)
+        self.clear_partitions_btn = QPushButton("Clear Queue")
+        self.clear_partitions_btn.clicked.connect(self.on_clear_partitions)
+        for b in (self.add_partition_btn, self.remove_partition_btn,
+                  self.clear_partitions_btn):
+            part_btns.addWidget(b)
+        part_btns.addStretch(1)
+        part_bar.addLayout(part_btns)
+        outer.addLayout(part_bar)
+
         btn_row = QHBoxLayout()
         self.analyze_btn = QPushButton("Analyze")
         self.analyze_btn.clicked.connect(self.on_analyze)
@@ -392,6 +429,23 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         outer.addWidget(self.progress)
+
+        # --- Active-partition selector (shown after a multi-partition run) ---
+        sel_row = QHBoxLayout()
+        self.partition_selector_label = QLabel("Active partition:")
+        self.partition_selector = QComboBox()
+        self.partition_selector.setToolTip(
+            "Switch the partition shown in every tab below (Summary, table, "
+            "AI agent, Edit Report). Each partition keeps its own report and "
+            "edits.")
+        self.partition_selector.currentIndexChanged.connect(
+            self._on_partition_selected)
+        sel_row.addWidget(self.partition_selector_label)
+        sel_row.addWidget(self.partition_selector, 1)
+        sel_row.addStretch(1)
+        self.partition_selector_label.setVisible(False)
+        self.partition_selector.setVisible(False)
+        outer.addLayout(sel_row)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_summary_tab(), "Summary")
@@ -582,6 +636,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Custom skills loaded — see the Skills tab.")
 
     def on_analyze(self) -> None:
+        if self._queued:
+            self._save_settings()
+            self._start_multi_analysis(list(self._queued))
+            return
+
         netlist = self.netlist_picker.path()
         faults = self.faults_picker.path()
         constraints = self.constraints_picker.path() or None
@@ -603,6 +662,52 @@ class MainWindow(QMainWindow):
         inputs = AnalysisInputs(netlist, faults, constraints)
         self._start_analysis(inputs)
 
+    def _unique_partition_name(self, base: str) -> str:
+        """Return *base* made unique against already-queued partition names."""
+        existing = {p.name for p in self._queued}
+        if base not in existing:
+            return base
+        i = 2
+        while f"{base}_{i}" in existing:
+            i += 1
+        return f"{base}_{i}"
+
+    def on_add_partition(self) -> None:
+        netlist = self.netlist_picker.path()
+        faults = self.faults_picker.path()
+        constraints = self.constraints_picker.path() or None
+        if not netlist or not os.path.isfile(netlist):
+            self._error("Select a valid netlist file before adding a partition.")
+            return
+        if not faults or not os.path.isfile(faults):
+            self._error("Select a valid fault-list file before adding a partition.")
+            return
+        if constraints and not os.path.isfile(constraints):
+            self._error("The constraint path is set but the file does not exist.")
+            return
+        base = _design_name(netlist) or f"partition_{len(self._queued) + 1}"
+        name = self._unique_partition_name(base)
+        self._queued.append(
+            PartitionInputs(name, AnalysisInputs(netlist, faults, constraints)))
+        self.partition_list.addItem(
+            f"{name}  —  {os.path.basename(netlist)} / {os.path.basename(faults)}")
+        self.statusBar().showMessage(
+            f"Queued partition '{name}'. Set the next partition's files and "
+            f"click 'Add Partition' again, or click 'Analyze' to run all "
+            f"{len(self._queued)}.")
+
+    def on_remove_partition(self) -> None:
+        row = self.partition_list.currentRow()
+        if row < 0:
+            return
+        self.partition_list.takeItem(row)
+        del self._queued[row]
+
+    def on_clear_partitions(self) -> None:
+        self._queued = []
+        self.partition_list.clear()
+        self.statusBar().showMessage("Partition queue cleared.")
+
     def _start_analysis(self, inputs: AnalysisInputs) -> None:
         self.analyze_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -614,6 +719,23 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = start_worker(inputs, self._skill_manager)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _start_multi_analysis(self, partitions) -> None:
+        self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._set_export_enabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.statusBar().showMessage(
+            f"Analyzing {len(partitions)} partition(s)…")
+
+        self._thread, self._worker = start_multi_worker(
+            partitions, self._skill_manager)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_multi_finished)
         self._worker.failed.connect(self._on_failed)
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
@@ -634,6 +756,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.analyze_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self._reset_partitions()
         self._base_report = report
         self._apply_report(report)
         n_skills = len(report.skill_results) if report.skill_results else 0
@@ -641,10 +764,74 @@ class MainWindow(QMainWindow):
             f"Done. {report.summary.coverage_loss_count} coverage-loss faults. "
             f"{n_skills} skill(s) ran.")
 
+    def _on_multi_finished(self, results) -> None:
+        self.progress.setVisible(False)
+        self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self._partitions = [
+            {"name": name, "report": rep, "base_report": rep}
+            for name, rep in results
+        ]
+        self._active_idx = -1
+        self._populate_partition_selector()
+        if self._partitions:
+            self._set_active_partition(0)
+        total_loss = sum(
+            rep.summary.coverage_loss_count for _, rep in results)
+        self.statusBar().showMessage(
+            f"Done. {len(results)} partition(s), {total_loss} total "
+            f"coverage-loss faults. Use 'Active partition' to switch views.")
+
+    def _reset_partitions(self) -> None:
+        """Clear analyzed-partition state and hide the selector (single run)."""
+        self._partitions = []
+        self._active_idx = -1
+        self.partition_selector.blockSignals(True)
+        self.partition_selector.clear()
+        self.partition_selector.blockSignals(False)
+        self.partition_selector.setVisible(False)
+        self.partition_selector_label.setVisible(False)
+
+    def _populate_partition_selector(self) -> None:
+        self.partition_selector.blockSignals(True)
+        self.partition_selector.clear()
+        for p in self._partitions:
+            self.partition_selector.addItem(
+                f"{p['name']}  "
+                f"({p['report'].summary.coverage_loss_count} loss)")
+        self.partition_selector.blockSignals(False)
+        show = len(self._partitions) >= 1
+        self.partition_selector.setVisible(show)
+        self.partition_selector_label.setVisible(show)
+
+    def _set_active_partition(self, idx: int) -> None:
+        if not (0 <= idx < len(self._partitions)):
+            return
+        self._active_idx = idx
+        self.partition_selector.blockSignals(True)
+        self.partition_selector.setCurrentIndex(idx)
+        self.partition_selector.blockSignals(False)
+        p = self._partitions[idx]
+        self._base_report = p["base_report"]
+        self._apply_report(p["report"])
+
+    def _on_partition_selected(self, idx: int) -> None:
+        self._set_active_partition(idx)
+
     def _apply_report(self, report: AnalysisReport) -> None:
         """Populate all views from *report* (shared by Analyze and Load)."""
         self._report = report
         self._results = report.fault_results
+        # Keep the active partition's stored report in sync so edits/waivers
+        # survive switching between partitions.
+        if 0 <= self._active_idx < len(self._partitions):
+            p = self._partitions[self._active_idx]
+            p["report"] = report
+            self.partition_selector.blockSignals(True)
+            self.partition_selector.setItemText(
+                self._active_idx,
+                f"{p['name']}  ({report.summary.coverage_loss_count} loss)")
+            self.partition_selector.blockSignals(False)
         self._set_export_enabled(True)
         self._populate(report)
         if report.skill_results:
@@ -1054,6 +1241,7 @@ class MainWindow(QMainWindow):
         self._base_report = None
         self._results = []
         self._report_html = None
+        self._reset_partitions()
         self.table.setRowCount(0)
         self.patterns_table.setRowCount(0)
         self._clear_summary()
@@ -1297,6 +1485,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self._error(f"Could not load report:\n{exc}")
             return
+        self._reset_partitions()
         self._base_report = report
         self._apply_report(report)
         self.statusBar().showMessage(
