@@ -56,17 +56,54 @@ through a **GUI**, a **CLI**, and **Markdown/CSV reports**.
 
 ## Installation
 
-Requires **Python 3.11+**.
+### Prerequisites
 
+- **Python 3.11+** (developed and tested on CPython 3.11).
+- **pip** and the standard-library **`venv`** module (to create a virtual
+  environment).
+- **PySide6** (installed from `requirements.txt`) — required for the GUI.
+- Optional: **networkx** (faster connectivity graph) and **pandas**
+  (CSV/table convenience). Both degrade gracefully if absent.
+- Optional, **only** for the AI Debug Agent's *GitHub Copilot CLI* backend:
+  **Node.js 18+ / npm** (or a prebuilt `copilot` binary). See
+  [Installing the GitHub Copilot CLI](#installing-the-github-copilot-cli-for-the-ai-debug-agent).
+
+### Set up the Python environment
+
+From the project root (the folder containing `requirements.txt`):
+
+**Linux / macOS (bash/zsh):**
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Linux (tcsh / csh):**
+```tcsh
+python3.11 -m venv .venv
+source .venv/bin/activate.csh
+pip install -r requirements.txt
+```
+
+**Windows (PowerShell):**
 ```powershell
-# from the project root (the folder containing requirements.txt)
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-`PySide6` is required only for the GUI. `networkx` and `pandas` are optional;
-the tool degrades gracefully without them.
+`requirements.txt` installs:
+
+| Package | Version | Purpose |
+| --- | --- | --- |
+| `PySide6` | `>=6.5` | GUI framework (**required for the GUI**) |
+| `networkx` | `>=3.0` | Optional — faster connectivity graph |
+| `pandas` | `>=2.0` | Optional — CSV/table generation (stdlib fallback exists) |
+| `pytest` | `>=7.0` | Running the test suite |
+
+The CLI and the analysis engine work without `networkx`/`pandas`; only the GUI
+strictly needs `PySide6`.
 
 ---
 
@@ -100,21 +137,46 @@ Two backends are supported:
 - **OpenAI-compatible HTTP endpoint** — e.g. an internal LLM gateway
   (`base URL` + `model` + optional API key).
 
-### One-time setup for the Copilot CLI backend
+### Installing the GitHub Copilot CLI (for the AI Debug Agent)
 
-The Copilot CLI is **not** bundled with the repo (it is a large binary and is
-git-ignored). Install it yourself:
+The Copilot CLI is a large binary and is **not** committed to the repo
+(git-ignored). You only need it if you want the default **GitHub Copilot CLI**
+backend — the OpenAI-compatible **HTTP** backend needs no CLI at all.
+
+**Prerequisite:** Node.js 18+ and npm (for the npm install method).
+
+Install it with **one** of the following:
 
 ```bash
+# 1) npm (recommended) — puts a `copilot` command on your PATH
 npm install -g @github/copilot
-# or download a release binary from https://github.com/github/copilot-cli/releases
+copilot --version                 # verify the install
+
+# 2) Prebuilt binary — download from the releases page, then mark it executable
+#    https://github.com/github/copilot-cli/releases
+chmod +x /path/to/copilot
+/path/to/copilot --version
 ```
 
-Optionally keep the CLI's config/state off a quota-limited home directory:
+Keep the CLI's config/state **off** a quota-limited home directory (recommended
+on shared NFS hosts, where `$HOME` is small):
 
 ```bash
-export COPILOT_HOME=/path/with/space/copilot-home   # tcsh: setenv COPILOT_HOME ...
+export COPILOT_HOME=/path/with/space/copilot-home     # bash / zsh
 ```
+```tcsh
+setenv COPILOT_HOME /path/with/space/copilot-home     # tcsh / csh
+```
+
+Then point the GUI at it: **AI Debug Agent → Backend = *GitHub Copilot CLI*** →
+set the **Copilot CLI** field to your `copilot` executable via **Browse…**
+(or leave it if `copilot` is already on your PATH), and authenticate once on the
+**Authentication** tab (see [Using the AI Debug Agent](#using-the-ai-debug-agent)).
+
+> **Authentication needs a Copilot-enabled GitHub account.** Use the
+> **Authentication** tab's device-code sign-in, or paste a **fine-grained PAT**
+> with the *Copilot Requests* permission. Classic `ghp_` tokens are **not**
+> supported.
 
 ### Steps
 
@@ -129,7 +191,7 @@ export COPILOT_HOME=/path/with/space/copilot-home   # tcsh: setenv COPILOT_HOME 
    - paste a **fine-grained PAT** (with the *Copilot Requests* permission) into
      **Option A**. Classic `ghp_` tokens are not supported.
    - Click **Check authentication** to confirm.
-5. Tick **Agentic mode** and click **Run Agentic Agent**. The analysis skills
+5. Tick **Agentic mode** and click **Run AI Debug Agent**. The analysis skills
    run and the agent produces its A–F diagnosis. (Untick it for a single-shot
    run, or use **Build Prompt Only** to copy the prompt into your own chat.)
 6. Use the **Follow-up Chat** box to ask questions about the diagnosis — the
