@@ -17,9 +17,9 @@ from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSplitter, QStatusBar, QTabWidget, QTableWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
@@ -98,12 +98,43 @@ run the <b>AI Debug Agent</b> for an explanation.</div>
     <td>Default folder for exported Markdown / CSV / JSON reports.</td></tr>
 </table>
 
+<h3>Analyzing several partitions at once</h3>
+<p>You can queue multiple partitions (each its own netlist + fault list +
+optional constraints) and analyze them together:</p>
+<ul>
+  <li class="step">Set the files above, click <b class="k">Add Partition</b>
+      &mdash; it is queued with a name derived from the netlist. Repeat for
+      each partition.</li>
+  <li class="step"><b class="k">Remove</b> drops the selected queued partition;
+      <b class="k">Clear Queue</b> empties the list.</li>
+  <li class="step"><b>Analyze</b> then runs every queued partition (one after
+      another). If the queue is empty it just analyzes the single file set
+      above, exactly as before.</li>
+  <li class="step">After the run, an <b class="k">Active partition</b> dropdown
+      appears above the tabs. Switching it re-loads that partition's full
+      report into every tab &mdash; Summary, Coverage Loss Table, AI agent and
+      Edit Report all act on the selected partition, and each keeps its own
+      edits.</li>
+</ul>
+
+<h3>Auto-saving the report</h3>
+<p>Tick <b class="k">Auto-save report</b> (next to the buttons) to have Analyze
+save the JSON report for you. It first asks for a name, pre-filled with a
+default derived from the netlist &mdash; e.g. <code>par_base_punit.v.gz</code>
+&rarr; <code>par_base_punit_atpg_report</code> &mdash; then writes it to the
+<b>Output dir</b> (or the netlist's folder if none is set) once the run
+finishes. In a multi-partition run each partition is saved under its own
+derived name. The saved file is a full report you can re-open with
+<b>Load Report</b>.</p>
+
 <h2>2. Action buttons</h2>
 <table>
 <tr><th>Button</th><th>Use</th></tr>
 <tr><td><b class="k">Analyze</b></td><td>Parse the inputs and build the report.
     Runs in the background; watch the progress bar and status bar.</td></tr>
 <tr><td><b class="k">Cancel</b></td><td>Abort a running analysis.</td></tr>
+<tr><td><b class="k">Add Partition / Remove / Clear Queue</b></td>
+    <td>Build a queue of partitions to analyze together (see section 1).</td></tr>
 <tr><td><b class="k">Export Markdown / Export CSV</b></td>
     <td>Save the report as Markdown, or the coverage-loss table as CSV.</td></tr>
 <tr><td><b class="k">Save Report / Load Report</b></td>
@@ -115,6 +146,9 @@ run the <b>AI Debug Agent</b> for an explanation.</div>
     You can then ask the AI agent &ldquo;what changed vs the baseline?&rdquo;</td></tr>
 <tr><td><b class="k">Edit Report</b></td>
     <td>Waive faults and recompute coverage &mdash; see section 4.</td></tr>
+<tr><td><b class="k">Auto-save report</b> (checkbox)</td>
+    <td>Auto-save the JSON report to the Output dir after Analyze (see
+    section 1).</td></tr>
 <tr><td><b class="k">Clear</b></td><td>Reset the views to start fresh.</td></tr>
 </table>
 
@@ -238,6 +272,15 @@ contributes the most loss?&rdquo;, &ldquo;how would a control point on X
 help?&rdquo;). <b>Max tokens</b>, <b>Temperature</b>, and <b>Max faults in
 prompt</b> tune size and determinism (temperature&nbsp;0 is most repeatable).</p>
 
+<h3>Bigger, easier-to-read panels &mdash; pop-out windows</h3>
+<p>Each of the four panels &mdash; <b>Assembled Prompt</b>, <b>Agent Tool
+Trace</b>, <b>Agent Response</b> and <b>Follow-up Chat</b> &mdash; has an
+<b class="k">&#10530; Open in window</b> button in its top-right corner. Click it
+to detach that panel into a large, resizable window that is easier to read and
+type in. Live streaming, clickable fault ids, and the chat input all keep
+working in the pop-out. Close the window (or click <b>Dock back</b>) to return
+the panel to its place.</p>
+
 <div class="tip"><b>Recommended flow:</b> Analyze &rarr; skim Summary &rarr;
 run the agent in Agentic mode &rarr; <b>Verify</b> the answer &rarr; ask
 follow-ups &rarr; <b>Suggest Fixes</b> &rarr; waive legitimate faults via
@@ -302,6 +345,9 @@ class MainWindow(QMainWindow):
         self._queued: List[PartitionInputs] = []
         self._partitions: List[dict] = []
         self._active_idx: int = -1
+        # Pending JSON path for an auto-saved report (set at Analyze time when
+        # the Auto-save checkbox is on; consumed when the run finishes).
+        self._pending_save_path: Optional[str] = None
 
         # Background HTTP server used to publish a shareable report link.
         self._report_server: Optional[ThreadingHTTPServer] = None
@@ -341,6 +387,7 @@ class MainWindow(QMainWindow):
             self.agent_panel.import_settings(s.agent)
         if s.custom_skills_dir:
             self.custom_skills_panel.set_custom_dir(s.custom_skills_dir)
+        self.autosave_check.setChecked(bool(getattr(s, "auto_save_report", False)))
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -422,6 +469,13 @@ class MainWindow(QMainWindow):
                   self.csv_btn, self.save_report_btn, self.load_report_btn,
                   self.compare_btn, self.edit_btn, self.clear_btn):
             btn_row.addWidget(b)
+        self.autosave_check = QCheckBox("Auto-save report")
+        self.autosave_check.setToolTip(
+            "After Analyze, automatically save the JSON report into the Output "
+            "dir. You'll be asked for a name first (default derived from the "
+            "netlist, e.g. par_base_punit.v.gz \u2192 par_base_punit_atpg_report).")
+        self.autosave_check.toggled.connect(self._save_settings)
+        btn_row.addWidget(self.autosave_check)
         btn_row.addStretch(1)
         outer.addLayout(btn_row)
         self._set_export_enabled(False)
@@ -658,9 +712,74 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No constraints",
                 "No constraint file selected. Constraint-related diagnoses will be disabled.")
 
+        self._pending_save_path = None
+        if self.autosave_check.isChecked():
+            if not self._prompt_autosave_name(netlist):
+                return  # user cancelled the name dialog -> cancel Analyze
+
         self._save_settings()
         inputs = AnalysisInputs(netlist, faults, constraints)
         self._start_analysis(inputs)
+
+    def _default_report_name(self, netlist: str) -> str:
+        """Report base name derived from the netlist (``<design>_atpg_report``)."""
+        design = _design_name(netlist) or "atpg"
+        return f"{design}_atpg_report"
+
+    def _autosave_dir(self, netlist: str = "") -> str:
+        """Directory to auto-save into: the Output dir, else the netlist's dir."""
+        outdir = self.outdir_picker.path()
+        if outdir and os.path.isdir(outdir):
+            return outdir
+        return os.path.dirname(netlist) or os.getcwd()
+
+    def _prompt_autosave_name(self, netlist: str) -> bool:
+        """Ask for the auto-save report name; store the target path.
+
+        Returns ``False`` if the user cancelled (so Analyze is aborted).
+        """
+        default = self._default_report_name(netlist)
+        name, ok = QInputDialog.getText(
+            self, "Auto-save report",
+            "Save the analysis report under this name (in the output dir):",
+            text=default)
+        if not ok:
+            return False
+        name = (name or "").strip() or default
+        if not name.lower().endswith(".json"):
+            name += ".json"
+        self._pending_save_path = os.path.join(self._autosave_dir(netlist), name)
+        return True
+
+    def _auto_save_report(self, report: AnalysisReport, path: str) -> bool:
+        """Save *report* to *path*, folding in the current agent investigation."""
+        try:
+            report.investigation = self.agent_panel.export_investigation()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            save_report(report, path)
+        except OSError as exc:
+            self._error(f"Could not auto-save report:\n{exc}")
+            return False
+        return True
+
+    def _auto_save_partitions(self, results) -> int:
+        """Auto-save each partition report to the output dir; return the count."""
+        saved = 0
+        for name, report in results:
+            netlist = ""
+            if getattr(report, "sources", None):
+                netlist = report.sources.get("netlist", "") or ""
+            path = os.path.join(self._autosave_dir(netlist),
+                                f"{name}_atpg_report.json")
+            try:
+                save_report(report, path)
+                saved += 1
+            except OSError as exc:
+                logger.warning("Auto-save failed for partition %s: %s",
+                               name, exc)
+        return saved
 
     def _unique_partition_name(self, base: str) -> str:
         """Return *base* made unique against already-queued partition names."""
@@ -760,9 +879,13 @@ class MainWindow(QMainWindow):
         self._base_report = report
         self._apply_report(report)
         n_skills = len(report.skill_results) if report.skill_results else 0
-        self.statusBar().showMessage(
-            f"Done. {report.summary.coverage_loss_count} coverage-loss faults. "
-            f"{n_skills} skill(s) ran.")
+        msg = (f"Done. {report.summary.coverage_loss_count} coverage-loss "
+               f"faults. {n_skills} skill(s) ran.")
+        if self._pending_save_path:
+            if self._auto_save_report(report, self._pending_save_path):
+                msg += f"  Saved: {self._pending_save_path}"
+            self._pending_save_path = None
+        self.statusBar().showMessage(msg)
 
     def _on_multi_finished(self, results) -> None:
         self.progress.setVisible(False)
@@ -778,9 +901,14 @@ class MainWindow(QMainWindow):
             self._set_active_partition(0)
         total_loss = sum(
             rep.summary.coverage_loss_count for _, rep in results)
-        self.statusBar().showMessage(
-            f"Done. {len(results)} partition(s), {total_loss} total "
-            f"coverage-loss faults. Use 'Active partition' to switch views.")
+        msg = (f"Done. {len(results)} partition(s), {total_loss} total "
+               f"coverage-loss faults. Use 'Active partition' to switch views.")
+        if self.autosave_check.isChecked() and results:
+            saved = self._auto_save_partitions(results)
+            if saved:
+                msg += (f"  Auto-saved {saved} report(s) to "
+                        f"{self._autosave_dir()}.")
+        self.statusBar().showMessage(msg)
 
     def _reset_partitions(self) -> None:
         """Clear analyzed-partition state and hide the selector (single run)."""
@@ -1265,6 +1393,7 @@ class MainWindow(QMainWindow):
         s.update_skills(self._skill_manager.to_config())
         s.agent = self.agent_panel.export_settings()
         s.custom_skills_dir = self.custom_skills_panel.custom_dir()
+        s.auto_save_report = self.autosave_check.isChecked()
         s.save()
 
     def closeEvent(self, event: QCloseEvent) -> None:

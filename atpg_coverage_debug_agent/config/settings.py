@@ -50,6 +50,8 @@ class AppSettings:
     agent: Dict[str, Any] = field(default_factory=dict)
     #: Last used custom-skills directory.
     custom_skills_dir: str = ""
+    #: Auto-save the JSON report to the output dir after Analyze.
+    auto_save_report: bool = False
 
     # ------------------------------------------------------------------
     # persistence
