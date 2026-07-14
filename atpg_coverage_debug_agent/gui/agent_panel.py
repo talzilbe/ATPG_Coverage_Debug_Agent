@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -187,6 +188,10 @@ class AgentPanel(QWidget):
         self._compare = None
         self._stream_buf: str = ""
         self._chat_stream_buf: str = ""
+        # Pop-out ("open in window") state: maps a docked panel box to its open
+        # dialog + header button, so the same widget can be detached/re-docked.
+        self._popouts: dict = {}
+        self._popout_btns: dict = {}
         self._build()
 
     # -- UI ------------------------------------------------------------------
@@ -418,12 +423,104 @@ class AgentPanel(QWidget):
         chat_layout.addLayout(chat_row)
         layout.addWidget(chat_box, 1)
 
+        # Enable "open in window" (pop-out) on the four content panels. Store
+        # the containers so a detached panel can be docked back in place.
+        self._agent_layout = layout
+        self._splitter = splitter
+        self._splitter_boxes = [prompt_box, trace_box, resp_box]
+        self._splitter_stretch = [3, 2, 3]
+        self._chat_box = chat_box
+        self._attach_popout(prompt_box, prompt_layout, "Assembled Prompt")
+        self._attach_popout(trace_box, trace_layout,
+                            "Agent Tool Trace / Verification")
+        self._attach_popout(resp_box, resp_layout, "Agent Response")
+        self._attach_popout(chat_box, chat_layout,
+                            "Follow-up Chat with the Agent")
+
         self._set_chat_enabled(False)
         self._update_button_state()
         self._on_backend_changed()
 
         self.tabs.addTab(agent_tab, "Debug Agent")
         self.tabs.addTab(self._build_auth_tab(), "Authentication")
+
+    # -- Pop-out / dock panels ----------------------------------------------
+
+    def _attach_popout(self, box, box_layout, title: str) -> None:
+        """Add an 'Open in window' button to *box* that detaches it.
+
+        The header button, inserted at the top of ``box_layout``, opens *box*
+        in a large resizable window (the real widget is re-parented, so live
+        streaming, fault links and chat input keep working) and docks it back
+        when that window is closed.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        btn = QPushButton("\u2922  Open in window")
+        btn.setToolTip(
+            "Open this panel in a large, resizable window that is easier to "
+            "read and type in. Close the window (or click 'Dock back') to "
+            "return it here.")
+        btn.setFlat(True)
+        btn.clicked.connect(
+            lambda _=False, b=box, t=title: self._toggle_popout(b, t))
+        row.addWidget(btn)
+        box_layout.insertLayout(0, row)
+        self._popout_btns[box] = btn
+
+    def _toggle_popout(self, box, title: str) -> None:
+        # Already detached -> closing the window docks it back.
+        if box in self._popouts:
+            dlg, _ = self._popouts[box]
+            dlg.close()
+            return
+        btn = self._popout_btns.get(box)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{title} \u2014 ATPG Debug Agent")
+        dlg.setModal(False)
+        vlay = QVBoxLayout(dlg)
+        vlay.setContentsMargins(4, 4, 4, 4)
+        vlay.addWidget(box)
+        box.show()
+        if btn is not None:
+            btn.setText("\u29c9  Dock back")
+        dlg.finished.connect(lambda _=0, b=box: self._dock_back(b))
+        self._popouts[box] = (dlg, btn)
+        dlg.resize(1000, 720)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _dock_back(self, box) -> None:
+        entry = self._popouts.pop(box, None)
+        if entry is None:
+            return
+        dlg, btn = entry
+        self._restore_placement(box)
+        if btn is not None:
+            btn.setText("\u2922  Open in window")
+        dlg.deleteLater()
+
+    def _restore_placement(self, box) -> None:
+        """Return a detached *box* to its original spot in the layout."""
+        if box is self._chat_box:
+            self._agent_layout.addWidget(box, 1)
+            box.show()
+            return
+        order = self._splitter_boxes
+        pos = 0
+        for w in order:
+            if w is box:
+                break
+            if self._splitter.indexOf(w) != -1:
+                pos += 1
+        self._splitter.insertWidget(pos, box)
+        for i, w in enumerate(order):
+            idx = self._splitter.indexOf(w)
+            if idx != -1:
+                self._splitter.setStretchFactor(idx, self._splitter_stretch[i])
+        box.show()
 
     def _build_auth_tab(self) -> QWidget:
         """Authentication tab for the GitHub Copilot CLI backend."""
