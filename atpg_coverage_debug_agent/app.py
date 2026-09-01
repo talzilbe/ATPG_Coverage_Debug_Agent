@@ -112,10 +112,20 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report.constraints = constraints
     report.sources = _source_metadata(inputs)
 
+    # Self-audit: the paths and claims this tool just generated must trace
+    # back to the inputs. A violation here is a defect in the tool, so it is
+    # surfaced as a warning rather than silently shipped.
+    from .analysis.guardrails import audit_report, issues_as_warnings
+    audit_issues = audit_report(report)
+    if audit_issues:
+        report.warnings.extend(issues_as_warnings(audit_issues))
+        report.summary.warnings = list(report.warnings)
+
     if skill_manager is not None:
         if progress:
             progress(4, 5, "Running skills")
         from .skills.base import AnalysisContext
+        from .analysis.investigate import serialize_triage
         ctx = AnalysisContext(
             netlist=netlist,
             faults=faults,
@@ -123,6 +133,9 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
             fault_results=report.fault_results,
             pattern_groups=report.pattern_groups,
             summary=report.summary,
+            triage=serialize_triage(report.statistics,
+                                    report.selected_categories,
+                                    report.recommendations),
         )
         report.skill_results = skill_manager.run_all(ctx)
 

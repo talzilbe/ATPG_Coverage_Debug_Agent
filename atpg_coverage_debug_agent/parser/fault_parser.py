@@ -96,8 +96,10 @@ def _parse_line(line: str, line_number: int) -> Optional[FaultRecord]:
     raw_class_token = ""
     class_index = -1
     for idx, tok in enumerate(tokens):
-        if tok.upper() in _KNOWN_CLASS_TOKENS:
-            fault_class = FaultClass.from_token(tok)
+        # Accept dotted subtypes (``AU.TC``) as well as bare class tokens.
+        base = tok.split(".", 1)[0]
+        if base.upper() in _KNOWN_CLASS_TOKENS:
+            fault_class = FaultClass.from_token(base)
             raw_class_token = tok
             class_index = idx
             break

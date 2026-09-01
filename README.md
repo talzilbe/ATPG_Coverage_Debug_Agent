@@ -7,22 +7,53 @@ ATPG test coverage is lost** and **why**, starting from three artefacts:
 2. a **Tessent-style ATPG fault list**, and
 3. a **constraint file**.
 
-It correlates undetected faults back to netlist objects and produces an
-evidence-based root-cause diagnosis for every coverage-loss fault, surfaced
-through a **GUI**, a **CLI**, and **Markdown/CSV reports**.
+It correlates undetected faults back to netlist objects, ranks the categories
+worth debugging, names what is blocking them, and proposes concrete fixes with
+runnable commands &mdash; surfaced through a **GUI**, a **CLI**,
+**Markdown/CSV/HTML reports**, and an **AI agent** that investigates through the
+same deterministic tools.
 
 > **Important:** This is a *structural* analyzer, not a logic simulator or a
 > full Verilog compiler. Every conclusion is conservative and carries a
-> **confidence level** and **evidence**. Verify diagnoses before acting on them.
+> **confidence level** and **evidence**. It never predicts a coverage gain:
+> only re-running ATPG can establish that. Verify diagnoses before acting on
+> them.
 
 ---
 
 ## Features
 
+**Triage and fixes**
+
+- **Fault-subclass taxonomy** &mdash; dotted Tessent classes (`AU.PC`, `AU.TC`,
+  `AU.SEQ`, `AU.BB`, `AU.UDN`, `AU.CC`, `UC/UO.AAB`, `UC/UO.EAB`) are the ATPG
+  tool's own root-cause labels, so they drive the analysis instead of
+  structural guesswork.
+- **Derived coverage statistics** &mdash; per-class and per-subclass counts,
+  percentages and stuck-at split, computed from the fault list.
+- **Hierarchy clustering** with automatic depth selection, to show *where* the
+  loss concentrates (a pointer, never a root cause).
+- **Scored verdicts** &mdash; concentration, symmetry, stuck-at asymmetry and
+  depth produce a reproducible `true` / `partial` / `false` actionability call
+  with an explicit confidence level.
+- **Blocking-source attribution** &mdash; traces fan-in cones to name the tie
+  cell, test data register, unscanned flop or constrained pin responsible.
+- **Structural site profiling** &mdash; estimates why aborted faults were hard
+  to test: low controllability, hard observability gap, observability
+  bottleneck, reconvergent complexity or sequential depth explosion.
+- **Fix catalogue** &mdash; ranked, evidence-backed proposals with
+  preconditions, caveats and copyable Tessent commands. The tool never runs
+  them.
+- **Honesty guardrails** &mdash; every emitted hierarchy path must trace back
+  to an input file, and no coverage gain is ever predicted without a measured
+  re-run.
+
+**Core analysis**
+
 - Structural parser for the common gate-level Verilog subset (modules,
   instances, cell types, pin/net connectivity, driver/load relationships).
-- Flexible Tessent fault-list parser supporting multiple line layouts and the
-  fault classes `DS`, `DI`, `TI`, `AU`, `UO`, `UC`.
+- Flexible Tessent fault-list parser: the MTFI structured format and several
+  flat layouts, preserving dotted subclasses and stuck-at values.
 - Keyword-driven constraint parser (force / constant / disable / block /
   constrain / clock / reset / test-enable, plus Tessent
   `add_input_constraints ... C0|C1|CX`).
@@ -32,15 +63,23 @@ through a **GUI**, a **CLI**, and **Markdown/CSV reports**.
   `unresolved` confidence and candidate lists (no hidden ambiguity).
 - Conservative **root-cause engine** that separates *observed facts* from
   *inferred conclusions* and attaches evidence to every diagnosis.
-- Executive summary, per-fault detail table, and repeated-pattern grouping.
-- Output to console, GUI tables, Markdown, and CSV.
-- PySide6 GUI with file pickers, a worker thread (non-blocking analysis),
-  progress updates, sortable/filterable table, and a details panel.
-- `pytest` unit tests and synthetic sample inputs.
+
+**Interfaces**
+
+- PySide6 GUI: file pickers, non-blocking analysis, a **Triage &amp; Fix Plan**
+  tab, sortable/filterable fault table, per-fault details, multi-partition
+  queueing, report waivers, and save/load/compare of sessions.
+- CLI with console triage and fix plan, plus Markdown / CSV / HTML export.
+- An **AI Debug Agent** that investigates through deterministic tools, over a
+  local MCP server or an OpenAI-compatible endpoint.
+- `pytest` suite (250+ tests) and synthetic sample inputs.
 
 ---
 
 ## Root-cause categories
+
+Assigned by the structural engine when the fault list carries no subtype, and
+used to corroborate it when one is present:
 
 - `constraint_induced_controllability_loss`
 - `constraint_induced_observability_loss`
@@ -51,6 +90,37 @@ through a **GUI**, a **CLI**, and **Markdown/CSV reports**.
 - `structural_masking_or_reconvergence`
 - `unresolved_connectivity`
 - `other_structural_cause`
+
+---
+
+## What the triage produces
+
+Running the shipped demo dataset:
+
+```
+Coverage triage (derived from the fault list):
+  detected     : 34 (28.81%)
+  coverage loss: 84 (71.19%)
+
+  Category      Faults        %   sa0/sa1   Imbalance
+  UO.AAB           32   27.12%   16/16   0.00
+  AU.TC            27   22.88%    0/27   1.00
+  AU.PC            12   10.17%    6/6    0.00
+  AU.SEQ           12   10.17%    6/6    0.00
+  AU.BB             1    0.85%    1/0    1.00
+
+  What is blocking them (structural estimate, not the tool's own attribution):
+    AU.TC        configurable_register (27/27 traced)
+          18  uf_tdr_out_inter_reg [test_data_register]
+           9  uf_tie_lo [tie_cell tied 0]
+    AU.PC        user_configured (12/12 traced)
+          12  pi_hold = 1 [constrain]
+```
+
+Each conclusion carries its evidence source: `fault_list`, `constraint_file`,
+`netlist`, `structural_inference` or `clustering_hint`. The first three are
+direct readings of an input file; the last two are this tool's own reasoning
+and are labelled as such.
 
 ---
 
@@ -109,20 +179,28 @@ strictly needs `PySide6`.
 
 ## Running the GUI
 
-```powershell
+```bash
 python -m atpg_coverage_debug_agent
 ```
 
 Then:
 
 1. Browse to the **netlist**, **fault list**, and (optionally) **constraints**.
+   To see what the tool does, load the `demo_*` files from `sample_data/`.
 2. Optionally pick an **output directory**.
 3. Click **Analyze**. Analysis runs on a worker thread; progress is shown in the
    status bar.
-4. Inspect the **Summary**, **Coverage Loss Table**, **Repeated Patterns**, and
-   **Logs / Warnings** tabs. Select any table row to see full evidence in the
-   details panel.
-5. Use **Export Markdown Report** / **Export CSV** to save results.
+4. Work the **Triage &amp; Fix Plan** tab &mdash; *Categories* for what is
+   losing coverage and whether it is worth acting on, *Where the loss is* for
+   the hierarchy hotspots, and *Fix Plan* for ranked proposals with copyable
+   commands.
+5. Drill into individual faults in the **Coverage Loss Table**; select a row to
+   see full evidence in the details panel.
+6. Use **Export Markdown Report** / **Export CSV**, or **Open Report in
+   Browser** for the full HTML document.
+
+The in-app **Help** (`?` in the menu) documents every tab and explains how each
+conclusion is reached.
 
 ---
 
@@ -205,18 +283,28 @@ set the **Copilot CLI** field to your `copilot` executable via **Browse…**
 
 ## Running the CLI
 
-```powershell
-python -m atpg_coverage_debug_agent.cli `
-  --netlist sample_data/sample_netlist.v `
-  --faults sample_data/sample_faults.txt `
-  --constraints sample_data/sample_constraints.txt `
-  --report-md report.md `
+```bash
+python -m atpg_coverage_debug_agent.cli \
+  --netlist sample_data/demo_netlist.v \
+  --faults sample_data/demo_faults.mtfi \
+  --constraints sample_data/demo_constraints.do \
+  --report-md report.md \
   --report-csv report.csv
 ```
 
-The CLI prints a summary to stdout, optionally writes Markdown/CSV reports, and
-returns a non-zero exit code on fatal errors (`2` for bad inputs, `1` for
-unexpected failures).
+The CLI prints the fault-class summary, the coverage triage (categories,
+hierarchy hotspots, blocking sources and structural signatures) and the ranked
+fix plan, optionally writes Markdown/CSV reports, and returns a non-zero exit
+code on fatal errors (`2` for bad inputs, `1` for unexpected failures).
+
+| Option | Effect |
+| --- | --- |
+| `--fix-limit N` | How many fix proposals to print (default 5). |
+| `--explain SUBCLASS` | Explain a class such as `AU.TC` &mdash; what it means, its usual causes, the evidence that would confirm it and the fixes that apply &mdash; then exit. Needs no input files. |
+
+```bash
+python -m atpg_coverage_debug_agent.cli --explain AU.TC
+```
 
 ---
 
@@ -236,14 +324,35 @@ endmodule
 ```
 
 ### Fault list
-Whitespace-delimited; the parser locates the class token and the path-like
-object token on each line. All of these work:
+
+Two shapes are supported. The **Tessent MTFI** structured format is detected
+automatically and is the one to prefer, because it carries the dotted subclass
+and the stuck-at value that the triage depends on:
 
 ```
-AU 1 top/u_alu/U5/Y
+FaultInformation {
+ FaultType (Stuck) {
+  FaultList {
+   Format : Identifier, Class, Location;
+   Instance ("") {
+    1,  AU.TC,   "/top/u_fifo/uf_and_0/A";
+    0,  UO.AAB,  "/top/u_crypto/uc_m0/Y";
+    0,  DS,      "/top/u_good/ug_head/A";
+```
+
+A **flat** whitespace-delimited list also works; the parser locates the class
+token and the path-like object token on each line. Dotted subclasses are
+accepted here too:
+
+```
+AU.TC 1 top/u_alu/U5/Y
 top/u_ctrl/U4/Y UO
 UC top/u_alu/reg_scan/SE
 ```
+
+> Without dotted subclasses the tool still works, but it falls back to
+> structural inference alone and reports `reduced` confidence. Use an MTFI
+> list where you can.
 
 ### Constraint file
 Intent detected by keyword:
@@ -257,21 +366,27 @@ block din
 scan_en = 0
 ```
 
-See [sample_data/](sample_data) for complete examples.
+See [sample_data/](sample_data) for complete examples. Two sets are shipped:
+
+| Set | Use |
+| --- | --- |
+| `demo_netlist.v` + `demo_faults.mtfi` + `demo_constraints.do` | **Start here.** Dotted subclasses and a design built to exercise every part of the triage: a test data register and a hardwired tie holding cones constant, a constrained input, a reconvergent cone, a long unscanned chain, and a cone with no capture point. |
+| `sample_netlist.v` + `sample_faults.txt` + `sample_constraints.txt` | A minimal set using bare fault classes, kept for the parser tests. |
 
 ---
 
 ## Example
 
-```powershell
-python -m atpg_coverage_debug_agent.cli `
-  --netlist sample_data/sample_netlist.v `
-  --faults sample_data/sample_faults.txt `
-  --constraints sample_data/sample_constraints.txt
+```bash
+python -m atpg_coverage_debug_agent.cli \
+  --netlist sample_data/demo_netlist.v \
+  --faults sample_data/demo_faults.mtfi \
+  --constraints sample_data/demo_constraints.do
 ```
 
-produces a summary of fault classes, top root causes, and the most-affected
-instances, plus per-fault evidence in the exported reports.
+produces the fault-class summary, the coverage triage with named blocking
+sources, and the ranked fix plan shown earlier, plus per-fault evidence in the
+exported reports.
 
 ---
 
@@ -283,8 +398,17 @@ pytest
 ```
 
 The tests cover fault parsing, constraint parsing, Verilog parsing,
-connectivity, mapping, root-cause classification, and report generation using
+connectivity, mapping, root-cause classification, the coverage triage
+(statistics, clustering, scoring, attribution, structural profiling and fix
+ranking), the honesty guardrails, report generation and the GUI panels, using
 the synthetic files in `sample_data/`.
+
+Two of them are worth knowing about:
+
+- a **self-audit** that runs a full analysis and asserts the tool's own output
+  quotes no fabricated path and predicts no unmeasured coverage gain;
+- a **help-drift** check that fails if an investigative tool is added without
+  being documented in the in-app Help.
 
 ---
 
@@ -297,24 +421,45 @@ atpg_coverage_debug_agent/
   models.py            # typed dataclasses / enums
   app.py               # orchestration shared by CLI and GUI
   cli.py               # command-line interface
+  mcp_server.py        # stdio MCP server exposing the investigative tools
+  knowledge/
+    subclasses.py      # fault-subclass taxonomy (meanings, causes, evidence)
+    fixes.py           # catalogue of candidate fixes and their commands
   parser/
     verilog_parser.py  # structural Verilog parser
-    fault_parser.py    # Tessent fault-list parser
+    fault_parser.py    # Tessent fault-list parser (MTFI + flat)
     constraint_parser.py
   analysis/
     connectivity.py    # driver/load graph + fan-in/out + cone tracing
     mapper.py          # fault-object -> netlist-object correlation
     root_cause.py      # conservative root-cause classification
+    statistics.py      # derived coverage breakdown + category selection
+    cluster.py         # hierarchy clustering with auto-depth
+    scoring.py         # score factors, patterns, actionability verdicts
+    attribution.py     # traces what is blocking AU.TC / AU.PC faults
+    reachability.py    # structural profiling of aborted fault sites
+    recommend.py       # ranked fix proposals with evidence
+    guardrails.py      # copy-exact paths + no unmeasured claims
+    investigate.py     # deterministic query core shared by skills and MCP
+    report_edit.py     # waivers, with the triage recomputed
+    regression.py      # baseline comparison
     summarizer.py      # summary, patterns, pipeline orchestration
   reporting/
     markdown_report.py
     csv_report.py
+    html_report.py     # print-style document, also shown in the GUI
+    session_report.py  # save / load a full analysis as JSON
+  skills/              # deterministic and on-demand analysis skills
+  agent/
+    debug_agent.py     # LLM backends (Copilot CLI / OpenAI-compatible)
   gui/
     main_window.py     # PySide6 main window
+    triage_panel.py    # Triage & Fix Plan tab
+    agent_panel.py     # AI Debug Agent tab
     workers.py         # QThread analysis worker
     details_panel.py   # per-fault evidence panel
 tests/                 # pytest suite
-sample_data/           # synthetic netlist / faults / constraints
+sample_data/           # demo and minimal netlist / faults / constraints
 requirements.txt
 README.md
 ```
@@ -325,6 +470,16 @@ README.md
 
 - **Structural only.** No simulation; conclusions are heuristic, not formal
   proofs. The engine is intentionally conservative and labels unproven items.
+- **Blocking sources and site profiles are estimates.** Cone tracing cannot
+  reason about Boolean satisfiability, multi-driver resolution or
+  mode-dependent gating the way ATPG does. Confirm them in a real tool session
+  before acting on anything expensive.
+- **Coverage percentages are fault-list ratios**, not the ATPG tool's
+  test-coverage figure, which also accounts for fault collapsing and
+  untestable-fault credit.
+- **No measured coverage gain.** The benefit of a proposed fix can only be
+  established by re-running ATPG; the tool proposes hypotheses to test and
+  never predicts a number.
 - **Verilog subset.** Behavioural RTL, generate loops, parameter elaboration,
   macros and complex bus expressions are not elaborated.
 - **Flat-name ambiguity.** Mapping flattened fault names back to hierarchy can
@@ -338,9 +493,14 @@ README.md
 
 ## Future improvements
 
+- Ingest `report_statistics -detailed_analysis` and `analyze_fault` logs when
+  they are available, upgrading the estimated attribution and site profiles to
+  the tool's own authoritative findings.
+- Connect to a live Tessent shell, and validate a proposed fix by submitting
+  baseline and cut-point runs and diffing the measured coverage.
+- Compare two revisions: coverage swing, class deltas and cluster movers.
 - Integrate a real Verilog elaboration library for accurate hierarchy.
 - Use formal/structural justification (e.g. SAT-based controllability cones).
 - Cross-module net tracing through port connections for full-chip cones.
 - Configurable, vendor-specific fault/constraint dialect profiles.
-- Richer GUI visualisation (schematic/cone views) and saved sessions.
-- Test-point recommendation ranking based on coverage impact.
+- Richer GUI visualisation (schematic/cone views).

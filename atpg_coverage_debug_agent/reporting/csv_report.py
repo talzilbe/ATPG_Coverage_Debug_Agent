@@ -34,6 +34,11 @@ COLUMNS = [
 
 
 def _row(r: FaultAnalysisResult) -> Dict[str, str]:
+    # Unmapped objects carry no connectivity information; their fan-in/out
+    # cells are left EMPTY (NULL) rather than 0, and the scan column reads
+    # 'unknown' rather than 'no'.
+    fan_in = r.fan_in_count
+    fan_out = r.fan_out_count
     return {
         "fault_object": r.fault.fault_object,
         "fault_class": r.fault.fault_class.value,
@@ -41,12 +46,12 @@ def _row(r: FaultAnalysisResult) -> Dict[str, str]:
         "mapping_confidence": r.mapping.confidence.value,
         "instance_name": r.instance_name or "",
         "cell_type": r.cell_type or "",
-        "fan_in_count": str(len(r.fan_in)),
-        "fan_out_count": str(len(r.fan_out)),
+        "fan_in_count": "" if fan_in is None else str(fan_in),
+        "fan_out_count": "" if fan_out is None else str(fan_out),
         "controllability_issue": "yes" if r.controllability_issue else "no",
         "observability_issue": "yes" if r.observability_issue else "no",
         "constraint_related": "yes" if r.constraint_related else "no",
-        "scan_boundary_involved": "yes" if r.scan_boundary_involved else "no",
+        "scan_boundary_involved": r.scan_boundary_state,
         "root_cause": r.root_cause.value,
         "evidence": " | ".join(r.evidence),
         "recommended_step": r.recommended_step,

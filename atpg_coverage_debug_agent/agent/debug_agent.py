@@ -73,6 +73,31 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
           restricted clocks/resets, observation limits, propagation barriers, broad fan-out impact).
   Step 5 Compute structural context (immediate fan-in/out, upstream drivers, downstream observe points,
           nearest scan/non-scan boundary, whether blocked in activation/propagation/observation).
+  Step 5a Resolve real drivers before assigning any root cause.
+          For every AU/UO/UC fault on a sequential or gate pin:
+          (a) Locate the actual instantiation in the netlist. Leaf names repeat
+              across replicated modules (SRoutXnnnH_reg occurs 110 times in this
+              design). Disambiguate by first resolving the PARENT instance name to
+              its module type, then find that module definition, then extract the
+              leaf instantiation from inside that module body only.
+          (b) Print the complete instantiation including all continuation lines.
+          (c) Classify pins: scan-data-in (si/sd/ti/scan_in), scan-out
+              (so/to/scan_out), shift-enable (se/ssb/sen/scan_enable). A cell is
+              SCAN if it has a dedicated scan-data input AND a shift-enable pin.
+          (d) Corroborate all three, and report the corroboration even when (c)
+              already looks conclusive:
+              - trace shift-enable back to a global test_se/scan_en (through
+                buffers/inverters);
+              - confirm scan-out reaches a module output port;
+              - confirm scan-in is driven by a real net, not a tie cell. If si
+                is driven by a tie cell, the cell is scan-CAPABLE but NOT
+                chain-connected - state that distinction explicitly.
+          (e) Trace every data and enable pin to its ultimate driving gate across
+              hierarchy. Ports are commonly feedthroughs across 3-5 levels. At each
+              level: find the module definition declaring the port, find where that
+              module is instantiated, read the net bound to the port, repeat until
+              a gate WITH INPUT PINS is found. Verify the terminal net's fanout by
+              counting all its occurrences in the netlist.
   Step 6 Determine root cause from evidence. Allowed categories:
           - Constraint-induced controllability loss
           - Constraint-induced observability loss
@@ -95,25 +120,72 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
     activation/propagation/observation, and why that yields AU/UO/UC.
   - Prioritize structural proof (fan-in/out, driver/load chain, scan boundary,
     forced/constrained values, local logic cone).
-  - Do not overclaim scan info unless explicit structures or strong naming/library basis (state the basis).
+  - Scan status (scan vs non-scan) may ONLY be asserted from a netlist
+    instantiation whose pin list has been literally read. Naming basis is
+    NEVER sufficient. Fault-table fields (fanin, fanout, mapped_instance,
+    confidence, 'scan boundary involved') are NEVER sufficient. In
+    particular, fanin/fanout == 0 together with confidence 'unresolved'
+    means the extractor FAILED TO MAP the object and carries ZERO
+    connectivity information; it must never be read as 'no scan
+    connection'. A 'scan boundary involved = N' column means 'no evidence
+    found', not 'confirmed non-scan'. Absent netlist pin evidence, the
+    required answer is exactly:
+    'Unresolved - scan status cannot be determined without netlist pin
+    evidence.'
   - Conservative recommendations only, linked to specific bottlenecks.
 
 7. OUTPUT FORMAT (always)
-  A. Executive Summary — total faults; counts by DS/DI/TI/AU/UO/UC; total coverage loss (AU+UO+UC);
-     top root-cause categories; top affected modules/instances; top contributing constraints;
-     and whether the dominant issue is constraint-driven / scan-boundary-driven / controllability /
-     observability / mixed.
-  B. Assumptions and Parsing Limits — file quality issues, hierarchy/mapping assumptions, unresolved
-     naming mismatches, unknown cell directions, black boxes/missing modules, confidence limits.
-  C. Coverage-Loss Table — for every AU/UO/UC: fault site, class, mapped object, mapping confidence,
-     instance, cell type, immediate fan-in, immediate fan-out, controllability issue (Y/N/Possible),
-     observability issue (Y/N/Possible), constraint-related (Y/N/Possible), scan boundary involved
-     (Y/N/Possible), root-cause category, structural evidence, recommended next debug step.
-  D. Repeated Pattern Analysis — common constraints/boundaries/observation blockages/uncontrollable conditions.
-  E. Detailed Debug Notes — short narratives for the most important/repeated failures.
-  F. Final Diagnosis — exact places coverage is lost; highest-confidence root causes; top 3 next actions.
+  The user is ALREADY looking at a deterministic report generated from the same
+  inputs. It contains, computed exactly: the fault-class census and coverage
+  metric (S2), the evidence basis -- mapped / unmapped / tied-to-constant /
+  actionable -- with the scan-status breakdown and the constant-driver ranking
+  (S3), the per-category triage with hierarchy clusters and blocking sources
+  (S4), the ranked fix plan with commands (S5), module and instance hotspots
+  (S6), per-root-cause boxes (S7), the full per-fault coverage-loss table (S8),
+  and a conclusions/priority table (S9). The same per-fault table is also
+  exported to CSV and shown in the GUI.
+  DO NOT REPRODUCE ANY OF THAT. Restating a number the tool already computed
+  adds no information, and retyping hierarchical paths risks corrupting them.
+  Cite a section instead ("see S3") and spend your output only on what the
+  deterministic pass cannot do: judgement, cross-cutting reasoning, and
+  disagreement.
+
+  A. Verdict — 3-6 sentences, no tables. Which mechanism dominates the
+     ACTIONABLE coverage loss (the mapped, non-tied population in S3) and the
+     specific evidence for that claim. If the actionable population is small
+     relative to unmapped + tied faults, say that the headline loss figure is
+     dominated by artefacts and that no mechanism can be ranked yet. Never
+     compute the ranking from the raw loss total.
+  B. Evidence Gaps That Change The Answer — only limits NOT already quantified
+     in S3. For each: what is missing, which specific conclusion it blocks, and
+     the file or command that would close it. If S3 already states it, skip it.
+  C. Corrections To The Computed Analysis — the rows where your reading differs
+     from the tool's. For each: the fault site (copied verbatim), the computed
+     root cause, your root cause, and the evidence for the change. Say "No
+     corrections" when the computed classification holds. Do NOT restate rows
+     you agree with; the full table is S8.
+  D. Cross-Cutting Patterns — only patterns that span categories or hierarchies
+     and are therefore invisible to the per-category clustering in S4/S6: one
+     structure blocking several unrelated blocks, one constraint reaching
+     several categories, a systematic naming or wiring anomaly. Skip if none.
+  E. Detailed Debug Notes — short narratives for the two or three most
+     important findings, each tracing the mechanism end to end: what is
+     established at the site, what blocks activation or propagation, where the
+     effect dies, and why that yields AU/UO/UC. This is the section with the
+     most value; spend the output budget here.
+  F. Fix Plan Review — do not invent a parallel plan. Take the ranked plan in
+     S5 and, per proposal, state agree / re-rank / reject with the reason.
+     Add a proposal only for something the plan misses, and say why it is
+     missing.
 
 8. DECISION LOGIC
+  PRECEDENCE: before applying any UC/UO/AU rule below, complete Step 5a. If
+  the terminal driver of a data or enable pin is a tie cell (no input pins;
+  output-only; cell type matching g1mtihi* / g1mtilo* or equivalent library
+  tie naming), the root cause is 'Tied / constant hardware condition'.
+  Scan-boundary and observability categories MUST NOT be used in that case.
+  A stuck-at fault on a pin held at a hard constant is undetectable because
+  no differing value can be established, regardless of scan architecture.
   UC -> prefer control/activation/constrained-control/tied-upstream/missing-scan-reach/blocked-TE-clk-rst.
   UO -> prefer observe/blocked-propagation/observation-mask/non-scan-observe-boundary/constrained-outputs.
   AU -> undetected; decide whether dominant reason is controllability, observability, mixed, masking,
@@ -121,6 +193,18 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
 
 9. EVIDENCE LANGUAGE (mandatory for ambiguous cases)
   Observed / Derived / Likely / Unresolved.
+  SELF-CHECK before emitting any scan-status or root-cause claim:
+  1. Did I read the actual instantiation line, or only a fault-table row?
+  2. Did I confirm the RIGHT instance among duplicate leaf names by
+     resolving the parent module type?
+  3. Am I relying on fanin/fanout/confidence/scan-column values from an
+     unresolved fault-table row?
+  4. If I claim non-scan, can I quote an instantiation with no si/se pins?
+  5. If I claim an observability or scan cause, have I ruled out a tied
+     constant on the data and enable pins?
+  If any check fails, answer 'Unresolved' and state exactly which file or
+  command is required. 'Observed' may label ONLY text literally read from a
+  file.
 
 11. STYLE: technical, concise, explicit, audit-friendly. Prefer tables and bullets.
    Avoid motivational language, filler, unsupported speculation.
@@ -247,13 +331,46 @@ def build_user_payload(report: Any, max_faults: int = 200,
     lines.append("- Top root-cause categories (structural heuristic):")
     for name, count in s.top_root_causes:
         lines.append(f"    {count:5d}  {name}")
-    lines.append("- Top affected instances:")
+    lines.append("- Top affected instances (ACTIONABLE loss only; tie-driven "
+                 "and unmapped faults excluded):")
     for name, count in s.top_instances[:10]:
         lines.append(f"    {count:5d}  {name}")
     lines.append("- Top contributing constraints:")
     for name, count in s.top_constraints:
         lines.append(f"    {count:5d}  {name}")
     lines.append("")
+
+    # Evidence basis. Stated up front so the model cannot rank causes from a
+    # bucket that is mostly unmapped rows or tie-driven faults.
+    if s.coverage_loss_count:
+        lines.append("## Evidence Basis of the Coverage Loss")
+        lines.append(f"- Mapped onto the netlist: {s.mapped_count}")
+        lines.append(
+            f"- NOT mapped: {s.unmapped_count} -- connectivity is UNKNOWN for "
+            f"these, not zero. No root cause on them is provable and they "
+            f"must not be counted towards an observability or scan-boundary "
+            f"conclusion.")
+        lines.append(
+            f"- Held at a hard constant (tie cell resolved across hierarchy): "
+            f"{s.tied_constant_count} -- expected and non-actionable.")
+        lines.append(
+            f"- Actionable coverage loss (mapped and not tied): "
+            f"{s.actionable_loss_count}")
+        scan = dict(s.scan_evidence_counts or {})
+        if scan:
+            lines.append("- Scan status of the fault sites, read from each "
+                         "instantiation's pin list:")
+            for key in ("scan", "non_scan", "unknown"):
+                if key in scan:
+                    lines.append(f"    {scan[key]:5d}  {key}")
+            lines.append("    ('unknown' means no instantiation was read; it "
+                         "is NOT evidence of non-scan logic.)")
+        causes = dict(s.unresolved_causes or {})
+        if causes:
+            lines.append("- Why the unmapped faults did not map:")
+            for cause, count in sorted(causes.items(), key=lambda kv: -kv[1]):
+                lines.append(f"    {count:5d}  {cause}")
+        lines.append("")
 
     # Repeated patterns
     if report.pattern_groups:
@@ -266,14 +383,29 @@ def build_user_payload(report: Any, max_faults: int = 200,
     # Coverage-loss faults
     lines.append("## Coverage-Loss Faults (AU/UO/UC)")
     lines.append(
+        "This table is INPUT for your reasoning. It is already published to "
+        "the user as report section S8, as a CSV export and as a GUI table, so "
+        "do not reproduce it -- quote a row only when you are correcting it."
+    )
+    lines.append(
         "Columns: site | class | mapped_instance | confidence | cell_type | "
         "fanin | fanout | ctrl | obsv | constraint | scan | root_cause"
+    )
+    lines.append(
+        "Column semantics: fanin/fanout = NULL and scan = unknown mean the "
+        "object was NOT mapped onto the netlist, so NO connectivity was "
+        "measured. NULL is not zero and unknown is not 'no' -- these rows "
+        "carry no evidence about scan status, drivers or observability. "
+        "scan = N means no boundary was found in the mapped neighbourhood, "
+        "which is still not proof that the cell is non-scan."
     )
     shown = 0
     for r in report.fault_results:
         if shown >= max_faults:
             lines.append(f"... ({len(report.fault_results) - shown} more faults omitted)")
             break
+        fan_in = r.fan_in_count
+        fan_out = r.fan_out_count
         lines.append(
             " | ".join([
                 r.fault.fault_object,
@@ -281,12 +413,12 @@ def build_user_payload(report: Any, max_faults: int = 200,
                 r.mapping.instance_name or "-",
                 r.mapping.confidence.value,
                 r.cell_type or "-",
-                str(len(r.fan_in)),
-                str(len(r.fan_out)),
+                "NULL" if fan_in is None else str(fan_in),
+                "NULL" if fan_out is None else str(fan_out),
                 "Y" if r.controllability_issue else "N",
                 "Y" if r.observability_issue else "N",
                 "Y" if r.constraint_related else "N",
-                "Y" if r.scan_boundary_involved else "N",
+                {"yes": "Y", "no": "N"}.get(r.scan_boundary_state, "unknown"),
                 r.root_cause.value,
             ])
         )
@@ -603,7 +735,8 @@ class DebugAgent:
         evidence = investigate.export_evidence(
             ctx.fault_results, ctx.constraints, ctx.netlist,
             adjacency=getattr(ctx, "adjacency", None),
-            compare=getattr(ctx, "compare", None))
+            compare=getattr(ctx, "compare", None),
+            triage=getattr(ctx, "triage", None))
         ev_fd, ev_path = tempfile.mkstemp(prefix="atpg_evidence_", suffix=".json")
         with os.fdopen(ev_fd, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)

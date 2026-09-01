@@ -14,13 +14,19 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QThread, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QTextCursor
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDesktopServices,
+    QKeySequence,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget, QTableWidget,
-    QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
+    QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget,
+    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from ..app import AnalysisInputs, PartitionInputs, _design_name
@@ -36,6 +42,7 @@ from .details_panel import DetailsPanel
 from .skills_panel import SkillsPanel
 from .agent_panel import AgentPanel
 from .custom_skills_panel import CustomSkillsPanel
+from .triage_panel import TriagePanel
 from .workers import start_worker, start_multi_worker
 
 logger = logging.getLogger(__name__)
@@ -72,14 +79,16 @@ _HELP_HTML = """
 <h1>ATPG Coverage-Loss Debug Agent &mdash; Help</h1>
 <p>This tool analyses <b>structural</b> (non-simulation) ATPG coverage loss. It
 maps untestable / unobservable / uncontrollable faults onto your gate-level
-netlist, root-causes them, groups repeated patterns, and lets an AI agent
-explain the results. Everything below is organised in the order you would
-normally use it.</p>
+netlist, root-causes them, ranks the categories worth debugging, proposes
+concrete fixes with runnable commands, and lets an AI agent explain the
+results. Everything below is organised in the order you would normally use
+it.</p>
 
 <div class="tip"><b>Quick start:</b> 1) pick a <b>Netlist</b> and a
 <b>Fault list</b> (constraints optional) &rarr; 2) click <b>Analyze</b> &rarr;
-3) read the <b>Summary</b> and <b>Coverage Loss Table</b> &rarr; 4) optionally
-run the <b>AI Debug Agent</b> for an explanation.</div>
+3) read the <b>Summary</b>, then work the <b>Triage &amp; Fix Plan</b> tab
+&rarr; 4) drill into individual faults in the <b>Coverage Loss Table</b>
+&rarr; 5) optionally run the <b>AI Debug Agent</b> for an explanation.</div>
 
 <h2>1. Input files (top of the window)</h2>
 <table>
@@ -136,7 +145,9 @@ derived name. The saved file is a full report you can re-open with
 <tr><td><b class="k">Add Partition / Remove / Clear Queue</b></td>
     <td>Build a queue of partitions to analyze together (see section 1).</td></tr>
 <tr><td><b class="k">Export Markdown / Export CSV</b></td>
-    <td>Save the report as Markdown, or the coverage-loss table as CSV.</td></tr>
+    <td>Save the report as Markdown &mdash; including the coverage triage,
+    hierarchy hotspots, blocking sources and the ranked fix plan &mdash; or
+    the coverage-loss table as CSV.</td></tr>
 <tr><td><b class="k">Save Report / Load Report</b></td>
     <td>Save the full analysis (including the AI investigation) to JSON and
     reload it later &mdash; no need to re-run Analyze.</td></tr>
@@ -152,12 +163,72 @@ derived name. The saved file is a full report you can re-open with
 <tr><td><b class="k">Clear</b></td><td>Reset the views to start fresh.</td></tr>
 </table>
 
+<h3>Window size &mdash; the View menu</h3>
+<p>The window opens maximized. If you need to change that, use <b>View</b>
+rather than the title bar:</p>
+<table>
+<tr><th>Action</th><th>Shortcut</th></tr>
+<tr><td><b class="k">Maximize</b></td><td><code>Ctrl+M</code></td></tr>
+<tr><td><b class="k">Full Screen</b> (toggle)</td><td><code>F11</code></td></tr>
+<tr><td><b class="k">Restore Down</b></td><td><code>Ctrl+Shift+M</code></td></tr>
+</table>
+<p>These drive the window through Qt directly, so they work even on remote X
+sessions whose window manager ignores the title-bar maximize button.</p>
+
 <h2>3. Result tabs</h2>
 <h3>Summary</h3>
 <p>A full HTML report: coverage metric, fault-class / subtype breakdown, top
 root causes, module and instance hotspots, and any analyst note. Click
 <b>Open Report in Browser</b> for the full-fidelity version (and a shareable
 local link).</p>
+<p>Section&nbsp;3 of that report, <b>Evidence Quality &amp; Scan Evidence</b>,
+is worth reading before anything else. It splits the coverage loss into what
+the analysis can and cannot stand behind:</p>
+<ul>
+  <li class="step"><b>Mapped</b> &mdash; the fault object was located in the
+      netlist, so its fan-in, fan-out and scan status were measured.</li>
+  <li class="step"><b>Not mapped</b> &mdash; the object was never located.
+      Its connectivity is <i>unknown</i>, and the tables show
+      <code>NULL</code> and <i>unknown</i> rather than <code>0</code> and
+      <i>no</i>. Nothing may be concluded from these rows; the table beneath
+      says whether the cause is a missing cell model, a repeated name, or a
+      netlist covering a different block.</li>
+  <li class="step"><b>Tied to a constant</b> &mdash; the site's driver was
+      traced across the hierarchy to a tie cell. A stuck-at fault on a
+      constant pin is undetectable by construction, so these are
+      <b>expected and non-actionable</b>: waive them instead of debugging
+      them. The tie cells holding the most sites are listed.</li>
+  <li class="step"><b>Actionable coverage loss</b> &mdash; what is left, and
+      the only number a priority ranking should be built on.</li>
+</ul>
+<p>The scan-status table there is read from each instantiation's pin list: a
+cell counts as scan only when a dedicated scan-data input <b>and</b> a
+shift-enable pin were both read. <i>unknown</i> means no instantiation was
+read &mdash; it is never reported as non-scan.</p>
+
+<h3>Triage &amp; Fix Plan</h3>
+<p>The shortest route from &ldquo;there is coverage loss&rdquo; to &ldquo;here is
+what to do about it&rdquo;. Three views, deliberately kept apart because they
+carry different weight &mdash; see section&nbsp;5 for how each is derived.</p>
+<ul>
+  <li class="step"><b>Categories</b> &mdash; every coverage-loss class with its
+      fault count, share of the design, stuck-at split, and a verdict on
+      whether it is <i>worth acting on</i> (<code>true</code> /
+      <code>partial</code> / <code>false</code>) with a confidence level.
+      Select a row to see what the subclass means, the reasoning behind the
+      verdict, which structure is blocking the faults, and why they were hard
+      to test.</li>
+  <li class="step"><b>Where the loss is</b> &mdash; hierarchy clustering. A
+      dominant prefix tells you <i>where</i> to look; it is never a root
+      cause. Sample paths are quoted <b>verbatim</b>, so they can be pasted
+      into an ATPG tool unmodified &mdash; double-click one to focus that
+      fault in the Coverage Loss Table, or use <b>Copy selected path</b>.</li>
+  <li class="step"><b>Fix Plan</b> &mdash; ranked proposals, each with its
+      rationale, what to confirm first, the supporting evidence, caveats, and
+      a copyable command block. This tool never runs the commands, and it
+      never predicts a coverage gain: where an action is marked as needing
+      measurement, the re-run is what establishes the benefit.</li>
+</ul>
 
 <h3>Coverage Loss Table</h3>
 <p>One row per coverage-loss fault with its class, mapped instance, mapping
@@ -204,8 +275,101 @@ the JSON report. You can waive at four levels:</p>
 </ul>
 <p>Add an <b>analyst note</b> to record <i>why</i> the waiver is legitimate; it
 appears on the report.</p>
+<p>Waiving also updates the <b>Triage &amp; Fix Plan</b> tab: a category you
+have written off leaves the fix plan, so the remaining proposals only cover
+loss you still intend to chase.</p>
 
-<h2>5. AI Debug Agent &mdash; usage guide</h2>
+<h2>5. How the triage reaches its conclusions</h2>
+<p>Everything below is derived from the same three input files &mdash; no ATPG
+tool is run. Each conclusion is labelled with how it was obtained, because the
+labels differ in how much they can be trusted.</p>
+
+<h3>Fault subclasses &mdash; the strongest signal</h3>
+<p>A Tessent fault list records a <i>dotted</i> class such as
+<code>AU.TC</code> or <code>UO.AAB</code>. That suffix is the ATPG tool's own
+root-cause label, which makes it far more reliable than anything that can be
+inferred from the netlist. When the fault list carries no subtype, only the
+coarse class is known and the confidence drops accordingly &mdash; you will
+see this reported as <code>reduced</code>.</p>
+
+<h3>Coverage figures</h3>
+<p>The detected and coverage-loss percentages are counted from the fault list.
+They are <b>not</b> the ATPG tool's test-coverage number, which also accounts
+for fault collapsing and untestable-fault credit.</p>
+
+<h3>Hierarchy clustering &mdash; where, not why</h3>
+<p>Faults are grouped by hierarchy prefix. The depth is chosen automatically:
+the tool descends while the largest cluster still holds a meaningful share of
+the faults, and stops before the grouping fragments into a long tail. A
+dominant prefix is a <b>pointer</b>, not a diagnosis.</p>
+
+<h3>Scored verdicts</h3>
+<p>Four fixed measurements decide whether a category is worth acting on:</p>
+<ul>
+  <li class="step"><b>Concentration</b> &mdash; how much of the loss sits in
+      the top few clusters. High means there is a focal point.</li>
+  <li class="step"><b>Symmetry</b> &mdash; how evenly the top clusters are
+      sized. Even sizing usually means a replicated structure rather than one
+      broken block.</li>
+  <li class="step"><b>Stuck-at asymmetry</b> &mdash; a strong skew towards
+      sa0 or sa1 points at a value held fixed upstream.</li>
+  <li class="step"><b>Depth</b> &mdash; how deep the loss had to be traced
+      before it localised.</li>
+</ul>
+<p>Categories below a minimum size are <b>not</b> scored at all: a single
+fault is trivially 100% concentrated and 100% skewed, and reading signal into
+that would manufacture evidence. Such categories are tagged
+<code>low_population</code>.</p>
+
+<h3>What is blocking the faults</h3>
+<p>For <code>AU.TC</code> and <code>AU.PC</code> the fan-in cone is traced to
+find the structure responsible, because the answer changes what you do:</p>
+<ul>
+  <li class="step"><b>Test data register</b> &mdash; configurable per run, so a
+      topoff with the opposite value is the cheap fix.</li>
+  <li class="step"><b>Hardwired tie</b> or <b>unscanned flop</b> &mdash;
+      cannot be overridden from the ATPG side; needs a design change.</li>
+  <li class="step"><b>A few named pins at fixed values</b> &mdash; configured
+      loss; waive it, or recover it with a topoff if the owner agrees.</li>
+  <li class="step"><b>A broad or masked blocking set</b> &mdash; usually means
+      the faults are covered by another partition's patterns rather than
+      lost.</li>
+</ul>
+
+<h3>Why aborted faults were hard to test</h3>
+<p>Aborted faults (<code>UC.AAB</code>, <code>UO.AAB</code>) were not proven
+untestable &mdash; the search ran out of budget. The netlist is measured to
+estimate which obstacle it hit: <b>low controllability</b>, a <b>hard
+observability gap</b>, an <b>observability bottleneck</b>, <b>reconvergent
+complexity</b>, or a <b>sequential depth explosion</b>. This distinction
+matters: a bottleneck is often fixed by raising the abort limit, while
+reconvergent complexity needs a design bypass and more abort budget is wasted
+runtime.</p>
+
+<h3>Honesty guardrails</h3>
+<p>Two checks run over everything the tool generates, and over the AI agent's
+answers:</p>
+<ul>
+  <li class="step"><b>Copy-exact paths</b> &mdash; every hierarchy path must
+      appear in the fault list, constraint file or netlist, or be a
+      component-aligned prefix of one. Shortened paths (with
+      &ldquo;&hellip;&rdquo;) and reconstructed ones are flagged, because they
+      will not resolve when pasted into a tool.</li>
+  <li class="step"><b>No unmeasured claims</b> &mdash; a coverage gain can only
+      be established by re-running ATPG. Predicted percentages are flagged
+      rather than presented as evidence.</li>
+</ul>
+<p>Violations appear in <b>Logs / Warnings</b>, and beneath an agent answer as
+a <i>Guardrail check</i> note.</p>
+
+<h3>What this analysis cannot do</h3>
+<p>It is a structural analyser, not a simulator. Cone tracing cannot reason
+about Boolean satisfiability, multi-driver resolution or mode-dependent gating
+the way ATPG does, so the blocking sources and site profiles are
+<b>estimates</b>. Confirm them in a real tool session before acting on
+anything expensive.</p>
+
+<h2>6. AI Debug Agent &mdash; usage guide</h2>
 <p>The agent explains coverage loss using an evidence-driven ATPG/DFT prompt.
 It reads only the deterministic report, so it cannot invent faults. Run an
 Analyze first, then open the <b>AI Debug Agent</b> tab.</p>
@@ -215,7 +379,14 @@ Analyze first, then open the <b>AI Debug Agent</b> tab.</p>
   <li class="step"><b>GitHub Copilot CLI (local subprocess)</b> &mdash; the
       default. Uses the bundled <code>copilot</code> CLI; data stays in the
       CLI's authenticated channel. Set the <b>CLI model</b>
-      (<code>auto</code> lets Copilot choose).</li>
+      (<code>auto</code> lets Copilot choose). The model list is <b>not</b>
+      hard-coded: on every launch the GUI asks the CLI which models your
+      account can use and refills the drop-down, so newly released models
+      appear on their own. The last answer is cached per user, so the list is
+      populated instantly at start and updated a moment later; press
+      <b>Refresh</b> next to the box to re-read it on demand. The box stays
+      editable, so a model id the CLI has not advertised can still be typed
+      in.</li>
   <li class="step"><b>OpenAI-compatible HTTP endpoint</b> &mdash; point at an
       internal endpoint with a Base URL, Model id, and API key (kept in memory
       only, never written to disk).</li>
@@ -226,7 +397,16 @@ Analyze first, then open the <b>AI Debug Agent</b> tab.</p>
 <ul>
   <li class="step"><b>Option A &mdash; GitHub token:</b> paste a fine-grained
       PAT with the <i>Copilot Requests</i> permission (or an OAuth token).
-      Classic <code>ghp_</code> tokens are not supported.</li>
+      Classic <code>ghp_</code> tokens are not supported. Leave
+      <b>Remember this token for my account on this machine</b> ticked and the
+      token is re-filled automatically on every later launch &mdash; it is kept
+      in the system keyring, or in an owner-only
+      <code>~/.atpg_debug_agent/credentials.json</code> under <i>your</i> home
+      directory. The store is per user, not per working directory: several
+      people can run this GUI on the same host from different directories and
+      each sees only their own token. It is never written to
+      <code>settings.json</code> and never into a saved report. Use
+      <b>Forget saved token</b> to delete it.</li>
   <li class="step"><b>Option B &mdash; device login:</b> click <i>Sign in with
       device code</i>, open the shown URL and enter the code.</li>
 </ul>
@@ -239,12 +419,48 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
   <li class="step"><b>Standard</b> (agentic off): the enabled skills run
       locally and their findings are folded into a single prompt.</li>
   <li class="step"><b>Agentic mode</b>: the model itself decides which
-      investigative tools to call (<code>list_faults</code>,
-      <code>get_fault_detail</code>, <code>why_blocked</code>,
-      <code>list_constraints</code>, <code>trace_path</code>) and iterates. For
-      the CLI backend this is driven through a local <b>MCP</b> server
-      (&ldquo;Agentic tools (MCP)&rdquo; checkbox). The HTTP backend needs an
-      endpoint that supports tool/function calling.</li>
+      investigative tools to call and iterates. For the CLI backend this is
+      driven through a local <b>MCP</b> server (&ldquo;Agentic tools
+      (MCP)&rdquo; checkbox). The HTTP backend needs an endpoint that supports
+      tool/function calling. The available tools are:
+      <table>
+      <tr><th>Tool</th><th>Answers</th></tr>
+      <tr><td><code>coverage_triage</code></td><td>Which categories are losing
+          coverage, and which were selected to debug.</td></tr>
+      <tr><td><code>explain_subclass</code></td><td>What a class such as
+          <code>AU.TC</code> means, its usual causes and its fixes. Needs no
+          analysis loaded.</td></tr>
+      <tr><td><code>list_clusters</code></td><td>Where in the hierarchy each
+          category concentrates, with verbatim samples.</td></tr>
+      <tr><td><code>list_blocking_sources</code></td><td>Which constant driver
+          or constrained signal is blocking the faults.</td></tr>
+      <tr><td><code>profile_fault_sites</code></td><td>Why aborted faults were
+          structurally hard to test.</td></tr>
+      <tr><td><code>recommend_fixes</code></td><td>Ranked, evidence-backed fix
+          proposals with commands.</td></tr>
+      <tr><td><code>diagnose_unresolved</code></td><td>Why fault objects failed
+          to map onto the netlist &mdash; a missing cell model, a repeated
+          name the path did not narrow down, or a netlist covering a
+          different block. Unmapped faults have <i>unknown</i> connectivity,
+          not zero, so nothing may be concluded from them until this is
+          resolved.</td></tr>
+      <tr><td><code>scan_status</code></td><td>Whether an instance is a scan
+          cell, decided <i>only</i> by reading its actual netlist
+          instantiation: it returns the verbatim pin list plus the scan-in,
+          shift-enable and scan-out pins found. With no netlist loaded, or
+          when the object does not map, it answers
+          <i>&ldquo;Unresolved &mdash; scan status cannot be determined
+          without netlist pin evidence.&rdquo;</i> rather than guessing.
+          Fan-in/fan-out counts and the scan-boundary column never decide
+          this.</td></tr>
+      <tr><td><code>verify_paths</code></td><td>Whether a path is safe to quote
+          before putting it in an answer.</td></tr>
+      <tr><td><code>list_faults</code>, <code>get_fault_detail</code>,
+          <code>why_blocked</code>, <code>list_constraints</code>,
+          <code>trace_path</code>, <code>suggest_test_points</code></td>
+          <td>Per-fault drill-down, constraints and structural path
+          tracing.</td></tr>
+      </table></li>
 </ul>
 
 <h3>Step 4 &mdash; run &amp; review</h3>
@@ -260,10 +476,27 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
     paths.</td></tr>
 <tr><td><b class="k">Suggest Fixes</b></td><td>Deterministically rank faults by
     impact and propose concrete DFT fixes (observation/control points,
-    constraint relaxation, scan insertion). No LLM used.</td></tr>
+    constraint relaxation, scan insertion). No LLM used. For fixes tied to a
+    specific fault <i>category</i>, use the <b>Fix Plan</b> view on the
+    Triage tab instead.</td></tr>
 <tr><td>Copy / Save Prompt &amp; Response</td><td>Export the prompt or the
     agent's answer.</td></tr>
 </table>
+<p>Every answer is also checked automatically against the guardrails described
+in section&nbsp;5. If the model shortens a hierarchy path, quotes one that is
+not in your inputs, or predicts a coverage gain, a <b>Guardrail check</b> note
+is appended beneath the answer. Treat anything listed there as unverified.</p>
+<p><b>What the agent will and will not say.</b> It is told that you are already
+looking at the report, so it does not restate fault counts, hotspots, the
+per-fault table or the fix plan &mdash; those are computed exactly and
+repeating them would only add transcription risk. Its answer is confined to
+what the deterministic pass cannot do: <b>A</b> a verdict on which mechanism
+dominates the <i>actionable</i> loss, <b>B</b> evidence gaps not already
+quantified in &sect;3, <b>C</b> corrections where its reading differs from the
+computed root cause, <b>D</b> patterns that span categories, <b>E</b> detailed
+narratives for the few findings that matter, and <b>F</b> a review of the fix
+plan rather than a second one. If a section has nothing to say it will say so
+in a line.</p>
 
 <h3>Step 5 &mdash; follow-up chat</h3>
 <p>After a run, use <b>Follow-up Chat</b> to ask questions about the diagnosis;
@@ -282,9 +515,9 @@ working in the pop-out. Close the window (or click <b>Dock back</b>) to return
 the panel to its place.</p>
 
 <div class="tip"><b>Recommended flow:</b> Analyze &rarr; skim Summary &rarr;
-run the agent in Agentic mode &rarr; <b>Verify</b> the answer &rarr; ask
-follow-ups &rarr; <b>Suggest Fixes</b> &rarr; waive legitimate faults via
-<b>Edit Report</b> &rarr; <b>Save Report</b>.</div>
+work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in Agentic mode
+&rarr; <b>Verify</b> the answer &rarr; ask follow-ups &rarr; waive legitimate
+faults via <b>Edit Report</b> &rarr; <b>Save Report</b>.</div>
 
 </body></html>
 """
@@ -503,6 +736,9 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_summary_tab(), "Summary")
+        self.triage_panel = TriagePanel()
+        self.triage_panel.fault_referenced.connect(self._focus_fault_in_table)
+        self.tabs.addTab(self.triage_panel, "Triage & Fix Plan")
         self.tabs.addTab(self._build_table_tab(), "Coverage Loss Table")
         # The "Repeated Patterns" tab is intentionally not shown; the backing
         # widget is still built so the populate/reset logic keeps working.
@@ -520,7 +756,15 @@ class MainWindow(QMainWindow):
         self.agent_panel = AgentPanel()
         self.agent_panel.config_changed.connect(self._save_settings)
         self.agent_panel.fault_referenced.connect(self._focus_fault_in_table)
-        self.tabs.addTab(self.agent_panel, "AI Debug Agent")
+        # The agent panel is tall. Placed directly in the tab widget its
+        # minimum size propagates to the whole window, which then cannot be
+        # shrunk and barely changes when maximised. A scroll area decouples
+        # the two, exactly as the Skills tab already does.
+        agent_scroll = QScrollArea()
+        agent_scroll.setWidgetResizable(True)
+        agent_scroll.setFrameShape(QFrame.NoFrame)
+        agent_scroll.setWidget(self.agent_panel)
+        self.tabs.addTab(agent_scroll, "AI Debug Agent")
 
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -659,10 +903,49 @@ class MainWindow(QMainWindow):
         reset_defaults.triggered.connect(self._on_reset_skill_defaults)
         skills_menu.addAction(reset_defaults)
 
+        self._build_view_menu()
+
         help_menu = self.menuBar().addMenu("&Help")
         user_guide = QAction("User Guide…", self)
         user_guide.triggered.connect(self._show_help)
         help_menu.addAction(user_guide)
+
+    def _build_view_menu(self) -> None:
+        """Add window-sizing actions that do not rely on the title bar.
+
+        Some remote X sessions have a window manager whose maximise button
+        does nothing. These actions drive the window directly through Qt, so
+        they work regardless.
+        """
+        view_menu = self.menuBar().addMenu("&View")
+
+        maximize = QAction("Maximize", self)
+        maximize.setShortcut(QKeySequence("Ctrl+M"))
+        maximize.triggered.connect(self.showMaximized)
+        view_menu.addAction(maximize)
+
+        self.fullscreen_action = QAction("Full Screen", self)
+        self.fullscreen_action.setCheckable(True)
+        self.fullscreen_action.setShortcut(QKeySequence("F11"))
+        self.fullscreen_action.triggered.connect(self._toggle_full_screen)
+        view_menu.addAction(self.fullscreen_action)
+
+        restore = QAction("Restore Down", self)
+        restore.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        restore.triggered.connect(self._restore_window)
+        view_menu.addAction(restore)
+
+    def _toggle_full_screen(self, checked: bool) -> None:
+        """Enter or leave full screen, returning to a maximised window."""
+        if checked:
+            self.showFullScreen()
+        else:
+            self.showMaximized()
+
+    def _restore_window(self) -> None:
+        """Leave full screen or maximised state and show a normal window."""
+        self.fullscreen_action.setChecked(False)
+        self.showNormal()
 
     def _on_enable_all_skills(self) -> None:
         self._skill_manager.enable_all()
@@ -982,6 +1265,7 @@ class MainWindow(QMainWindow):
 
     def _populate(self, report: AnalysisReport) -> None:
         self._populate_summary(report)
+        self.triage_panel.set_report(report)
         self._populate_table(report)
         self._populate_patterns(report)
         self._populate_logs(report)
@@ -1036,15 +1320,20 @@ class MainWindow(QMainWindow):
         for r in report.fault_results:
             row = self.table.rowCount()
             self.table.insertRow(row)
+            # Unmapped objects have no measured connectivity: show "?" rather
+            # than "0", which would read as "proven to have no fan-in/out".
+            fan_in = r.fan_in_count
+            fan_out = r.fan_out_count
             values = [
                 r.fault.fault_object, r.fault.fault_class.value,
                 r.mapping.instance_name or "—", r.mapping.confidence.value,
                 r.instance_name or "—", r.cell_type or "—",
-                str(len(r.fan_in)), str(len(r.fan_out)),
+                "?" if fan_in is None else str(fan_in),
+                "?" if fan_out is None else str(fan_out),
                 "yes" if r.controllability_issue else "no",
                 "yes" if r.observability_issue else "no",
                 "yes" if r.constraint_related else "no",
-                "yes" if r.scan_boundary_involved else "no",
+                r.scan_boundary_state,
                 r.root_cause.value,
             ]
             for col, val in enumerate(values):
@@ -1372,6 +1661,7 @@ class MainWindow(QMainWindow):
         self._reset_partitions()
         self.table.setRowCount(0)
         self.patterns_table.setRowCount(0)
+        self.triage_panel.clear()
         self._clear_summary()
         self.open_browser_btn.setEnabled(False)
         self.logs_view.clear()
@@ -1628,6 +1918,10 @@ class MainWindow(QMainWindow):
 
 def run() -> int:
     app = QApplication.instance() or QApplication([])
+    # The whole UI is English text; never mirror it because of an RTL locale.
+    app.setLayoutDirection(Qt.LeftToRight)
     window = MainWindow()
-    window.show()
+    # Start maximised: the window has a lot to show, and on remote displays a
+    # broken title-bar maximise button would otherwise leave it small.
+    window.showMaximized()
     return app.exec()

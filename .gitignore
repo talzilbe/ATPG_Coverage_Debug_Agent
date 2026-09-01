@@ -22,6 +22,10 @@ tools/
 copilot-home/
 .copilot/
 
+# Vendored copy of the internal autobots agent tree (see .autobots_manifest.json).
+# Not ours to publish, and overwritten on every reinstall.
+SageAGENT/
+
 # OS / misc
 .DS_Store
 Thumbs.db

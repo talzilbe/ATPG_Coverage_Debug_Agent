@@ -15,6 +15,7 @@ and surfaced to the user via parser warnings.
 
 from __future__ import annotations
 
+import bisect
 import gzip
 import logging
 import re
@@ -58,6 +59,35 @@ _VERILOG_KEYWORDS = {
     "endcase", "default",
 }
 
+# ---------------------------------------------------------------------------
+# Scan pin conventions
+# ---------------------------------------------------------------------------
+# A cell is scannable when it has BOTH a dedicated scan-data input and a
+# shift-enable pin. These sets are the vocabulary for that test; matching is on
+# the literal pin name of an instantiation, never on the instance name.
+_SCAN_IN_PINS = frozenset({"si", "sd", "ti", "sin", "scan_in", "scanin",
+                           "sdi", "test_si", "tie"})
+_SCAN_OUT_PINS = frozenset({"so", "to", "sout", "scan_out", "scanout",
+                            "sdo", "test_so", "q_so"})
+_SHIFT_ENABLE_PINS = frozenset({"se", "ssb", "sen", "scan_en", "scan_enable",
+                                "shift_en", "test_se", "sh", "smc"})
+
+
+def scan_pin_role(pin_name: str) -> Optional[str]:
+    """Return ``'scan_in'`` / ``'scan_out'`` / ``'shift_enable'`` or ``None``.
+
+    Args:
+        pin_name: The literal pin name from an instantiation.
+    """
+    name = (pin_name or "").strip().lstrip(".").lower()
+    if name in _SCAN_IN_PINS:
+        return "scan_in"
+    if name in _SCAN_OUT_PINS:
+        return "scan_out"
+    if name in _SHIFT_ENABLE_PINS:
+        return "shift_enable"
+    return None
+
 
 @dataclass
 class VerilogNetlist:
@@ -97,15 +127,36 @@ class VerilogNetlist:
         return out
 
 
+def _blank(match: "re.Match") -> str:
+    """Replace matched text with its own newlines so line numbers survive."""
+    return "\n" * match.group(0).count("\n")
+
+
 def _strip_comments(text: str) -> str:
-    text = _COMMENT_BLOCK.sub(" ", text)
+    # Blank comments out rather than deleting them: every reported line number
+    # is meant to be pasted into an editor, so offsets must not drift.
+    text = _COMMENT_BLOCK.sub(_blank, text)
     text = _COMMENT_LINE.sub("", text)
     return text
 
 
-def _split_module_bodies(text: str) -> List[Tuple[str, str, str]]:
-    """Yield ``(name, ports_text, body_text)`` for each module in *text*."""
-    results: List[Tuple[str, str, str]] = []
+class _LineIndex:
+    """Character-offset -> 1-based line number, cheap for large netlists."""
+
+    def __init__(self, text: str) -> None:
+        self._newlines: List[int] = []
+        pos = text.find("\n")
+        while pos != -1:
+            self._newlines.append(pos)
+            pos = text.find("\n", pos + 1)
+
+    def line_of(self, offset: int) -> int:
+        return bisect.bisect_right(self._newlines, offset - 1) + 1
+
+
+def _split_module_bodies(text: str) -> List[Tuple[str, str, str, int]]:
+    """Yield ``(name, ports_text, body_text, body_offset)`` per module."""
+    results: List[Tuple[str, str, str, int]] = []
     for match in _MODULE_RE.finditer(text):
         name = match.group("name").strip()
         ports = (match.group("ports") or "").strip()
@@ -113,7 +164,7 @@ def _split_module_bodies(text: str) -> List[Tuple[str, str, str]]:
         end = _ENDMODULE_RE.search(text, body_start)
         body_end = end.start() if end else len(text)
         body = text[body_start:body_end]
-        results.append((name, ports, body))
+        results.append((name, ports, body, body_start))
     return results
 
 
@@ -150,13 +201,22 @@ def _parse_connections(conns: str) -> List[Pin]:
     return pins
 
 
-def _classify_pin_direction(pin_name: str) -> str:
+def classify_pin_direction(pin_name: str) -> str:
     """Heuristically classify a pin as input/output by common naming.
 
     This only affects driver/load inference for leaf cells where we have no
     module definition. Documented as a heuristic.
+
+    Scan pins are named explicitly rather than left to the prefix rules: a
+    scan output ``so``/``to`` starts with a letter the generic rules read as
+    an input, and mis-directing a scan-out pin makes a scan cell look like it
+    has no scan connection at all.
     """
     name = pin_name.lower()
+    if name in _SCAN_OUT_PINS:
+        return "output"
+    if name in _SCAN_IN_PINS or name in _SHIFT_ENABLE_PINS:
+        return "input"
     output_like = ("q", "qn", "y", "z", "o", "out", "co", "s", "sum")
     input_like = ("a", "b", "c", "d", "ci", "ck", "clk", "clock", "rn", "sn",
                   "se", "si", "ti", "te", "rst", "reset", "en", "in")
@@ -165,6 +225,10 @@ def _classify_pin_direction(pin_name: str) -> str:
     if name in input_like or name.startswith(("a", "b", "d", "in", "s")):
         return "input"
     return "unknown"
+
+
+#: Backwards-compatible private alias.
+_classify_pin_direction = classify_pin_direction
 
 
 def _build_nets(module: Module) -> None:
@@ -200,23 +264,26 @@ def parse_verilog(text: str) -> VerilogNetlist:
     """
     netlist = VerilogNetlist()
     clean = _strip_comments(text)
+    lines = _LineIndex(clean)
 
     bodies = _split_module_bodies(clean)
     if not bodies:
         netlist.warnings.append("No 'module ... endmodule' blocks were found.")
         return netlist
 
-    for name, _ports_text, body in bodies:
+    for name, _ports_text, body, body_offset in bodies:
         module = Module(name=name)
         module.ports = _parse_ports(body)
+        module.line_number = lines.line_of(body_offset)
 
-        # Remove port/wire declarations before scanning for instances so that
-        # declarations are not mistaken for instantiations.
-        scan_body = _PORT_DECL_RE.sub(" ", body)
+        # Blank out port/wire declarations before scanning for instances so
+        # that declarations are not mistaken for instantiations. Blanking (not
+        # deleting) keeps every offset aligned with the source file.
+        scan_body = _PORT_DECL_RE.sub(_blank, body)
         scan_body = re.sub(
-            r"\b(wire|reg|supply0|supply1|tri)\b[^;]*;", " ", scan_body
+            r"\b(wire|reg|supply0|supply1|tri)\b[^;]*;", _blank, scan_body
         )
-        scan_body = re.sub(r"\bassign\b[^;]*;", " ", scan_body)
+        scan_body = re.sub(r"\bassign\b[^;]*;", _blank, scan_body)
 
         for inst_match in _INSTANCE_RE.finditer(scan_body):
             type_token = inst_match.group("type")
@@ -230,6 +297,10 @@ def parse_verilog(text: str) -> VerilogNetlist:
                 cell_type=type_token,
                 module=name,
                 pins=pins,
+                # Verbatim source, kept so a scan-status claim can quote the
+                # instantiation instead of paraphrasing a table row.
+                source_text=inst_match.group(0).strip(),
+                line_number=lines.line_of(body_offset + inst_match.start()),
             )
             if inst_name in module.instances:
                 netlist.warnings.append(

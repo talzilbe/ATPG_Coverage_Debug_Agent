@@ -98,6 +98,9 @@ class AnalysisContext:
     adjacency: Any = None
     #: Optional baseline report payload for regression tools (or ``None``).
     compare: Any = None
+    #: Optional coverage-triage payload (derived statistics, selected
+    #: categories and ranked fix proposals) for the triage tools.
+    triage: Any = None
 
 
 # ---------------------------------------------------------------------------

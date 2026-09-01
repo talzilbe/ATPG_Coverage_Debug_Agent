@@ -1,0 +1,137 @@
+// ---------------------------------------------------------------------------
+// sample_data/demo_faults.mtfi
+//
+// Tessent MTFI fault list for demo_netlist.v, carrying dotted subclasses
+// (AU.TC, AU.PC, UO.AAB, AU.SEQ, AU.BB) so the coverage triage, hierarchy
+// clustering, blocking-source attribution and structural profiling all have
+// real input to work on.
+//
+// Columns are: stuck value, fault class, hierarchical location.
+// ---------------------------------------------------------------------------
+FaultInformation {
+ FaultType (Stuck) {
+  FaultList {
+   Format : Identifier, Class, Location;
+   Instance ("") {
+    1,  AU.TC,   "/top/u_fifo/uf_and_0/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_0/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_0/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_and_1/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_1/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_1/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_and_2/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_2/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_2/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_and_3/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_3/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_3/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_and_4/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_4/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_4/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_and_5/A";
+    1,  AU.TC,   "/top/u_fifo/uf_and_5/B";
+    1,  AU.TC,   "/top/u_fifo/uf_and_5/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_0/A";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_0/B";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_0/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_1/A";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_1/B";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_1/Y";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_2/A";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_2/B";
+    1,  AU.TC,   "/top/u_fifo/uf_gate_2/Y";
+    0,  AU.PC,   "/top/u_io/ui_buf_0/A";
+    1,  AU.PC,   "/top/u_io/ui_buf_0/B";
+    0,  AU.PC,   "/top/u_io/ui_buf_0/Y";
+    1,  AU.PC,   "/top/u_io/ui_buf_1/A";
+    0,  AU.PC,   "/top/u_io/ui_buf_1/B";
+    1,  AU.PC,   "/top/u_io/ui_buf_1/Y";
+    0,  AU.PC,   "/top/u_io/ui_buf_2/A";
+    1,  AU.PC,   "/top/u_io/ui_buf_2/B";
+    0,  AU.PC,   "/top/u_io/ui_buf_2/Y";
+    1,  AU.PC,   "/top/u_io/ui_buf_3/A";
+    0,  AU.PC,   "/top/u_io/ui_buf_3/B";
+    1,  AU.PC,   "/top/u_io/ui_buf_3/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_head/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_head/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_a/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_a/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_b/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_b/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m0/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m0/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m1/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m1/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m2/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m2/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m3/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m3/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m4/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m4/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_m5/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_m5/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_j0/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_j0/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_j1/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_j1/Y";
+    0,  UO.AAB,  "/top/u_crypto/uc_j2/A";
+    1,  UO.AAB,  "/top/u_crypto/uc_j2/Y";
+    0,  UO.AAB,  "/top/u_dead/ud_dead_0/A";
+    1,  UO.AAB,  "/top/u_dead/ud_dead_0/Y";
+    0,  UO.AAB,  "/top/u_dead/ud_dead_1/A";
+    1,  UO.AAB,  "/top/u_dead/ud_dead_1/Y";
+    0,  UO.AAB,  "/top/u_dead/ud_dead_2/A";
+    1,  UO.AAB,  "/top/u_dead/ud_dead_2/Y";
+    0,  UO.AAB,  "/top/u_dead/ud_dead_3/A";
+    1,  UO.AAB,  "/top/u_dead/ud_dead_3/Y";
+    0,  AU.SEQ,  "/top/u_mem/um_head/D";
+    1,  AU.SEQ,  "/top/u_mem/um_head/Q";
+    0,  AU.SEQ,  "/top/u_mem/um_d0/D";
+    1,  AU.SEQ,  "/top/u_mem/um_d0/Q";
+    0,  AU.SEQ,  "/top/u_mem/um_d1/D";
+    1,  AU.SEQ,  "/top/u_mem/um_d1/Q";
+    0,  AU.SEQ,  "/top/u_mem/um_d2/D";
+    1,  AU.SEQ,  "/top/u_mem/um_d2/Q";
+    0,  AU.SEQ,  "/top/u_mem/um_d3/D";
+    1,  AU.SEQ,  "/top/u_mem/um_d3/Q";
+    0,  AU.SEQ,  "/top/u_mem/um_d4/D";
+    1,  AU.SEQ,  "/top/u_mem/um_d4/Q";
+    0,  AU.BB,   "/top/u_mem/um_d7/D";
+    0,  DS,      "/top/u_good/ug_head/A";
+    1,  DS,      "/top/u_good/ug_head/D";
+    0,  DS,      "/top/u_good/ug_head/Q";
+    1,  DS,      "/top/u_good/ug_scan_0/A";
+    0,  DS,      "/top/u_good/ug_scan_0/D";
+    1,  DS,      "/top/u_good/ug_scan_0/Q";
+    0,  DS,      "/top/u_good/ug_scan_1/A";
+    1,  DS,      "/top/u_good/ug_scan_1/D";
+    0,  DS,      "/top/u_good/ug_scan_1/Q";
+    1,  DS,      "/top/u_good/ug_scan_2/A";
+    0,  DS,      "/top/u_good/ug_scan_2/D";
+    1,  DS,      "/top/u_good/ug_scan_2/Q";
+    0,  DS,      "/top/u_fifo/uf_scan_0/D";
+    1,  DS,      "/top/u_fifo/uf_scan_0/Q";
+    0,  DS,      "/top/u_fifo/uf_scan_0/CK";
+    1,  DS,      "/top/u_fifo/uf_scan_1/D";
+    0,  DS,      "/top/u_fifo/uf_scan_1/Q";
+    1,  DS,      "/top/u_fifo/uf_scan_1/CK";
+    0,  DS,      "/top/u_crypto/uc_j3/A";
+    1,  DS,      "/top/u_crypto/uc_j3/B";
+    0,  DS,      "/top/u_crypto/uc_j3/D";
+    1,  DS,      "/top/u_crypto/uc_j3/Q";
+    0,  DS,      "/top/u_crypto/uc_j4/A";
+    1,  DS,      "/top/u_crypto/uc_j4/B";
+    0,  DS,      "/top/u_crypto/uc_j4/D";
+    1,  DS,      "/top/u_crypto/uc_j4/Q";
+    0,  DS,      "/top/u_crypto/uc_scan/A";
+    1,  DS,      "/top/u_crypto/uc_scan/B";
+    0,  DS,      "/top/u_crypto/uc_scan/D";
+    1,  DS,      "/top/u_crypto/uc_scan/Q";
+    0,  DS,      "/top/u_io/ui_scan/D";
+    1,  DS,      "/top/u_io/ui_scan/Q";
+    0,  DI,      "/top/u_mem/um_scan/D";
+    1,  DI,      "/top/u_mem/um_scan/Q";
+   }
+  }
+ }
+}

@@ -12,6 +12,7 @@ mutates its inputs.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from . import regression
@@ -35,20 +36,32 @@ def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
               compact summary row.
     """
     mapping = fr.mapping
+    connectivity_known = bool(getattr(fr, "connectivity_known", True))
     row: Dict[str, Any] = {
         "fault_object": fr.fault.fault_object,
         "fault_class": _enum_value(fr.fault.fault_class),
         "instance": mapping.instance_name or None,
         "cell_type": mapping.cell_type or None,
         "confidence": _enum_value(mapping.confidence),
-        "fan_in_count": len(fr.fan_in),
-        "fan_out_count": len(fr.fan_out),
+        # None, never 0, when the object never mapped: an unmapped object
+        # carries no connectivity evidence whatsoever.
+        "fan_in_count": len(fr.fan_in) if connectivity_known else None,
+        "fan_out_count": len(fr.fan_out) if connectivity_known else None,
+        "connectivity_known": connectivity_known,
         "controllability_issue": bool(fr.controllability_issue),
         "observability_issue": bool(fr.observability_issue),
         "constraint_related": bool(fr.constraint_related),
-        "scan_boundary_involved": bool(fr.scan_boundary_involved),
+        # Tri-state: "yes" / "no" / "unknown".
+        "scan_boundary_involved": getattr(
+            fr, "scan_boundary_state",
+            "yes" if fr.scan_boundary_involved else "no"),
+        # Scan status of the cell itself, read from its pin list.
+        "scan_cell_state": getattr(fr, "scan_cell_state", "unknown"),
         "root_cause": _enum_value(fr.root_cause),
     }
+    tie = getattr(fr, "tie_driver", None)
+    if tie:
+        row["tie_driver"] = dict(tie)
     if full:
         row.update({
             "normalized_object": fr.fault.normalized_object,
@@ -57,20 +70,93 @@ def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
             "matched_net": mapping.matched_net,
             "mapping_candidates": list(mapping.candidates or []),
             "mapping_evidence": list(mapping.evidence or []),
-            "fan_in": list(fr.fan_in),
-            "fan_out": list(fr.fan_out),
+            "fan_in": list(fr.fan_in) if connectivity_known else None,
+            "fan_out": list(fr.fan_out) if connectivity_known else None,
+            "scan_evidence": getattr(fr, "scan_evidence", ""),
             "observed_facts": list(fr.observed_facts or []),
             "inferred_conclusions": list(fr.inferred_conclusions or []),
             "evidence": list(fr.evidence or []),
             "recommended_step": fr.recommended_step,
         })
+        if not connectivity_known:
+            row["connectivity_note"] = (
+                "This object was never mapped onto the netlist. fan_in_count, "
+                "fan_out_count and fan-in/out lists are null because nothing "
+                "was measured -- not because the node is unconnected. Scan "
+                "status cannot be determined from this row; netlist pin "
+                "evidence is required."
+            )
     return row
+
+
+def scan_status(netlist: Any, target: str) -> Dict[str, Any]:
+    """Answer "is this a scan cell?" strictly from netlist pin evidence.
+
+    Args:
+        netlist: The parsed netlist, or ``None`` when unavailable.
+        target: Fault object or hierarchical instance path.
+
+    Returns:
+        The :meth:`~..analysis.scan_status.ScanStatus.as_dict` payload. With no
+        netlist loaded the verdict is ``unresolved`` and ``answer`` is the
+        required sentence -- a fault-table row can never decide scan status.
+    """
+    from . import scan_status as scan_status_mod
+
+    target = (target or "").strip()
+    if not target:
+        return {"error": "Provide a fault object or instance path."}
+    if netlist is None or not getattr(netlist, "modules", None):
+        return scan_status_mod.unresolved(
+            target,
+            "No parsed netlist is available in this session. Load the "
+            "hierarchical netlist and re-run; fault-table fields carry no pin "
+            "evidence.",
+        ).as_dict()
+
+    conn = getattr(netlist, "_atpg_connectivity", None)
+    mapper = getattr(netlist, "_atpg_mapper", None)
+    if conn is None or mapper is None:
+        from .connectivity import ConnectivityModel
+        from .mapper import FaultMapper
+
+        conn = ConnectivityModel(netlist)
+        mapper = FaultMapper(conn)
+        try:
+            netlist._atpg_connectivity = conn
+            netlist._atpg_mapper = mapper
+        except Exception:  # pragma: no cover - immutable netlist stand-ins
+            pass
+
+    return scan_status_mod.determine_scan_status(
+        target, mapper, conn, netlist).as_dict()
+
+
+def diagnose_unresolved_tool(fault_results: Any, netlist: Any,
+                             limit: int = 20) -> Dict[str, Any]:
+    """Explain why fault objects failed to map onto the netlist.
+
+    Args:
+        fault_results: The analysed coverage-loss faults.
+        netlist: The parsed netlist, or ``None``.
+        limit: Max groups to return.
+
+    Returns:
+        The :meth:`~..analysis.unresolved.UnresolvedDiagnosis.as_dict` payload.
+    """
+    from .unresolved import diagnose_unresolved
+
+    if netlist is None or not getattr(netlist, "modules", None):
+        return {"error": ("No parsed netlist in this session, so mapping "
+                          "failures cannot be attributed. Load the "
+                          "hierarchical netlist and re-run.")}
+    return diagnose_unresolved(fault_results, netlist,
+                               max_groups=max(1, int(limit))).as_dict()
 
 
 def serialize_constraint(c: Any) -> Dict[str, Any]:
     return {
-        "kind": getattr(c, "kind", None),
-        "signal": getattr(c, "signal", None),
+        "kind": getattr(c, "kind", None),        "signal": getattr(c, "signal", None),
         "normalized_signal": getattr(c, "normalized_signal", None),
         "value": getattr(c, "value", None),
         "line_number": getattr(c, "line_number", None),
@@ -450,13 +536,15 @@ def build_adjacency(netlist: Any) -> Dict[str, List[str]]:
 def export_evidence(fault_results: Any, constraints: Any,
                     netlist: Any,
                     adjacency: Optional[Dict[str, List[str]]] = None,
-                    compare: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    compare: Optional[Dict[str, Any]] = None,
+                    triage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Serialise everything the investigative tools need into a plain dict.
 
     The result is JSON-serialisable so it can be written to a file and read by a
     separate MCP server process. When *netlist* is None, a caller-supplied
     *adjacency* (e.g. from a reloaded report) is used for path tracing. When a
-    *compare* baseline payload is given, the regression tools are enabled.
+    *compare* baseline payload is given, the regression tools are enabled, and
+    when a *triage* payload is given the coverage-triage tools are enabled.
     """
     if netlist is not None:
         adj = build_adjacency(netlist)
@@ -470,7 +558,240 @@ def export_evidence(fault_results: Any, constraints: Any,
     }
     if compare:
         evidence["compare"] = compare
+    if triage:
+        evidence["triage"] = triage
     return evidence
+
+
+def serialize_triage(statistics: Any, selected: Any,
+                     recommendations: Any) -> Dict[str, Any]:
+    """Serialise the triage results into the payload the tools consume.
+
+    Args:
+        statistics: A ``DerivedStatistics``, or ``None``.
+        selected: ``SelectedCategory`` objects, or ``None``.
+        recommendations: ``Recommendation`` objects, or ``None``.
+
+    Returns:
+        A JSON-serialisable dict, empty when there is nothing to report.
+    """
+    if statistics is None:
+        return {}
+    return {
+        "statistics": statistics.as_dict(),
+        "selected": [
+            {
+                "rank": c.rank,
+                "subclass": c.subclass_id,
+                "count": c.stat.count,
+                "pct": round(c.stat.pct, 4),
+                "reason": c.reason,
+                "verdict": (c.verdict.as_dict()
+                            if getattr(c, "verdict", None) else None),
+                "clusters": (c.clusters.as_dict()
+                             if getattr(c, "clusters", None) else None),
+                "attribution": (c.attribution.as_dict()
+                                if getattr(c, "attribution", None) else None),
+                "reachability": (c.reachability.as_dict()
+                                 if getattr(c, "reachability", None) else None),
+            }
+            for c in (selected or [])
+        ],
+        "recommendations": [r.as_dict() for r in (recommendations or [])],
+    }
+
+
+_NO_TRIAGE = {
+    "error": ("No coverage triage available. Run an analysis first — triage is "
+              "derived from the fault list during the analysis pass.")
+}
+
+
+def coverage_triage(triage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the fault-class breakdown and the categories chosen to debug."""
+    if not triage:
+        return dict(_NO_TRIAGE)
+    stats = triage.get("statistics", {})
+    return {
+        "totals": {
+            "total_faults": stats.get("total_faults", 0),
+            "detected": stats.get("detected_count", 0),
+            "coverage_loss": stats.get("loss_count", 0),
+            "detected_pct": stats.get("detected_pct", 0.0),
+            "loss_pct": stats.get("loss_pct", 0.0),
+        },
+        "note": ("Percentages are aggregated from the fault list. They are not "
+                 "the ATPG tool's test-coverage figure, which also accounts "
+                 "for fault collapsing and untestable-fault credit."),
+        "categories": [c for c in stats.get("subclasses", [])
+                       if c.get("count")],
+        "selected": triage.get("selected", []),
+    }
+
+
+def recommend_fixes(triage: Optional[Dict[str, Any]],
+                    subclass: Optional[str] = None,
+                    limit: int = 10) -> Dict[str, Any]:
+    """Return ranked fix proposals, optionally filtered to one subclass."""
+    if not triage:
+        return dict(_NO_TRIAGE)
+    rows = list(triage.get("recommendations", []))
+    if subclass:
+        key = subclass.strip().upper()
+        rows = [r for r in rows if str(r.get("subclass", "")).upper() == key]
+    limit = max(1, int(limit or 10))
+    return {
+        "total": len(rows),
+        "returned": min(len(rows), limit),
+        "note": ("Commands are for you to run in your own ATPG session. Where "
+                 "'requires_measurement' is true, no coverage gain is "
+                 "predicted — only a re-run establishes the benefit."),
+        "recommendations": rows[:limit],
+    }
+
+
+def explain_subclass(subclass: str) -> Dict[str, Any]:
+    """Explain what a dotted fault subclass means and how it is usually fixed."""
+    from .recommend import explain_category  # local: keeps import graph flat
+
+    return explain_category(subclass)
+
+
+def list_clusters(triage: Optional[Dict[str, Any]],
+                  subclass: Optional[str] = None,
+                  limit: int = 10) -> Dict[str, Any]:
+    """Return where each category's faults concentrate in the hierarchy."""
+    if not triage:
+        return dict(_NO_TRIAGE)
+
+    rows = []
+    for entry in triage.get("selected", []):
+        if subclass and str(entry.get("subclass", "")).upper() != \
+                subclass.strip().upper():
+            continue
+        clusters = entry.get("clusters")
+        if not clusters:
+            continue
+        trimmed = dict(clusters)
+        trimmed["clusters"] = clusters.get("clusters", [])[:max(1, limit)]
+        rows.append({"subclass": entry.get("subclass"), **trimmed})
+
+    if not rows:
+        return {
+            "categories": [],
+            "note": ("No clustering is available. It is rebuilt from the fault "
+                     "paths during analysis."),
+        }
+    return {
+        "note": ("A dominant prefix shows where faults concentrate, not why "
+                 "they are there. Sample paths are verbatim and can be pasted "
+                 "into a tool unmodified."),
+        "categories": rows,
+    }
+
+
+def list_blocking_sources(triage: Optional[Dict[str, Any]],
+                          subclass: Optional[str] = None) -> Dict[str, Any]:
+    """Return the constant drivers and constrained signals blocking faults."""
+    if not triage:
+        return dict(_NO_TRIAGE)
+
+    rows = []
+    for entry in triage.get("selected", []):
+        if subclass and str(entry.get("subclass", "")).upper() != \
+                subclass.strip().upper():
+            continue
+        attribution = entry.get("attribution")
+        if attribution:
+            rows.append(attribution)
+
+    if not rows:
+        return {
+            "categories": [],
+            "note": ("No blocking structure was attributed. Only AU.TC and "
+                     "AU.PC are traced, and only when the faults map onto "
+                     "netlist objects."),
+        }
+    return {
+        "note": ("Derived by tracing fan-in cones through the netlist. This "
+                 "is an estimate of what blocks the faults, not the ATPG "
+                 "tool's own attribution."),
+        "categories": rows,
+    }
+
+
+def profile_fault_sites(triage: Optional[Dict[str, Any]],
+                        subclass: Optional[str] = None) -> Dict[str, Any]:
+    """Return why aborted faults were structurally hard to test."""
+    if not triage:
+        return dict(_NO_TRIAGE)
+
+    rows = []
+    for entry in triage.get("selected", []):
+        if subclass and str(entry.get("subclass", "")).upper() != \
+                subclass.strip().upper():
+            continue
+        profile = entry.get("reachability")
+        if profile:
+            rows.append(profile)
+
+    if not rows:
+        return {
+            "categories": [],
+            "note": ("No structural profile is available. Only aborted "
+                     "categories (UC.AAB, UO.AAB, UC, UO) are profiled, and "
+                     "only when the faults map onto netlist objects."),
+        }
+    return {
+        "note": ("Estimated from the netlist. A bottleneck and a reconvergent "
+                 "cone need opposite fixes — more abort budget helps the "
+                 "former and is wasted on the latter — so check the dominant "
+                 "signature before acting."),
+        "categories": rows,
+    }
+
+
+def verify_paths(fault_results: Any, constraints: Any, netlist: Any = None,
+                 paths: Any = None, text: str = "") -> Dict[str, Any]:
+    """Check hierarchy paths against the source artefacts before quoting them.
+
+    A path that was shortened with an ellipsis, or assembled from plausible
+    looking parts, will not resolve when pasted into a tool. Verify anything
+    you intend to quote.
+    """
+    from . import guardrails
+
+    registry = guardrails.PathRegistry.from_parts(
+        fault_results=fault_results or (), constraints=constraints or (),
+        netlist=netlist)
+
+    candidates: List[str] = []
+    if isinstance(paths, str):
+        candidates = [p for p in re.split(r"[,\s]+", paths) if p]
+    elif paths:
+        candidates = [str(p) for p in paths]
+
+    checked = []
+    for path in candidates:
+        issue = registry.validate(path, context="verify_paths")
+        checked.append({
+            "path": path,
+            "ok": issue is None,
+            "problem": issue.kind if issue else "",
+        })
+
+    scanned = ([i.as_dict() for i in
+                guardrails.check_text(text, registry, "verify_paths")]
+               if text else [])
+
+    return {
+        "source_paths_known": len(registry),
+        "checked": checked,
+        "text_issues": scanned,
+        "note": ("A path is accepted when it matches a source path exactly or "
+                 "is a component-aligned prefix of one, such as a cluster "
+                 "prefix. Anything else was not in the inputs."),
+    }
 
 
 class _Bag:
@@ -478,6 +799,24 @@ class _Bag:
 
     def __init__(self, **kw: Any) -> None:
         self.__dict__.update(kw)
+
+
+def _connectivity_known(d: Dict[str, Any]) -> bool:
+    """Whether a serialised fault row carries measured connectivity."""
+    if "connectivity_known" in d:
+        return bool(d["connectivity_known"])
+    # Older payloads: an unresolved mapping never had connectivity measured.
+    return str(d.get("confidence", "")).lower() != "unresolved"
+
+
+def _scan_state(d: Dict[str, Any]) -> str:
+    """Normalise the tri-state scan column of a serialised fault row."""
+    if not _connectivity_known(d):
+        return "unknown"
+    raw = d.get("scan_boundary_involved", False)
+    if isinstance(raw, str):
+        return raw if raw in ("yes", "no", "unknown") else "no"
+    return "yes" if raw else "no"
 
 
 def rehydrate(evidence: Dict[str, Any]):
@@ -507,12 +846,17 @@ def rehydrate(evidence: Dict[str, Any]):
         faults.append(_Bag(
             fault=fault,
             mapping=mapping,
-            fan_in=d.get("fan_in", []),
-            fan_out=d.get("fan_out", []),
+            fan_in=d.get("fan_in") or [],
+            fan_out=d.get("fan_out") or [],
+            connectivity_known=_connectivity_known(d),
             controllability_issue=d.get("controllability_issue", False),
             observability_issue=d.get("observability_issue", False),
             constraint_related=d.get("constraint_related", False),
-            scan_boundary_involved=d.get("scan_boundary_involved", False),
+            scan_boundary_involved=_scan_state(d) == "yes",
+            scan_boundary_state=_scan_state(d),
+            scan_cell_state=d.get("scan_cell_state", "unknown"),
+            scan_evidence=d.get("scan_evidence", ""),
+            tie_driver=d.get("tie_driver"),
             root_cause=d.get("root_cause"),
             observed_facts=d.get("observed_facts", []),
             inferred_conclusions=d.get("inferred_conclusions", []),
@@ -537,11 +881,39 @@ def rehydrate(evidence: Dict[str, Any]):
 #: tool name to ``(description, parameter_schema)`` where parameter_schema is a
 #: dict of ``param -> {type, description, default?}`` using skill-style types.
 TOOL_SPECS: Dict[str, Dict[str, Any]] = {
+    "scan_status": {
+        "description": (
+            "Decide whether an instance is a SCAN cell by reading its actual "
+            "netlist instantiation. Returns the verbatim instantiation, the "
+            "scan-in / shift-enable / scan-out pins, and three corroborating "
+            "checks. This is the ONLY admissible basis for a scan-status "
+            "claim: without a netlist, or when the object does not map, it "
+            "returns 'Unresolved - scan status cannot be determined without "
+            "netlist pin evidence.' Fault-table fan-in/fan-out/confidence "
+            "values never decide scan status."),
+        "params": {
+            "target": {"type": "str",
+                       "description": "fault object or hierarchical "
+                                      "instance path"},
+        },
+    },
+    "diagnose_unresolved": {
+        "description": (
+            "Explain why fault objects failed to map onto the netlist, "
+            "grouped by cause: absent_leaf (the cell model is missing from "
+            "the netlist), ambiguous (the name repeats and the path did not "
+            "narrow it), or outside_scope (the fault list and netlist cover "
+            "different blocks). Unmapped faults have UNKNOWN connectivity, "
+            "so no root cause on them is provable until this is fixed."),
+        "params": {
+            "limit": {"type": "int", "default": 20,
+                      "description": "max groups to return"},
+        },
+    },
     "list_faults": {
         "description": (
             "List coverage-loss faults matching optional filters (fault class, "
-            "instance substring, root-cause substring, or issue flags)."),
-        "params": {
+            "instance substring, root-cause substring, or issue flags)."),        "params": {
             "fault_class": {"type": "str", "description": "AU, UO, or UC"},
             "instance": {"type": "str", "description": "instance-name substring"},
             "root_cause": {"type": "str", "description": "root-cause substring"},
@@ -655,6 +1027,90 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                       "description": "max rows to return"},
         },
     },
+    "coverage_triage": {
+        "description": (
+            "Break the fault list down by Tessent fault class and dotted "
+            "subclass (AU.PC, AU.TC, UO.AAB, ...) with stuck-at split, and "
+            "report which coverage-loss categories were selected for "
+            "investigation. Start here to decide what to debug."),
+        "params": {},
+    },
+    "recommend_fixes": {
+        "description": (
+            "Return ranked, evidence-backed fix proposals for the selected "
+            "coverage-loss categories, each with rationale, preconditions, "
+            "copyable Tessent commands and caveats."),
+        "params": {
+            "subclass": {"type": "str", "default": "",
+                         "description": ("restrict to one dotted subclass, "
+                                         "e.g. 'AU.TC'; empty for all")},
+            "limit": {"type": "int", "default": 10,
+                      "description": "max proposals to return"},
+        },
+    },
+    "explain_subclass": {
+        "description": (
+            "Explain what a dotted fault subclass means, what usually causes "
+            "it, what evidence would confirm it, and which fixes apply. "
+            "Works without an analysis loaded."),
+        "params": {
+            "subclass": {"type": "str",
+                         "description": "dotted class id, e.g. 'UO.AAB'"},
+        },
+    },
+    "list_clusters": {
+        "description": (
+            "Show where each coverage-loss category concentrates in the "
+            "design hierarchy, with fault counts, stuck-at split and verbatim "
+            "sample paths. Tells you WHERE to look, never why."),
+        "params": {
+            "subclass": {"type": "str", "default": "",
+                         "description": ("restrict to one dotted subclass; "
+                                         "empty for all")},
+            "limit": {"type": "int", "default": 10,
+                      "description": "max clusters per category"},
+        },
+    },
+    "list_blocking_sources": {
+        "description": (
+            "Name what is blocking the faults: constant drivers (tie cells, "
+            "test data registers, unscanned flops) for AU.TC and constrained "
+            "signals for AU.PC, found by tracing fan-in cones. Structural "
+            "estimate, not the ATPG tool's own attribution."),
+        "params": {
+            "subclass": {"type": "str", "default": "",
+                         "description": ("restrict to one dotted subclass; "
+                                         "empty for all")},
+        },
+    },
+    "profile_fault_sites": {
+        "description": (
+            "Explain why aborted faults (UC.AAB / UO.AAB / UC / UO) were hard "
+            "to test: low controllability, hard observability gap, "
+            "observability bottleneck, reconvergent complexity or sequential "
+            "depth explosion. These call for different fixes, so check this "
+            "before recommending test points or a higher abort limit."),
+        "params": {
+            "subclass": {"type": "str", "default": "",
+                         "description": ("restrict to one dotted subclass; "
+                                         "empty for all")},
+        },
+    },
+    "verify_paths": {
+        "description": (
+            "Check hierarchy paths against the source artefacts before "
+            "quoting them. Use this for any path you are about to put in an "
+            "answer: a shortened or reconstructed path will not resolve when "
+            "pasted into a tool. Also flags coverage-gain claims that have "
+            "not been measured by a re-run."),
+        "params": {
+            "paths": {"type": "str", "default": "",
+                      "description": "whitespace/comma separated paths"},
+            "text": {"type": "str", "default": "",
+                     "description": ("optional prose to scan for bad paths "
+                                     "and unmeasured claims")},
+        },
+    },
 }
 
 
@@ -683,16 +1139,48 @@ def serialize_report_for_compare(fault_results: Any, summary: Any,
 def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              constraints: Any, netlist: Any,
              adjacency: Optional[Dict[str, List[str]]] = None,
-             compare: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             compare: Optional[Dict[str, Any]] = None,
+             triage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
     Unknown parameters are ignored; missing ones fall back to defaults. When
     *adjacency* is provided (out-of-process MCP server), ``trace_path`` uses it
     instead of a live netlist. When *compare* (a baseline report payload) is
-    provided, the regression tools become available.
+    provided, the regression tools become available, and when *triage* is
+    provided the coverage-triage tools become available.
     """
     args = dict(args or {})
+    if name == "scan_status":
+        return scan_status(netlist, str(args.get("target", "")))
+    if name == "diagnose_unresolved":
+        return diagnose_unresolved_tool(
+            fault_results, netlist,
+            limit=int(args.get("limit", 20) or 20))
+    if name == "coverage_triage":
+        return coverage_triage(triage)
+    if name == "recommend_fixes":
+        return recommend_fixes(
+            triage,
+            subclass=str(args.get("subclass", "") or "") or None,
+            limit=int(args.get("limit", 10) or 10))
+    if name == "explain_subclass":
+        return explain_subclass(str(args.get("subclass", "")))
+    if name == "list_clusters":
+        return list_clusters(
+            triage,
+            subclass=str(args.get("subclass", "") or "") or None,
+            limit=int(args.get("limit", 10) or 10))
+    if name == "list_blocking_sources":
+        return list_blocking_sources(
+            triage, subclass=str(args.get("subclass", "") or "") or None)
+    if name == "profile_fault_sites":
+        return profile_fault_sites(
+            triage, subclass=str(args.get("subclass", "") or "") or None)
+    if name == "verify_paths":
+        return verify_paths(
+            fault_results, constraints, netlist,
+            paths=args.get("paths", ""), text=str(args.get("text", "") or ""))
     if name == "list_faults":
         return list_faults(
             fault_results,

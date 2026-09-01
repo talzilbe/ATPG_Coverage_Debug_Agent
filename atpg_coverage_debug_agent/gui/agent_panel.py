@@ -10,7 +10,15 @@ import uuid
 from typing import Optional
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QObject,
+    QProcess,
+    QProcessEnvironment,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,7 +50,9 @@ from ..agent.debug_agent import (
     build_user_payload,
     is_cli_auth_error,
 )
+from ..agent import cli_models
 from ..analysis import investigate
+from ..config import credentials
 from ..skills.base import AnalysisContext
 
 logger = logging.getLogger(__name__)
@@ -56,23 +66,38 @@ _DEFAULT_CLI_HOME = os.environ.get(
     "COPILOT_HOME", "/nfs/site/disks/talzilbe_wa01/copilot-home")
 
 # Suggested model ids for the GitHub Copilot CLI --model flag. This is only a
-# convenience list — the combo is editable, so any id the account supports can
-# be typed in. The authoritative list comes from the CLI's /model command once
-# authenticated.
-_CLI_MODEL_CHOICES = [
-    "auto",
-    "claude-opus-4.8",
-    "claude-sonnet-4.8",
-    "claude-opus-4.5",
-    "claude-opus-4.1",
-    "claude-sonnet-4.5",
-    "claude-sonnet-4",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-4.1",
-    "o3",
-    "o4-mini",
-]
+# seed for the very first launch: the real list is pulled from the CLI itself
+# on every start (see ``agent.cli_models``) and cached, because any list
+# hard-coded here goes stale as soon as a new model ships. The combo stays
+# editable so an id the CLI has not advertised can still be typed in.
+_CLI_MODEL_CHOICES = ["auto"]
+
+# Inline style for every chat paragraph. Chat content is English technical
+# text, so the direction and alignment are pinned rather than inherited from
+# the system locale (an RTL locale would otherwise mirror "You: question"
+# into "question :You").
+_LTR_STYLE = "margin:6px 0; text-align:left; direction:ltr;"
+
+
+class _ModelListWorker(QObject):
+    """Asks the Copilot CLI for its current model list, off the GUI thread."""
+
+    finished = Signal(list)
+
+    def __init__(self, cli_path: str, cli_home: str, token: str) -> None:
+        super().__init__()
+        self._cli_path = cli_path
+        self._cli_home = cli_home
+        self._token = token
+
+    def run(self) -> None:
+        try:
+            models = cli_models.fetch_models(self._cli_path, self._cli_home,
+                                             self._token)
+        except Exception:  # noqa: BLE001
+            logger.exception("Model list refresh failed")
+            models = []
+        self.finished.emit(models)
 
 
 class _AgentWorker(QObject):
@@ -183,6 +208,8 @@ class AgentPanel(QWidget):
         self._chat_backend: str = "cli"
         self._chat_thread: Optional[QThread] = None
         self._chat_worker = None
+        self._model_thread: Optional[QThread] = None
+        self._model_worker = None
         self._last_response: str = ""
         self._chat_turns: list = []
         self._compare = None
@@ -245,7 +272,16 @@ class AgentPanel(QWidget):
             "account supports. 'auto' lets Copilot choose automatically.")
         self.cli_model_combo.currentTextChanged.connect(
             self._notify_config_changed)
-        form.addRow("CLI model:", self.cli_model_combo)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.cli_model_combo, 1)
+        self.cli_model_refresh_btn = QPushButton("Refresh")
+        self.cli_model_refresh_btn.setToolTip(
+            "Re-read the model list from the Copilot CLI. This also happens "
+            "automatically each time the GUI starts.")
+        self.cli_model_refresh_btn.clicked.connect(self.refresh_models)
+        model_row.addWidget(self.cli_model_refresh_btn)
+        self.cli_model_row_widget = self._wrap(model_row)
+        form.addRow("CLI model:", self.cli_model_row_widget)
 
         self.cli_mcp_check = QCheckBox(
             "Let the agent drive investigation tools (MCP)")
@@ -382,6 +418,7 @@ class AgentPanel(QWidget):
         resp_box = QGroupBox("Agent Response (click a fault to focus it in the table)")
         resp_layout = QVBoxLayout(resp_box)
         self.response_view = QTextBrowser()
+        self.response_view.setLayoutDirection(Qt.LeftToRight)
         self.response_view.setOpenLinks(False)
         self.response_view.setOpenExternalLinks(False)
         self.response_view.anchorClicked.connect(self._on_anchor_clicked)
@@ -400,6 +437,11 @@ class AgentPanel(QWidget):
         chat_box = QGroupBox("Follow-up Chat with the Agent")
         chat_layout = QVBoxLayout(chat_box)
         self.chat_view = QTextBrowser()
+        # The transcript is always English/technical text: pin it to
+        # left-to-right so an RTL system locale cannot mirror the layout.
+        self.chat_view.setLayoutDirection(Qt.LeftToRight)
+        self.chat_view.document().setDefaultStyleSheet(
+            "p { text-align: left; }")
         self.chat_view.setOpenLinks(False)
         self.chat_view.setOpenExternalLinks(False)
         self.chat_view.anchorClicked.connect(self._on_anchor_clicked)
@@ -443,6 +485,12 @@ class AgentPanel(QWidget):
 
         self.tabs.addTab(agent_tab, "Debug Agent")
         self.tabs.addTab(self._build_auth_tab(), "Authentication")
+
+        # Show the last known models immediately, then go ask the CLI for the
+        # current list — models are added and retired between releases, so a
+        # list baked into the source is wrong within weeks.
+        self._apply_models(cli_models.load_cached_models())
+        QTimer.singleShot(0, self.refresh_models)
 
     # -- Pop-out / dock panels ----------------------------------------------
 
@@ -529,9 +577,9 @@ class AgentPanel(QWidget):
 
         info = QLabel(
             "The GitHub Copilot CLI backend needs GitHub authentication. Use "
-            "<b>either</b> option below. Credentials are never written to this "
-            "app's settings — a pasted token is kept in memory only; the device "
-            "login stores its token in the CLI home shown on the Debug Agent tab.")
+            "<b>either</b> option below. A pasted token can be remembered for "
+            "the next launch (see the checkbox); the device login stores its "
+            "token in the CLI home shown on the Debug Agent tab.")
         info.setWordWrap(True)
         v.addWidget(info)
 
@@ -543,10 +591,33 @@ class AgentPanel(QWidget):
         self.auth_token_edit.setPlaceholderText(
             "Fine-grained PAT with 'Copilot Requests' permission, or an OAuth token")
         self.auth_token_edit.textChanged.connect(self._notify_config_changed)
+        self.auth_token_edit.editingFinished.connect(self._persist_token)
         tok_form.addRow("GitHub token:", self.auth_token_edit)
+
+        remember_row = QHBoxLayout()
+        self.auth_remember_check = QCheckBox(
+            "Remember this token for my account on this machine")
+        self.auth_remember_check.setChecked(True)
+        self.auth_remember_check.setToolTip(
+            "When checked, the token is stored outside the normal settings "
+            "file and re-filled automatically the next time the GUI starts. "
+            "The store belongs to your account, so other users running this "
+            "GUI never see it \u2014 and it does not depend on which directory "
+            "you launch from.")
+        self.auth_remember_check.toggled.connect(self._on_remember_toggled)
+        self.auth_forget_btn = QPushButton("Forget saved token")
+        self.auth_forget_btn.clicked.connect(self.on_forget_token)
+        remember_row.addWidget(self.auth_remember_check)
+        remember_row.addWidget(self.auth_forget_btn)
+        remember_row.addStretch(1)
+        tok_form.addRow("", self._wrap(remember_row))
+
         tok_note = QLabel(
             "Injected as COPILOT_GITHUB_TOKEN for CLI runs. Classic ghp_ tokens "
-            "are not supported.")
+            "are not supported.<br>Remembered tokens are kept in "
+            f"<code>{html.escape(credentials.storage_description())}</code> — "
+            "your account only, independent of the launch directory, never in "
+            "settings.json, and never in a saved report.")
         tok_note.setWordWrap(True)
         tok_note.setStyleSheet("color: #666;")
         tok_form.addRow("", tok_note)
@@ -593,7 +664,120 @@ class AgentPanel(QWidget):
         self.auth_log.setPlaceholderText(
             "Authentication output (device code, URL, results) appears here.")
         v.addWidget(self.auth_log, 1)
+
+        self._restore_saved_token()
         return tab
+
+    # -- remembered GitHub token ---------------------------------------------
+
+    def _restore_saved_token(self) -> None:
+        """Pre-fill the token field from the credential store, if one is saved."""
+        try:
+            token = credentials.load_github_token()
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not read the saved GitHub token")
+            return
+        if not token:
+            return
+        # Block signals so restoring does not re-write the store.
+        self.auth_token_edit.blockSignals(True)
+        self.auth_token_edit.setText(token)
+        self.auth_token_edit.blockSignals(False)
+        self.auth_remember_check.setChecked(True)
+        self.auth_status_label.setText(
+            "Saved GitHub token loaded — press 'Check authentication' to "
+            "confirm it is still valid.")
+
+    def _persist_token(self, announce: bool = True) -> None:
+        """Save (or clear) the token according to the 'remember' checkbox."""
+        if not self.auth_remember_check.isChecked():
+            return
+        token = self.auth_token_edit.text().strip()
+        if not token:
+            return
+        saved = credentials.save_github_token(token)
+        if not saved:
+            self.auth_status_label.setText(
+                "Could not save the token (see the log); it stays in memory "
+                "for this session only.")
+        elif announce:
+            self.auth_status_label.setText(
+                "Token saved — it will be filled in automatically next time.")
+
+    def _on_remember_toggled(self, checked: bool) -> None:
+        if checked:
+            self._persist_token()
+        else:
+            credentials.clear_github_token()
+            self.auth_status_label.setText(
+                "Saved token removed — it will not be restored next time.")
+        self.config_changed.emit()
+
+    def on_forget_token(self) -> None:
+        """Clear the token field and delete anything held in the store."""
+        credentials.clear_github_token()
+        self.auth_token_edit.clear()
+        self.auth_remember_check.setChecked(False)
+        self.auth_status_label.setText("Saved GitHub token deleted.")
+
+    # -- CLI model list ------------------------------------------------------
+
+    def _apply_models(self, models: list) -> None:
+        """Repopulate the model combo from *models*, keeping the selection."""
+        if not models:
+            return
+        current = self.cli_model_combo.currentText().strip()
+        ids = cli_models.model_ids(models)
+        self.cli_model_combo.blockSignals(True)
+        self.cli_model_combo.clear()
+        self.cli_model_combo.addItems(ids)
+        by_id = {m.model_id: m for m in models}
+        for row, mid in enumerate(ids):
+            info = by_id.get(mid)
+            if info is not None and info.name:
+                self.cli_model_combo.setItemData(row, info.label(), Qt.ToolTipRole)
+        # A model the user picked earlier may have been retired; keep the text
+        # anyway (the combo is editable) so nothing silently switches models.
+        self.cli_model_combo.setCurrentText(current or "auto")
+        self.cli_model_combo.blockSignals(False)
+
+    def refresh_models(self) -> None:
+        """Re-read the model list from the Copilot CLI in the background."""
+        if self._model_thread is not None:
+            return
+        cli_path = self.cli_path_edit.text().strip()
+        if not cli_path or not os.path.isfile(cli_path):
+            self.status_label.setText(
+                "Set a valid Copilot CLI path to refresh the model list.")
+            return
+        self.cli_model_refresh_btn.setEnabled(False)
+        self.status_label.setText("Reading the model list from the Copilot CLI…")
+        self._model_thread = QThread()
+        self._model_worker = _ModelListWorker(
+            cli_path, self.cli_home_edit.text().strip(),
+            self.auth_token_edit.text().strip())
+        self._model_worker.moveToThread(self._model_thread)
+        self._model_thread.started.connect(self._model_worker.run)
+        self._model_worker.finished.connect(self._on_models_fetched)
+        self._model_worker.finished.connect(self._model_thread.quit)
+        self._model_thread.finished.connect(self._model_cleanup)
+        self._model_thread.start()
+
+    def _on_models_fetched(self, models: list) -> None:
+        if not models:
+            self.status_label.setText(
+                "Could not read the model list — keeping the last known one. "
+                "Check the CLI path and authentication.")
+            return
+        self._apply_models(models)
+        cli_models.save_cached_models(models)
+        self.status_label.setText(
+            f"Model list updated from the Copilot CLI ({len(models)} models).")
+
+    def _model_cleanup(self) -> None:
+        self._model_thread = None
+        self._model_worker = None
+        self.cli_model_refresh_btn.setEnabled(True)
 
     @staticmethod
     def _wrap(inner_layout) -> QWidget:
@@ -612,7 +796,7 @@ class AgentPanel(QWidget):
         """Show only the fields relevant to the selected backend."""
         is_cli = self._current_backend() == "cli"
         for w in (self.cli_path_row_widget, self.cli_home_edit,
-                  self.cli_model_combo, self.cli_mcp_check):
+                  self.cli_model_row_widget, self.cli_mcp_check):
             self._form.setRowVisible(w, is_cli)
         for w in (self.base_url_edit, self.model_edit, self.api_key_edit):
             self._form.setRowVisible(w, not is_cli)
@@ -753,6 +937,7 @@ class AgentPanel(QWidget):
             "temperature": float(self.temp_spin.value()),
             "max_tokens": int(self.maxtok_spin.value()),
             "max_faults": int(self.maxfaults_spin.value()),
+            "remember_token": self.auth_remember_check.isChecked(),
         }
 
     def import_settings(self, cfg: dict) -> None:
@@ -773,6 +958,10 @@ class AgentPanel(QWidget):
         self.temp_spin.setValue(float(cfg.get("temperature", 0.0)))
         self.maxtok_spin.setValue(int(cfg.get("max_tokens", 4000)))
         self.maxfaults_spin.setValue(int(cfg.get("max_faults", 200)))
+        if "remember_token" in cfg:
+            self.auth_remember_check.blockSignals(True)
+            self.auth_remember_check.setChecked(bool(cfg["remember_token"]))
+            self.auth_remember_check.blockSignals(False)
         self._on_backend_changed()
 
     # -- actions -------------------------------------------------------------
@@ -812,6 +1001,10 @@ class AgentPanel(QWidget):
             summary=r.summary,
             adjacency=getattr(r, "adjacency", None),
             compare=getattr(self, "_compare", None),
+            triage=investigate.serialize_triage(
+                getattr(r, "statistics", None),
+                getattr(r, "selected_categories", None),
+                getattr(r, "recommendations", None)),
         )
 
     def on_run(self) -> None:
@@ -900,8 +1093,35 @@ class AgentPanel(QWidget):
     def _append_trace(self, line: str) -> None:
         self.trace_view.appendPlainText(line)
 
+    def _audit_answer(self, text: str) -> str:
+        """Return *text* with a guardrail notice appended when it earns one.
+
+        The model is the component most likely to shorten a hierarchy path or
+        predict a coverage number, and both read as authoritative. Flagging
+        them next to the answer keeps the reader from acting on either.
+        """
+        if not text or self._report is None:
+            return text
+        try:
+            from ..analysis.guardrails import (
+                PathRegistry,
+                check_text,
+                issues_as_warnings,
+            )
+            registry = PathRegistry.from_report(self._report)
+            issues = check_text(text, registry, "agent answer")
+        except Exception:  # noqa: BLE001 - auditing must never break the run
+            return text
+        if not issues:
+            return text
+
+        notice = ["", "---", "**Guardrail check on the answer above:**", ""]
+        notice.extend(f"- {line}" for line in issues_as_warnings(issues))
+        return text + "\n" + "\n".join(notice)
+
     def _on_finished(self, text: str) -> None:
         final = text or getattr(self, "_stream_buf", "")
+        final = self._audit_answer(final)
         self._set_response(final)
         self.status_label.setText(
             "Agent response received — click a fault to focus it, or Verify.")
@@ -973,8 +1193,9 @@ class AgentPanel(QWidget):
             body = html.escape((text or "").strip()).replace("\n", "<br>")
         colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b"}.get(
             role, "#555")
-        block = (f'<p style="margin:6px 0;"><b style="color:{colour};">'
-                 f'{html.escape(role)}:</b><br>{body}</p>')
+        block = (f'<p dir="ltr" style="{_LTR_STYLE}">'
+                 f'<b style="color:{colour};">{html.escape(role)}:</b> '
+                 f'{body}</p>')
         self._append_html(self.chat_view, block)
 
     def _append_chat(self, role: str, text: str) -> None:
@@ -1018,14 +1239,17 @@ class AgentPanel(QWidget):
         return esc.replace("\n", "<br>")
 
     def _append_html(self, browser: QTextBrowser, html_str: str) -> None:
-        browser.moveCursor(QTextCursor.End)
-        browser.insertHtml(html_str)
+        # append() starts a new paragraph; insertHtml would merge the fragment
+        # into the block that is already at the cursor, running consecutive
+        # turns together on one line.
+        browser.append(html_str)
         browser.moveCursor(QTextCursor.End)
 
     def _set_response(self, text: str) -> None:
         self._last_response = text
         self.response_view.setHtml(
-            f'<div style="font-family:monospace;white-space:pre-wrap;">'
+            f'<div dir="ltr" style="font-family:monospace;'
+            f'white-space:pre-wrap;text-align:left;direction:ltr;">'
             f'{self._to_html(text)}</div>')
 
     def _on_anchor_clicked(self, url) -> None:
@@ -1157,7 +1381,8 @@ class AgentPanel(QWidget):
         # Live streaming cue appended below the You turn; replaced on finish.
         self._append_html(
             self.chat_view,
-            '<p style="margin:6px 0;"><b style="color:#036;">Agent:</b><br></p>')
+            f'<p dir="ltr" style="{_LTR_STYLE}">'
+            '<b style="color:#036;">Agent:</b> </p>')
 
         agent = DebugAgent(config)
         self._chat_thread = QThread()
@@ -1322,6 +1547,10 @@ class AgentPanel(QWidget):
                    f"Not authenticated (exit {code}). Paste a token (Option A) "
                    "or use device sign-in (Option B).")
             self.auth_status_label.setText(msg)
+            if ok:
+                # The token just proved it works: remember it so the next
+                # launch starts authenticated.
+                self._persist_token(announce=False)
         self.auth_log.appendPlainText(f"[done] exit={code}")
         self._auth_proc = None
         self.auth_login_btn.setEnabled(True)

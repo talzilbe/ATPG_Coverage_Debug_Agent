@@ -15,6 +15,12 @@ import json
 from typing import Any, Dict, List
 
 from ..analysis import investigate
+from ..analysis.recommend import build_recommendations
+from ..analysis.statistics import (
+    DerivedStatistics,
+    enrich_categories,
+    select_categories,
+)
 from ..models import (
     AnalysisReport,
     AnalysisSummary,
@@ -71,6 +77,9 @@ def _fault_result_to_dict(r: FaultAnalysisResult) -> Dict[str, Any]:
         "observability_issue": r.observability_issue,
         "constraint_related": r.constraint_related,
         "scan_boundary_involved": r.scan_boundary_involved,
+        "scan_cell_state": r.scan_cell_state,
+        "scan_evidence": r.scan_evidence,
+        "tie_driver": dict(r.tie_driver) if r.tie_driver else None,
         "root_cause": r.root_cause.value,
         "observed_facts": list(r.observed_facts or []),
         "inferred_conclusions": list(r.inferred_conclusions or []),
@@ -102,6 +111,12 @@ def _summary_to_dict(s: AnalysisSummary) -> Dict[str, Any]:
         "top_modules": [list(t) for t in s.top_modules],
         "top_constraints": [list(t) for t in s.top_constraints],
         "warnings": list(s.warnings),
+        "mapped_count": s.mapped_count,
+        "unmapped_count": s.unmapped_count,
+        "scan_evidence_counts": dict(s.scan_evidence_counts),
+        "tied_constant_count": s.tied_constant_count,
+        "actionable_loss_count": s.actionable_loss_count,
+        "unresolved_causes": dict(s.unresolved_causes),
     }
 
 
@@ -126,6 +141,10 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         "sources": getattr(report, "sources", None) or {},
         "investigation": getattr(report, "investigation", None),
         "edits": getattr(report, "edits", None),
+        # Only the aggregated breakdown is stored: the selected categories and
+        # fix proposals are derived from it deterministically on load.
+        "statistics": (report.statistics.as_dict()
+                       if getattr(report, "statistics", None) else None),
     }
 
 
@@ -173,6 +192,9 @@ def _dict_to_fault_result(d: Dict[str, Any]) -> FaultAnalysisResult:
         observability_issue=bool(d.get("observability_issue", False)),
         constraint_related=bool(d.get("constraint_related", False)),
         scan_boundary_involved=bool(d.get("scan_boundary_involved", False)),
+        scan_cell_state=d.get("scan_cell_state", "unknown"),
+        scan_evidence=d.get("scan_evidence", ""),
+        tie_driver=d.get("tie_driver") or None,
         root_cause=RootCause(d.get("root_cause",
                                    RootCause.OTHER_STRUCTURAL.value)),
         observed_facts=list(d.get("observed_facts", [])),
@@ -208,6 +230,12 @@ def _dict_to_summary(d: Dict[str, Any]) -> AnalysisSummary:
         top_modules=_tuples("top_modules"),
         top_constraints=_tuples("top_constraints"),
         warnings=list(d.get("warnings", [])),
+        mapped_count=int(d.get("mapped_count", 0) or 0),
+        unmapped_count=int(d.get("unmapped_count", 0) or 0),
+        scan_evidence_counts=dict(d.get("scan_evidence_counts", {})),
+        tied_constant_count=int(d.get("tied_constant_count", 0) or 0),
+        actionable_loss_count=int(d.get("actionable_loss_count", 0) or 0),
+        unresolved_causes=dict(d.get("unresolved_causes", {})),
     )
 
 
@@ -236,6 +264,18 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     report.sources = data.get("sources", {}) or {}
     report.investigation = data.get("investigation")
     report.edits = data.get("edits")
+
+    stats_payload = data.get("statistics")
+    if stats_payload:
+        statistics = DerivedStatistics.from_dict(stats_payload)
+        report.statistics = statistics
+        # Clustering is rebuilt from the coverage-loss faults that were saved.
+        # Detected faults are not persisted, so clusters cover the loss
+        # population only — which is all the triage looks at anyway.
+        report.selected_categories = enrich_categories(
+            select_categories(statistics), report.faults or [])
+        report.recommendations = build_recommendations(
+            statistics, report.selected_categories)
     return report
 
 

@@ -98,6 +98,34 @@ def test_chat_token_streaming_rebuilds_transcript(panel_with_report):
     assert panel._chat_turns[-1][0] == "Agent"
 
 
+def test_chat_transcript_is_left_to_right_and_one_block_per_turn(
+        panel_with_report, qapp):
+    from PySide6.QtCore import Qt
+
+    panel, _rep = panel_with_report
+    qapp.setLayoutDirection(Qt.RightToLeft)   # hostile (RTL) system locale
+    try:
+        panel._chat_turns = []
+        panel.chat_view.clear()
+        panel._append_chat("You", "why is AU.PC high?")
+        panel._append_chat("Agent", "the scan enable is tied off")
+
+        assert panel.chat_view.layoutDirection() == Qt.LeftToRight
+
+        doc = panel.chat_view.document()
+        blocks = [doc.findBlockByNumber(i)
+                  for i in range(doc.blockCount())]
+        texts = [b.text() for b in blocks if b.text().strip()]
+        # One paragraph per turn, speaker label first, on the same line.
+        assert texts == ["You: why is AU.PC high?",
+                         "Agent: the scan enable is tied off"]
+        for b in blocks:
+            assert b.textDirection() == Qt.LeftToRight
+            assert b.blockFormat().alignment() & Qt.AlignLeft
+    finally:
+        qapp.setLayoutDirection(Qt.LeftToRight)
+
+
 
 def test_investigation_export_import(panel_with_report, qapp,
                                      sample_netlist_path, sample_faults_path,

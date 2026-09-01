@@ -8,6 +8,15 @@ from PySide6.QtWidgets import QTextBrowser, QWidget, QVBoxLayout
 
 from ..models import FaultAnalysisResult
 
+#: Human labels for the tri-state scan verdict. "unknown" is never softened
+#: into "non-scan" -- that substitution is what produced a wrong published
+#: analysis once already.
+_SCAN_LABEL = {
+    "scan": "scan (scan-data input + shift-enable pins read)",
+    "non_scan": "non-scan (no scan-data input, no shift-enable)",
+    "unknown": "unknown \u2014 no instantiation read, or unrecognised pin names",
+}
+
 
 class DetailsPanel(QWidget):
     """Read-only rich-text panel showing evidence for one fault."""
@@ -45,14 +54,37 @@ class DetailsPanel(QWidget):
                          "yes" if r.observability_issue else "no"))
         html.append(_row("Constraint related",
                          "yes" if r.constraint_related else "no"))
-        html.append(_row("Scan boundary involved",
-                         "yes" if r.scan_boundary_involved else "no"))
-        html.append(_row("Immediate fan-in", _esc(", ".join(r.fan_in) or "—")))
-        html.append(_row("Immediate fan-out", _esc(", ".join(r.fan_out) or "—")))
+        html.append(_row("Scan boundary involved", r.scan_boundary_state))
+        html.append(_row("Scan status (from pin list)",
+                         _SCAN_LABEL.get(r.scan_cell_state,
+                                         r.scan_cell_state)))
+        if r.tie_driver:
+            tie = r.tie_driver
+            value = tie.get("value")
+            html.append(_row(
+                "Constant driver",
+                f"<b>{_esc(tie.get('instance', ''))}</b> "
+                f"(<code>{_esc(tie.get('cell_type', ''))}</code>)"
+                + (f" holding constant {_esc(value)}" if value else "")
+                + f", {tie.get('levels', 0)} hierarchy level(s) away "
+                  f"on net <code>{_esc(tie.get('net', ''))}</code>"))
+        if r.connectivity_known:
+            html.append(_row("Immediate fan-in",
+                             _esc(", ".join(r.fan_in) or "—")))
+            html.append(_row("Immediate fan-out",
+                             _esc(", ".join(r.fan_out) or "—")))
+        else:
+            unknown = ("<i>unknown — this object never mapped onto the "
+                       "netlist, so no connectivity was measured</i>")
+            html.append(_row("Immediate fan-in", unknown))
+            html.append(_row("Immediate fan-out", unknown))
         html.append("</table>")
 
         html.append("<h3>Observed facts</h3>")
         html.append(_ul(r.observed_facts))
+        if r.scan_evidence:
+            html.append("<h3>Instantiation read from the netlist</h3>")
+            html.append(f"<pre>{_esc(r.scan_evidence)}</pre>")
         html.append("<h3>Inferred conclusions</h3>")
         html.append(_ul(r.inferred_conclusions))
         html.append("<h3>Evidence</h3>")

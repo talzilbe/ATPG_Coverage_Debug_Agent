@@ -23,6 +23,7 @@ from ..models import (
 )
 from .connectivity import ConnectivityModel
 from .mapper import FaultMapper
+from ..parser.verilog_parser import scan_pin_role
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,17 @@ _RESET_NAME = re.compile(r"(rst|reset|_rn$|_sn$|clr|clear)", re.I)
 _TEST_EN_NAME = re.compile(r"(test_?en|scan_?en|tmode|test_mode|_te\b|_se\b)", re.I)
 _CONST_CELL = re.compile(r"(tie|tlo|thi|tieh|tiel|const|logic0|logic1)", re.I)
 _SCAN_CELL = re.compile(r"(sdff|sff|scan|muxdff|sdf)", re.I)
+
+#: Pin names treated as the data/enable inputs of a cell. A hard constant on
+#: one of these is what makes a stuck-at fault at the site undetectable, so
+#: they are the pins whose real driver must be resolved before any
+#: scan-boundary or observability story is told.
+_DATA_ENABLE_PIN = re.compile(
+    r"^(d|di|d\d+|data|den|de|e|en|ena|enable|ce|le|g|gate)$", re.I)
+
+#: Clock and reset pins, excluded from the data/enable search.
+_CLOCK_PIN = re.compile(r"^(clk|ck|clock|cp|gclk|clkin)$", re.I)
+_RESET_PIN = re.compile(r"^(r|rb|rn|rst|reset|clr|cd|sb|sn|set)$", re.I)
 
 
 class RootCauseEngine:
@@ -67,6 +79,43 @@ class RootCauseEngine:
                 f"{len(result.fan_in)} fan-in and {len(result.fan_out)} "
                 f"fan-out instance(s)."
             )
+            if inst.source_text:
+                result.observed_facts.append(
+                    f"Instantiation (netlist line {inst.line_number}): "
+                    f"{inst.source_text}"
+                )
+                result.scan_evidence = inst.source_text
+            scan = self._is_scan_cell(inst)
+            result.scan_cell_state = (
+                "unknown" if scan is None else ("scan" if scan else "non_scan"))
+            result.observed_facts.append(
+                f"Scan status from the pin list: {result.scan_cell_state}."
+            )
+            result.driver_resolution = self._resolve_site_driver(
+                module, inst, mapping.pin_name)
+            if result.driver_resolution is not None:
+                res = result.driver_resolution
+                result.observed_facts.append(
+                    f"Driver of the fault site resolved across "
+                    f"{res.levels} hierarchy hop(s) to {res.describe()}."
+                )
+                result.observed_facts.extend(
+                    f"  hop: {hop}" for hop in res.trace)
+                if res.is_tie:
+                    result.tie_driver = {
+                        "instance": res.instance.name,
+                        "cell_type": res.instance.cell_type,
+                        "value": res.tie_value,
+                        "net": res.net,
+                        "levels": res.levels,
+                        "trace": list(res.trace),
+                    }
+        else:
+            result.observed_facts.append(
+                "This fault object did not map onto a netlist instance. No "
+                "connectivity was measured: fan-in, fan-out and scan status "
+                "are UNKNOWN for this row, not zero and not 'no'."
+            )
 
         self._flag_controllability_observability(fault, result)
         constraint_hits = self._constraint_hits(mapping, module, inst)
@@ -90,10 +139,60 @@ class RootCauseEngine:
     def _locate(self, mapping) -> Tuple[Optional[str], Optional[Instance]]:
         if mapping.confidence is MappingConfidence.UNRESOLVED:
             return None, None
-        for mod_name, module in self.conn.netlist.modules.items():
-            if mapping.instance_name in module.instances:
-                return mod_name, module.instances[mapping.instance_name]
+        module = getattr(mapping, "module_name", None)
+        if module and module in self.conn.netlist.modules:
+            inst = self.conn.netlist.modules[module].instances.get(
+                mapping.instance_name)
+            if inst is not None:
+                return module, inst
+        for mod_name, module_obj in self.conn.netlist.modules.items():
+            if mapping.instance_name in module_obj.instances:
+                return mod_name, module_obj.instances[mapping.instance_name]
         return None, None
+
+    def _resolve_site_driver(self, module: str, inst: Instance,
+                             pin_name: Optional[str]):
+        """Resolve the real driver of the fault site across hierarchy.
+
+        Prefers the pin named by the fault object; when the fault names no
+        pin, falls back to the cell's data/enable inputs. Clock, reset and
+        scan pins are excluded -- a constant there is a different finding and
+        must not be reported as a tied data condition.
+
+        Returns:
+            A ``DriverResolution`` for the first pin whose driver resolves to
+            a tie cell, otherwise the first resolution found, otherwise
+            ``None`` (meaning *not resolved*, never *no driver*).
+        """
+        pins = self._site_pins(inst, pin_name)
+        first = None
+        for pin in pins:
+            if not pin.net:
+                continue
+            resolution = self.conn.resolve_driver(module, pin.net)
+            if resolution is None:
+                continue
+            if resolution.is_tie:
+                return resolution
+            if first is None:
+                first = resolution
+        return first
+
+    @staticmethod
+    def _site_pins(inst: Instance, pin_name: Optional[str]) -> List:
+        """Pins whose driver decides this fault site."""
+        if pin_name:
+            for pin in inst.pins:
+                if pin.name.lower() == pin_name.lower():
+                    if not (_CLOCK_PIN.match(pin.name)
+                            or scan_pin_role(pin.name)):
+                        return [pin]
+                    return []
+        return [pin for pin in inst.pins
+                if _DATA_ENABLE_PIN.match(pin.name)
+                and not _CLOCK_PIN.match(pin.name)
+                and not _RESET_PIN.match(pin.name)
+                and not scan_pin_role(pin.name)]
 
     def _flag_controllability_observability(
         self, fault: FaultRecord, result: FaultAnalysisResult
@@ -148,10 +247,17 @@ class RootCauseEngine:
 
     def _scan_boundary(self, module: Optional[str], inst: Optional[Instance],
                        result: FaultAnalysisResult) -> bool:
-        """Detect a scan/non-scan boundary in the immediate neighbourhood."""
+        """Detect a scan/non-scan boundary in the immediate neighbourhood.
+
+        Scan status is taken from pin evidence only. When either side of a
+        neighbour pair cannot be decided from its pin list, no boundary is
+        claimed -- an undecidable cell is not evidence of non-scan logic.
+        """
         if inst is None or module is None:
             return False
         this_scan = self._is_scan_cell(inst)
+        if this_scan is None:
+            return False
         neighbours = (self.conn.immediate_fan_in(module, inst.name)
                       + self.conn.immediate_fan_out(module, inst.name))
         mixed = False
@@ -159,25 +265,36 @@ class RootCauseEngine:
             nb_inst = self.conn.find_instance(module, nb)
             if nb_inst is None:
                 continue
-            if self._is_scan_cell(nb_inst) != this_scan:
-                mixed = True
-                result.observed_facts.append(
-                    f"Neighbour '{nb}' ({nb_inst.cell_type}) is "
-                    f"{'scan' if not this_scan else 'non-scan'} while this "
-                    f"cell is {'scan' if this_scan else 'non-scan'}."
-                )
-                break
+            nb_scan = self._is_scan_cell(nb_inst)
+            if nb_scan is None or nb_scan == this_scan:
+                continue
+            mixed = True
+            result.observed_facts.append(
+                f"Neighbour '{nb}' ({nb_inst.cell_type}) is "
+                f"{'scan' if nb_scan else 'non-scan'} while this cell is "
+                f"{'scan' if this_scan else 'non-scan'}; both decided from "
+                f"their pin lists."
+            )
+            break
         return mixed
 
     @staticmethod
-    def _is_scan_cell(inst: Instance) -> bool:
-        if _SCAN_CELL.search(inst.cell_type):
+    def _is_scan_cell(inst: Instance) -> Optional[bool]:
+        """Scan status from the pin list, or ``None`` when undecidable.
+
+        A cell is scan when its instantiation carries both a dedicated
+        scan-data input and a shift-enable pin. Instance and cell naming are
+        deliberately not consulted: naming was the basis on which this engine
+        once declared a flop with ``.si``/``.ssb``/``.so`` to be non-scan.
+        """
+        if not inst.pins:
+            return None
+        roles = {scan_pin_role(pin.name) for pin in inst.pins}
+        if "scan_in" in roles and "shift_enable" in roles:
             return True
-        if _NON_SCAN_NAME.search(inst.cell_type) or _NON_SCAN_NAME.search(inst.name):
+        if "scan_in" not in roles and "shift_enable" not in roles:
             return False
-        if _SCAN_NAME.search(inst.name):
-            return True
-        return False
+        return None
 
     def _classify(self, fault: FaultRecord, result: FaultAnalysisResult,
                   mapping, inst: Optional[Instance],
@@ -196,9 +313,32 @@ class RootCauseEngine:
             result.inferred_conclusions.append(
                 "Cell type indicates a tie/constant driver."
             )
-            return RootCause.TIED_OR_CONSTANT
+            return RootCause.TIED_CONSTANT
+
+        # 1b. PRECEDENCE: a resolved tie driver beats every rule below.
+        #
+        # A stuck-at fault on a pin held at a hard constant is undetectable
+        # because no differing value can ever be established there. That is
+        # true regardless of scan architecture, so scan-boundary and
+        # observability categories must not be used for it. The driver is
+        # resolved across hierarchy feedthrough ports, which is why this fires
+        # even when the tie cell sits four levels away from the fault site.
+        resolution = result.driver_resolution
+        if resolution is not None and resolution.is_tie:
+            value = (f" holding it at constant {resolution.tie_value}"
+                     if resolution.tie_value else "")
+            result.inferred_conclusions.append(
+                f"The fault site is driven by tie cell "
+                f"'{resolution.instance.name}' "
+                f"({resolution.instance.cell_type}){value}, reached across "
+                f"{resolution.levels} hierarchy hop(s). Expected and "
+                f"non-actionable: no differing value can be established, so "
+                f"this is not a scan or observability problem."
+            )
+            return RootCause.TIED_CONSTANT
+
         if fault.fault_class is FaultClass.TI:
-            return RootCause.TIED_OR_CONSTANT
+            return RootCause.TIED_CONSTANT
 
         # 2. Constraint-induced loss (split by controllability/observability).
         if constraint_hits:
@@ -283,8 +423,10 @@ class RootCauseEngine:
                 "Non-scan logic blocks propagation; add an observe test point "
                 "downstream or convert the blocking flop to scan.",
             RootCause.TIED_OR_CONSTANT:
-                "Confirm the tie/constant is intended; tied nodes are "
-                "untestable by design and may be safely waived.",
+                "Expected / non-actionable: the site is held at a hard "
+                "constant, so no differing value can be established. Confirm "
+                "the tie is intended and waive; do not spend debug effort "
+                "here and do not treat it as a scan or observability issue.",
             RootCause.CLOCK_RESET_TE_BLOCKING:
                 "Verify clock/reset/test-enable setup in the ATPG procedure "
                 "and constraints.",
@@ -292,8 +434,10 @@ class RootCauseEngine:
                 "Examine reconvergent fan-in for masking; consider control or "
                 "observe test points.",
             RootCause.UNRESOLVED_CONNECTIVITY:
-                "Improve fault-to-netlist mapping (provide full hierarchy) "
-                "before drawing conclusions.",
+                "Mapping failed, so nothing about this site is known -- not "
+                "its fan-in, not its fan-out, not its scan status. Re-run "
+                "with the full hierarchical netlist and resolve the mapping "
+                "before drawing any conclusion.",
             RootCause.OTHER_STRUCTURAL:
                 "Manually inspect the cone of logic around this node.",
         }

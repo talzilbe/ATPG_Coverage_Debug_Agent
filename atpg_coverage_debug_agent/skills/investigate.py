@@ -55,6 +55,7 @@ class _InvestigativeSkill(SkillBase):
                 netlist=ctx.netlist,
                 adjacency=getattr(ctx, "adjacency", None),
                 compare=getattr(ctx, "compare", None),
+                triage=getattr(ctx, "triage", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -85,6 +86,44 @@ class _InvestigativeSkill(SkillBase):
     def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
         """Default: no structured findings (raw JSON already attached)."""
         return
+
+
+@register
+class DiagnoseUnresolvedSkill(_InvestigativeSkill):
+    skill_id = "diagnose_unresolved"
+    tool_name = "diagnose_unresolved"
+    display_name = "Diagnose Unresolved Mappings (query)"
+    description = investigate.TOOL_SPECS["diagnose_unresolved"]["description"]
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for group in data.get("groups", []):
+            result.add_finding(
+                title=(f"{group['count']} unmapped fault(s): "
+                       f"{group['cause']}"),
+                description=group.get("meaning", ""),
+                evidence=list(group.get("samples", [])),
+                affected_objects=list(group.get("samples", [])),
+                confidence="high",
+            )
+
+
+@register
+class ScanStatusSkill(_InvestigativeSkill):
+    skill_id = "scan_status"
+    tool_name = "scan_status"
+    display_name = "Scan Status (query)"
+    description = investigate.TOOL_SPECS["scan_status"]["description"]
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        verdict = data.get("verdict", "unresolved")
+        result.add_finding(
+            title=f"{data.get('target')}: {verdict}",
+            description=data.get("answer", ""),
+            evidence=list(data.get("evidence", []))
+            + list(data.get("blockers", [])),
+            affected_objects=[data.get("instance") or data.get("target") or ""],
+            confidence="high" if verdict != "unresolved" else "insufficient",
+        )
 
 
 @register
@@ -235,3 +274,188 @@ class ListChangedSkill(_InvestigativeSkill):
     tool_name = "list_changed"
     display_name = "List Changed (query)"
     description = investigate.TOOL_SPECS["list_changed"]["description"]
+
+
+@register
+class CoverageTriageSkill(_InvestigativeSkill):
+    skill_id = "coverage_triage"
+    tool_name = "coverage_triage"
+    display_name = "Coverage Triage (query)"
+    description = investigate.TOOL_SPECS["coverage_triage"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        totals = data.get("totals", {})
+        return (f"coverage_triage: {totals.get('coverage_loss', 0)} "
+                f"coverage-loss fault(s) across "
+                f"{len(data.get('categories', []))} categorie(s); "
+                f"{len(data.get('selected', []))} selected for debug.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for row in data.get("selected", []):
+            result.add_finding(
+                title=(f"{row['subclass']}: {row['count']} fault(s) "
+                       f"({row['pct']:.2f}%)"),
+                description=row.get("reason", ""),
+                confidence="high",
+                recommendation=(
+                    f"Run recommend_fixes with subclass='{row['subclass']}' "
+                    f"for concrete next steps."))
+
+
+@register
+class RecommendFixesSkill(_InvestigativeSkill):
+    skill_id = "recommend_fixes"
+    tool_name = "recommend_fixes"
+    display_name = "Recommend Fixes (query)"
+    description = investigate.TOOL_SPECS["recommend_fixes"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        return f"recommend_fixes: {data.get('total', 0)} proposal(s)."
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for rec in data.get("recommendations", [])[:10]:
+            evidence = list(rec.get("evidence", []))
+            if rec.get("requires_measurement"):
+                evidence.append(
+                    "Benefit must be measured by an ATPG re-run; no gain is "
+                    "predicted here.")
+            result.add_finding(
+                title=f"[{rec['subclass']}] {rec['title']}",
+                description=rec.get("rationale", ""),
+                evidence=evidence,
+                confidence=rec.get("confidence", "medium"),
+                recommendation=rec.get("expected_effect", ""))
+
+
+@register
+class ExplainSubclassSkill(_InvestigativeSkill):
+    skill_id = "explain_subclass"
+    tool_name = "explain_subclass"
+    display_name = "Explain Subclass (query)"
+    description = investigate.TOOL_SPECS["explain_subclass"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if not data.get("known"):
+            return f"explain_subclass: '{data.get('subclass')}' is not catalogued."
+        return f"explain_subclass: {data['matched']} — {data['title']}."
+
+
+@register
+class ListClustersSkill(_InvestigativeSkill):
+    skill_id = "list_clusters"
+    tool_name = "list_clusters"
+    display_name = "List Clusters (query)"
+    description = investigate.TOOL_SPECS["list_clusters"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        categories = data.get("categories", [])
+        return (f"list_clusters: hierarchy hotspots for "
+                f"{len(categories)} categorie(s).")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for entry in data.get("categories", []):
+            clusters = entry.get("clusters", [])
+            if not clusters:
+                continue
+            top = clusters[0]
+            result.add_finding(
+                title=(f"[{entry['subclass']}] {top['pct']:.1f}% under "
+                       f"{top['prefix']}"),
+                description=(f"{top['count']} of {entry.get('total_faults', 0)} "
+                             f"fault(s), stuck-at split "
+                             f"{top['sa0']}/{top['sa1']}."),
+                evidence=list(top.get("samples", [])),
+                affected_objects=[top["prefix"]],
+                confidence="medium",
+                recommendation=("Investigate this hierarchy first. The prefix "
+                                "shows where the faults are, not why."))
+
+
+@register
+class ListBlockingSourcesSkill(_InvestigativeSkill):
+    skill_id = "list_blocking_sources"
+    tool_name = "list_blocking_sources"
+    display_name = "List Blocking Sources (query)"
+    description = investigate.TOOL_SPECS["list_blocking_sources"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        categories = data.get("categories", [])
+        return (f"list_blocking_sources: traced "
+                f"{len(categories)} categorie(s).")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for entry in data.get("categories", []):
+            evidence = [entry.get("caveat", "")]
+            objects = []
+            for source in entry.get("tie_sources", [])[:3]:
+                objects.append(source["driver"])
+                evidence.append(
+                    f"{source['driver']} [{source['cell_type']}] → "
+                    f"{source['count']} fault(s)")
+            for source in entry.get("constraint_sources", [])[:3]:
+                objects.append(source["signal"])
+                evidence.append(
+                    f"{source['signal']} = {source['value'] or '?'} → "
+                    f"{source['count']} fault(s)")
+            result.add_finding(
+                title=(f"[{entry['subclass']}] {entry['verdict']} "
+                       f"({entry['attributed']}/{entry['analysed']} traced)"),
+                description=entry.get("note", ""),
+                evidence=[e for e in evidence if e],
+                affected_objects=objects,
+                confidence="medium",
+                recommendation=entry.get("note", ""))
+
+
+@register
+class ProfileFaultSitesSkill(_InvestigativeSkill):
+    skill_id = "profile_fault_sites"
+    tool_name = "profile_fault_sites"
+    display_name = "Profile Fault Sites (query)"
+    description = investigate.TOOL_SPECS["profile_fault_sites"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        categories = data.get("categories", [])
+        return f"profile_fault_sites: profiled {len(categories)} categorie(s)."
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for entry in data.get("categories", []):
+            if not entry.get("dominant"):
+                continue
+            top = next((s for s in entry.get("signatures", [])
+                        if s["signature"] == entry["dominant"]), None)
+            result.add_finding(
+                title=(f"[{entry['subclass']}] {entry['dominant_label']} "
+                       f"({entry['dominant_share']:.0%} of "
+                       f"{entry['profiled']} site(s))"),
+                description=entry.get("note", ""),
+                evidence=(list(top.get("samples", [])) if top else [])
+                + [entry.get("caveat", "")],
+                confidence="high" if entry.get("consensus") else "medium",
+                recommendation=(top or {}).get("meaning", ""))
+
+
+@register
+class VerifyPathsSkill(_InvestigativeSkill):
+    skill_id = "verify_paths"
+    tool_name = "verify_paths"
+    display_name = "Verify Paths (query)"
+    description = investigate.TOOL_SPECS["verify_paths"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        bad = [c for c in data.get("checked", []) if not c["ok"]]
+        return (f"verify_paths: {len(bad)} unverifiable path(s), "
+                f"{len(data.get('text_issues', []))} text issue(s).")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for row in data.get("checked", []):
+            if row["ok"]:
+                continue
+            result.add_finding(
+                title=f"Unverifiable path: {row['path']}",
+                description=("This path does not appear in the fault list, "
+                             "constraint file or netlist."),
+                affected_objects=[row["path"]],
+                confidence="high",
+                recommendation=("Quote the path verbatim from a source "
+                                "artefact instead."))
