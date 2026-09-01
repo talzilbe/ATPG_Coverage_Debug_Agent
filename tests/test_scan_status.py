@@ -3,7 +3,7 @@
 These encode the two conditions the fix must satisfy together:
 
 * **Test 1** -- with the netlist, the agent answers SCAN for
-  ``.../start_fuse_sense_boot_fsm_ctrl/SRoutXnnnH_reg`` and quotes the
+  ``.../boot_seq_ctrl/state_out_reg`` and quotes the
   ``.si`` / ``.ssb`` / ``.so`` pins from the instantiation.
 * **Test 2** -- without the netlist, given only a fault-table row
   (``mapped_instance='-'``, ``confidence='unresolved'``, ``fanin=0``,
@@ -34,84 +34,87 @@ from atpg_coverage_debug_agent.reporting import csv_report, markdown_report
 
 
 # The instance under test, exactly as it was asked about.
-TARGET = ("/punit/punit_inst/ptpcbclk/pcusapmbootfsm/"
-          "start_fuse_sense_boot_fsm_ctrl/SRoutXnnnH_reg")
+TARGET = ("/core/core_inst/clkblk/bootfsm/"
+          "boot_seq_ctrl/state_out_reg")
 
 
 # ---------------------------------------------------------------------------
-# A miniature of the real hierarchy.
+# A miniature of the hierarchy that produced the original wrong answer.
 #
-# Reproduces the three properties that broke the original analysis:
-#   1. the leaf name SRoutXnnnH_reg is defined in several modules, so a
+# Reproduces the three properties that broke that analysis:
+#   1. the leaf name state_out_reg is defined in several modules, so a
 #      leaf-name lookup is ambiguous;
 #   2. the scan flop's .d pin is a feedthrough port four levels deep;
 #   3. the net at the far end is driven by a tie-high cell with no inputs.
+#
+# The cell names are deliberately free of any scan-ish substring (no "sff",
+# "sdff", "scan"). The SCAN verdict therefore cannot come from naming -- only
+# the .si / .ssb / .so pin evidence can produce it, which is the whole point.
 # ---------------------------------------------------------------------------
 NETLIST = """
-module par_base_punit_pcu_srmsff_with_xover_1_0_0_1 ( p11198, SetCondXnnnH,
-  Reset_BAR, clock_gate_logic_0, ropt_net_1667503, HFSNET_1, SRoutXnnnH,
-  test_so1976 );
-  input p11198, SetCondXnnnH, Reset_BAR, clock_gate_logic_0;
-  input ropt_net_1667503, HFSNET_1;
-  output SRoutXnnnH, test_so1976;
-  g1mfuz043ac2n02x5 SRoutXnnnH_reg ( .si ( ropt_net_1667503 ) ,
-  .rb ( Reset_BAR ) , .d ( p11198 ) , .den ( SetCondXnnnH ) ,
-  .ssb ( HFSNET_1 ) , .clk ( clock_gate_logic_0 ) , .o ( SRoutXnnnH ) ,
-  .so ( test_so1976 ) ) ;
+module demo_flop_xover ( d_in, set_cond, reset_bar, gated_clk,
+  scan_in_net, shift_en_net, q_out, scan_out_net );
+  input d_in, set_cond, reset_bar, gated_clk;
+  input scan_in_net, shift_en_net;
+  output q_out, scan_out_net;
+  vendorcell_a1 state_out_reg ( .si ( scan_in_net ) ,
+  .rb ( reset_bar ) , .d ( d_in ) , .den ( set_cond ) ,
+  .ssb ( shift_en_net ) , .clk ( gated_clk ) , .o ( q_out ) ,
+  .so ( scan_out_net ) ) ;
 endmodule
 
-module par_base_punit_decoy_a ( d, clk, o );
+module demo_decoy_a ( d, clk, o );
   input d, clk;
   output o;
-  g1mfdz001ac2n02x5 SRoutXnnnH_reg ( .d ( d ) , .clk ( clk ) , .o ( o ) ) ;
+  vendorcell_b2 state_out_reg ( .d ( d ) , .clk ( clk ) , .o ( o ) ) ;
 endmodule
 
-module par_base_punit_decoy_b ( d, clk, o );
+module demo_decoy_b ( d, clk, o );
   input d, clk;
   output o;
-  g1mfdz001ac2n02x5 SRoutXnnnH_reg ( .d ( d ) , .clk ( clk ) , .o ( o ) ) ;
+  vendorcell_b2 state_out_reg ( .d ( d ) , .clk ( clk ) , .o ( o ) ) ;
 endmodule
 
-module par_base_punit_pcusapmbootfsm ( p20001, se20001, si20001, cond20001,
+module demo_bootfsm ( p20001, se20001, si20001, cond20001,
   rst20001, clk20001, q20001, so20001 );
   input p20001, se20001, si20001, cond20001, rst20001, clk20001;
   output q20001, so20001;
-  par_base_punit_pcu_srmsff_with_xover_1_0_0_1 start_fuse_sense_boot_fsm_ctrl (
-    .p11198 ( p20001 ) , .SetCondXnnnH ( cond20001 ) ,
-    .Reset_BAR ( rst20001 ) , .clock_gate_logic_0 ( clk20001 ) ,
-    .ropt_net_1667503 ( si20001 ) , .HFSNET_1 ( se20001 ) ,
-    .SRoutXnnnH ( q20001 ) , .test_so1976 ( so20001 ) ) ;
+  demo_flop_xover boot_seq_ctrl (
+    .d_in ( p20001 ) , .set_cond ( cond20001 ) ,
+    .reset_bar ( rst20001 ) , .gated_clk ( clk20001 ) ,
+    .scan_in_net ( si20001 ) , .shift_en_net ( se20001 ) ,
+    .q_out ( q20001 ) , .scan_out_net ( so20001 ) ) ;
 endmodule
 
-module par_base_punit_ptpcbclk ( p30001, se30001, si30001, cond30001,
+module demo_clkblk ( p30001, se30001, si30001, cond30001,
   rst30001, clk30001, q30001, so30001 );
   input p30001, se30001, si30001, cond30001, rst30001, clk30001;
   output q30001, so30001;
-  par_base_punit_pcusapmbootfsm pcusapmbootfsm ( .p20001 ( p30001 ) ,
+  demo_bootfsm bootfsm ( .p20001 ( p30001 ) ,
     .se20001 ( se30001 ) , .si20001 ( si30001 ) , .cond20001 ( cond30001 ) ,
     .rst20001 ( rst30001 ) , .clk20001 ( clk30001 ) , .q20001 ( q30001 ) ,
     .so20001 ( so30001 ) ) ;
 endmodule
 
-module par_base_punit_punit ( test_se, chain_head, cond_in, rst_in, clk_in,
+module demo_core ( test_se, chain_head, cond_in, rst_in, clk_in,
   q_out, chain_tail );
   input test_se, chain_head, cond_in, rst_in, clk_in;
   output q_out, chain_tail;
-  wire p25523, scan_en_net;
-  g1mtihi00ac3n02x5 optlc1874990 ( .o ( p25523 ) ) ;
-  g1mbufx02ac2n02x5 se_buf ( .a ( test_se ) , .o ( scan_en_net ) ) ;
-  g1mbufx02ac2n02x5 si_buf ( .a ( chain_head ) , .o ( chain_net ) ) ;
-  par_base_punit_ptpcbclk ptpcbclk ( .p30001 ( p25523 ) ,
+  wire tied_net, scan_en_net;
+  TIEHIX1 u_tie_hi ( .o ( tied_net ) ) ;
+  BUFX2 se_buf ( .a ( test_se ) , .o ( scan_en_net ) ) ;
+  BUFX2 si_buf ( .a ( chain_head ) , .o ( chain_net ) ) ;
+  demo_clkblk clkblk ( .p30001 ( tied_net ) ,
     .se30001 ( scan_en_net ) , .si30001 ( chain_net ) ,
     .cond30001 ( cond_in ) , .rst30001 ( rst_in ) , .clk30001 ( clk_in ) ,
     .q30001 ( q_out ) , .so30001 ( chain_tail ) ) ;
 endmodule
 
-module par_base_punit ( test_se, chain_head, cond_in, rst_in, clk_in, q_out,
+module demo_soc ( test_se, chain_head, cond_in, rst_in, clk_in, q_out,
   chain_tail );
   input test_se, chain_head, cond_in, rst_in, clk_in;
   output q_out, chain_tail;
-  par_base_punit_punit punit_inst ( .test_se ( test_se ) ,
+  demo_core core_inst ( .test_se ( test_se ) ,
     .chain_head ( chain_head ) , .cond_in ( cond_in ) , .rst_in ( rst_in ) ,
     .clk_in ( clk_in ) , .q_out ( q_out ) , .chain_tail ( chain_tail ) ) ;
 endmodule
@@ -120,7 +123,7 @@ module tb_top ( test_se, chain_head, cond_in, rst_in, clk_in, q_out,
   chain_tail );
   input test_se, chain_head, cond_in, rst_in, clk_in;
   output q_out, chain_tail;
-  par_base_punit punit ( .test_se ( test_se ) , .chain_head ( chain_head ) ,
+  demo_soc core ( .test_se ( test_se ) , .chain_head ( chain_head ) ,
     .cond_in ( cond_in ) , .rst_in ( rst_in ) , .clk_in ( clk_in ) ,
     .q_out ( q_out ) , .chain_tail ( chain_tail ) ) ;
 endmodule
@@ -150,20 +153,20 @@ def test_1_scan_verdict_is_derived_from_the_instantiation(mapper, conn):
 
     assert status.verdict == scan_status.SCAN
     assert status.answer().startswith("SCAN")
-    assert status.cell_type == "g1mfuz043ac2n02x5"
-    assert status.module == "par_base_punit_pcu_srmsff_with_xover_1_0_0_1"
+    assert status.cell_type == "vendorcell_a1"
+    assert status.module == "demo_flop_xover"
 
 
 def test_1_quotes_the_si_ssb_and_so_pins_as_evidence(mapper, conn):
     status = scan_status.determine_scan_status(TARGET, mapper, conn)
 
-    assert status.scan_in == ("si", "ropt_net_1667503")
-    assert status.shift_enable == ("ssb", "HFSNET_1")
-    assert status.scan_out == ("so", "test_so1976")
+    assert status.scan_in == ("si", "scan_in_net")
+    assert status.shift_enable == ("ssb", "shift_en_net")
+    assert status.scan_out == ("so", "scan_out_net")
     # The evidence must be quotable text read from the file, not a paraphrase.
-    assert ".si ( ropt_net_1667503 )" in status.instantiation
-    assert ".ssb ( HFSNET_1 )" in status.instantiation
-    assert ".so ( test_so1976 )" in status.instantiation
+    assert ".si ( scan_in_net )" in status.instantiation
+    assert ".ssb ( shift_en_net )" in status.instantiation
+    assert ".so ( scan_out_net )" in status.instantiation
     assert status.line_number is not None
 
 
@@ -179,13 +182,13 @@ def test_1_reports_the_three_corroborating_checks(mapper, conn):
 
 def test_1_duplicate_leaf_names_resolve_through_the_parent_module(mapper):
     """The right instance is picked among duplicates, not the first one."""
-    leaf_matches = mapper._by_name["SRoutXnnnH_reg"]
+    leaf_matches = mapper._by_name["state_out_reg"]
     assert len(leaf_matches) > 1, "the fixture must exercise ambiguity"
 
     mapping = mapper.map_object(TARGET)
     assert mapping.confidence is MappingConfidence.HIGH
-    assert mapping.module_name == "par_base_punit_pcu_srmsff_with_xover_1_0_0_1"
-    assert mapping.cell_type == "g1mfuz043ac2n02x5"
+    assert mapping.module_name == "demo_flop_xover"
+    assert mapping.cell_type == "vendorcell_a1"
 
 
 # ---------------------------------------------------------------------------
@@ -276,15 +279,14 @@ def test_2_unmapped_row_is_null_in_every_renderer():
 # Tied-constant reclassification (B2)
 # ---------------------------------------------------------------------------
 def test_tie_driver_is_resolved_across_four_hierarchy_levels(conn):
-    resolution = conn.resolve_driver(
-        "par_base_punit_pcu_srmsff_with_xover_1_0_0_1", "p11198")
+    resolution = conn.resolve_driver("demo_flop_xover", "d_in")
 
     assert resolution is not None
     assert resolution.is_tie is True
-    assert resolution.instance.name == "optlc1874990"
-    assert resolution.instance.cell_type == "g1mtihi00ac3n02x5"
+    assert resolution.instance.name == "u_tie_hi"
+    assert resolution.instance.cell_type == "TIEHIX1"
     assert resolution.tie_value == "1"
-    assert resolution.net == "p25523"
+    assert resolution.net == "tied_net"
     assert resolution.levels >= 4, resolution.trace
 
 
@@ -304,7 +306,7 @@ def test_tied_site_is_classified_tied_constant_not_scan_or_observability(
     assert result.root_cause is RootCause.TIED_CONSTANT
     assert result.root_cause is not RootCause.UNRESOLVED_CONNECTIVITY
     assert result.root_cause is not RootCause.OTHER_STRUCTURAL
-    assert result.driver_resolution.instance.name == "optlc1874990"
+    assert result.driver_resolution.instance.name == "u_tie_hi"
     assert "non-actionable" in " ".join(result.inferred_conclusions).lower()
 
 
@@ -315,7 +317,7 @@ def test_tie_cell_is_detected_structurally_not_only_by_name(conn):
     netlist = parse_verilog(
         "module m ( o ); output o; wire n;"
         " weird_vendor_cell u_const ( .o ( n ) ) ;"
-        " g1mbufx02ac2n02x5 u_buf ( .a ( n ) , .o ( o ) ) ; endmodule")
+        " BUFX2 u_buf ( .a ( n ) , .o ( o ) ) ; endmodule")
     inst = netlist.modules["m"].instances["u_const"]
 
     assert is_tie_cell(inst, netlist) is True
@@ -341,10 +343,10 @@ def test_unresolved_mappings_are_attributed_to_a_cause(netlist, conn, mapper):
     absent = FaultRecord(
         raw_text=f"AU 0 {TARGET}/../u_missing_model/o",
         line_number=2,
-        fault_object=("/punit/punit_inst/ptpcbclk/pcusapmbootfsm/"
+        fault_object=("/core/core_inst/clkblk/bootfsm/"
                       "u_missing_model/o"),
         normalized_object=normalize_object(
-            "/punit/punit_inst/ptpcbclk/pcusapmbootfsm/u_missing_model/o"),
+            "/core/core_inst/clkblk/bootfsm/u_missing_model/o"),
         fault_class=FaultClass.AU,
         raw_class_token="AU",
         fault_type="0",
@@ -398,8 +400,8 @@ def test_offline_analysis_records_scan_and_tie_evidence(tied_report):
                 if r.root_cause is RootCause.TIED_CONSTANT)
 
     assert tied.scan_cell_state == "scan"
-    assert ".ssb ( HFSNET_1 )" in tied.scan_evidence
-    assert tied.tie_driver["instance"] == "optlc1874990"
+    assert ".ssb ( shift_en_net )" in tied.scan_evidence
+    assert tied.tie_driver["instance"] == "u_tie_hi"
     assert tied.tie_driver["value"] == "1"
     assert tied.tie_driver["levels"] >= 4
 
@@ -428,8 +430,8 @@ def test_summary_page_shows_the_evidence_breakdown(tied_report):
     assert "3. Evidence Quality" in html
     assert "Coverage-loss faults by evidence basis" in html
     assert "Actionable coverage loss" in html
-    assert "optlc1874990" in html
-    assert "g1mtihi00ac3n02x5" in html
+    assert "u_tie_hi" in html
+    assert "TIEHIX1" in html
     assert "expected and non-actionable" in html
     assert "unknown</b>, not zero" in html
 
@@ -462,7 +464,7 @@ def test_saved_report_keeps_the_evidence_breakdown(tied_report, tmp_path):
     assert reloaded.summary.actionable_loss_count == 0
     assert reloaded.summary.unresolved_causes == tied_report.summary.unresolved_causes
     tied = next(r for r in reloaded.fault_results if r.tie_driver)
-    assert tied.tie_driver["instance"] == "optlc1874990"
+    assert tied.tie_driver["instance"] == "u_tie_hi"
     assert tied.scan_cell_state == "scan"
 
 

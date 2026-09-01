@@ -76,10 +76,11 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
   Step 5a Resolve real drivers before assigning any root cause.
           For every AU/UO/UC fault on a sequential or gate pin:
           (a) Locate the actual instantiation in the netlist. Leaf names repeat
-              across replicated modules (SRoutXnnnH_reg occurs 110 times in this
-              design). Disambiguate by first resolving the PARENT instance name to
-              its module type, then find that module definition, then extract the
-              leaf instantiation from inside that module body only.
+              across replicated modules -- the same register name can occur
+              hundreds of times in one design. Disambiguate by first resolving
+              the PARENT instance name to its module type, then find that module
+              definition, then extract the leaf instantiation from inside that
+              module body only.
           (b) Print the complete instantiation including all continuation lines.
           (c) Classify pins: scan-data-in (si/sd/ti/scan_in), scan-out
               (so/to/scan_out), shift-enable (se/ssb/sen/scan_enable). A cell is
@@ -181,8 +182,8 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
 8. DECISION LOGIC
   PRECEDENCE: before applying any UC/UO/AU rule below, complete Step 5a. If
   the terminal driver of a data or enable pin is a tie cell (no input pins;
-  output-only; cell type matching g1mtihi* / g1mtilo* or equivalent library
-  tie naming), the root cause is 'Tied / constant hardware condition'.
+  output-only; or a cell type matching the library's tie-high / tie-low
+  naming), the root cause is 'Tied / constant hardware condition'.
   Scan-boundary and observability categories MUST NOT be used in that case.
   A stuck-at fault on a pin held at a hard constant is undetectable because
   no differing value can be established, regardless of scan architecture.

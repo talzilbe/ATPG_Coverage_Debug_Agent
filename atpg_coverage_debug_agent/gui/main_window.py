@@ -129,8 +129,8 @@ optional constraints) and analyze them together:</p>
 <h3>Auto-saving the report</h3>
 <p>Tick <b class="k">Auto-save report</b> (next to the buttons) to have Analyze
 save the JSON report for you. It first asks for a name, pre-filled with a
-default derived from the netlist &mdash; e.g. <code>par_base_punit.v.gz</code>
-&rarr; <code>par_base_punit_atpg_report</code> &mdash; then writes it to the
+default derived from the netlist &mdash; e.g. <code>my_design.v.gz</code>
+&rarr; <code>my_design_atpg_report</code> &mdash; then writes it to the
 <b>Output dir</b> (or the netlist's folder if none is set) once the run
 finishes. In a multi-partition run each partition is saved under its own
 derived name. The saved file is a full report you can re-open with
@@ -706,7 +706,7 @@ class MainWindow(QMainWindow):
         self.autosave_check.setToolTip(
             "After Analyze, automatically save the JSON report into the Output "
             "dir. You'll be asked for a name first (default derived from the "
-            "netlist, e.g. par_base_punit.v.gz \u2192 par_base_punit_atpg_report).")
+            "netlist, e.g. my_design.v.gz \u2192 my_design_atpg_report).")
         self.autosave_check.toggled.connect(self._save_settings)
         btn_row.addWidget(self.autosave_check)
         btn_row.addStretch(1)
@@ -1754,7 +1754,7 @@ class MainWindow(QMainWindow):
         v.addWidget(QLabel("Exclude specific faults by object path (one per line):"))
         ids_edit = QPlainTextEdit()
         ids_edit.setPlainText("\n".join(ex_ids))
-        ids_edit.setPlaceholderText("/top/u_seq/optlc_900/o")
+        ids_edit.setPlaceholderText("/top/u_seq/u_opt_900/o")
         ids_edit.setMaximumHeight(80)
         v.addWidget(ids_edit)
 

@@ -46,7 +46,7 @@ def _faults(spec):
 # Subclass parsing
 # ---------------------------------------------------------------------------
 def test_dotted_class_token_is_split_into_class_and_subclass():
-    fault = _fault("AU.TC", "1", "top/u_seq/optlc_900/o")
+    fault = _fault("AU.TC", "1", "top/u_seq/u_opt_900/o")
     assert fault.fault_class is FaultClass.AU
     assert fault.subclass == "TC"
     assert fault.dotted_class == "AU.TC"
@@ -66,7 +66,7 @@ def test_mtfi_dotted_classes_are_preserved():
       FaultList {
        Format : Identifier, Class, Location;
        Instance ("") {
-          0,  AU.TC,     "/top/u_seq/optlc_900/o";
+          0,  AU.TC,     "/top/u_seq/u_opt_900/o";
           1,  UO.AAB,    "/top/u_ctrl/reg/q";
           0,  DS,        "/top/u_xyz/o";
 """

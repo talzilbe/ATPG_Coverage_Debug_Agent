@@ -11,8 +11,8 @@ Two on-disk shapes are supported:
          FaultList {
           Format : Identifier, Class, Location;
           Instance ("") {
-             0,  AU,        "/top/u_clkgate/optlc_125/o";
-             1,  AU.TC,     "/top/u_seq/optlc_900/o";
+             0,  AU,        "/top/u_clkgate/u_opt_125/o";
+             1,  AU.TC,     "/top/u_seq/u_opt_900/o";
              0,  DS,        "/top/u_xyz/o";
 
    Fields are comma separated: the *Identifier* is the stuck value (0/1), the

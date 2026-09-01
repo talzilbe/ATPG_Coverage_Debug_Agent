@@ -8,6 +8,7 @@ pure-Python fallback keeps the tool functional without the dependency.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -29,16 +30,35 @@ except Exception:  # pragma: no cover - exercised only without networkx
 #: stack 3-5 deep in a synthesised partition, so a bound of 3 is far too tight.
 DEFAULT_MAX_HOPS = 24
 
-#: Library naming for constant drivers. ``g1mtihi*`` / ``g1mtilo*`` are the
-#: forms in the designs this tool was built against; the generic tokens cover
-#: other vendors. Naming alone is only ever a *hint* -- :func:`is_tie_cell`
-#: also accepts a cell structurally, from having no input pins at all.
+#: Library naming for constant drivers. Naming alone is only ever a *hint* --
+#: :func:`is_tie_cell` also accepts a cell structurally, from having no input
+#: pins at all, which is how tie cells are recognised in any library.
+#:
+#: Vendor libraries use their own prefixes. Rather than hardcode one vendor's
+#: scheme, extra alternatives are read from the environment so a site can add
+#: its own without patching this file::
+#:
+#:     ATPG_TIE_HIGH_PATTERNS='^mylib_tihi'
+#:     ATPG_TIE_LOW_PATTERNS='^mylib_tilo'
+#:
+#: Each variable holds one or more regular-expression alternatives separated
+#: by ``|``, matched case-insensitively against the cell type.
+_TIE_HIGH_DEFAULT = r"tiehi|tieh\b|tie1|logic1|const1"
+_TIE_LOW_DEFAULT = r"tielo|tiel\b|tie0|logic0|const0"
+
+
+def _pattern_body(env_var: str, default: str) -> str:
+    extra = os.environ.get(env_var, "").strip()
+    return f"{default}|{extra}" if extra else default
+
+
+_TIE_HIGH_BODY = _pattern_body("ATPG_TIE_HIGH_PATTERNS", _TIE_HIGH_DEFAULT)
+_TIE_LOW_BODY = _pattern_body("ATPG_TIE_LOW_PATTERNS", _TIE_LOW_DEFAULT)
+
 _TIE_CELL_TYPE = re.compile(
-    r"(^g1mti(hi|lo)|tiehi|tielo|tieh\b|tiel\b|tie1|tie0|_tie|logic0|logic1"
-    r"|const0|const1)", re.I
-)
-_TIE_HIGH_TYPE = re.compile(r"(^g1mtihi|tiehi|tieh\b|tie1|logic1|const1)", re.I)
-_TIE_LOW_TYPE = re.compile(r"(^g1mtilo|tielo|tiel\b|tie0|logic0|const0)", re.I)
+    f"({_TIE_HIGH_BODY}|{_TIE_LOW_BODY}|_tie)", re.I)
+_TIE_HIGH_TYPE = re.compile(f"({_TIE_HIGH_BODY})", re.I)
+_TIE_LOW_TYPE = re.compile(f"({_TIE_LOW_BODY})", re.I)
 
 
 def _pin_direction(pin) -> str:

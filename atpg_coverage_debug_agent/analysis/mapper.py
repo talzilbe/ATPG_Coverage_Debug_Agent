@@ -165,10 +165,10 @@ class FaultMapper:
                               ) -> List[Tuple[str, Instance]]:
         """Disambiguate a repeated leaf name using its ancestor path.
 
-        For ``.../ptpcbclk/pcusapmbootfsm/foo_ctrl/SRoutXnnnH_reg`` the leaf
-        may exist in many modules, but only one of them is the module type of
-        an instance named ``foo_ctrl`` whose own parent chain also matches the
-        path. Candidates that fail that chain are discarded.
+        For ``.../clkblk/bootfsm/foo_ctrl/state_out_reg`` the leaf may exist in
+        many modules, but only one of them is the module type of an instance
+        named ``foo_ctrl`` whose own parent chain also matches the path.
+        Candidates that fail that chain are discarded.
 
         Args:
             inst_path: Normalised instance path (pin segment already removed).
