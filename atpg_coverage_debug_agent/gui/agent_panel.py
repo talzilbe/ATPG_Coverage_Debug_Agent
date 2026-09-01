@@ -62,8 +62,8 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 _DEFAULT_CLI_PATH = os.path.join(_REPO_ROOT, "tools", "copilot-cli", "copilot")
-_DEFAULT_CLI_HOME = os.environ.get(
-    "COPILOT_HOME", "/nfs/site/disks/talzilbe_wa01/copilot-home")
+_DEFAULT_CLI_HOME = (os.environ.get("COPILOT_HOME", "").strip()
+                     or os.path.join(_REPO_ROOT, "copilot-home"))
 
 # Suggested model ids for the GitHub Copilot CLI --model flag. This is only a
 # seed for the very first launch: the real list is pulled from the CLI itself

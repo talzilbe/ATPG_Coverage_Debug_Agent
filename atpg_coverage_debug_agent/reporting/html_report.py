@@ -331,7 +331,7 @@ def _cover(
         + _row("Netlist", _esc(nl), mono=True)
         + _row("Constraints", _esc(cn), mono=True)
         + _row("Date", _esc(date))
-        + _row("Skill", "<code>.github/skills/dft-atpg-debug/SKILL.md</code>")
+        + _row("Skill", "<code>dft-atpg-debug</code>")
         + "</table></div>"
         '<hr class="divider"/>'
     )

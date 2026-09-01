@@ -20,11 +20,22 @@ from ..models import RootCause
 
 logger = logging.getLogger(__name__)
 
-# Canonical location of the authored SKILL.md (best-effort load for content).
-_SKILL_MD_PATHS = (
-    "/nfs/site/disks/olevy2_wa01/hmlsoc_a0_ww23.5_clone_10440_SOC_SPEC_FIX/"
-    ".github/skills/dft-atpg-debug/SKILL.md",
-)
+#: Repository root, derived from this file's location.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+
+def _skill_md_candidates() -> tuple[str, ...]:
+    """Where to look for the authored ``SKILL.md``, best first.
+
+    ``ATPG_SKILL_MD`` lets a site point at its own copy; otherwise the one
+    bundled with the repository is used, so a fresh clone shows the real
+    guidance instead of silently falling back to the summary below.
+    """
+    override = os.environ.get("ATPG_SKILL_MD", "").strip()
+    candidates = [override] if override else []
+    candidates.append(os.path.join(_REPO_ROOT, "Skill.md"))
+    return tuple(candidates)
 
 _FALLBACK_CONTENT = """# dft-atpg-debug
 
@@ -54,7 +65,7 @@ D — Final diagnosis with a prioritised action list and projected coverage.
 
 
 def _load_skill_content() -> tuple[str, Optional[str]]:
-    for path in _SKILL_MD_PATHS:
+    for path in _skill_md_candidates():
         try:
             if os.path.isfile(path):
                 with open(path, "r", encoding="utf-8") as fh:
