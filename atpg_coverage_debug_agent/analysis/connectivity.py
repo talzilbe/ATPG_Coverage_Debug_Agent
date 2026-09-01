@@ -30,21 +30,24 @@ except Exception:  # pragma: no cover - exercised only without networkx
 #: stack 3-5 deep in a synthesised partition, so a bound of 3 is far too tight.
 DEFAULT_MAX_HOPS = 24
 
-#: Library naming for constant drivers. Naming alone is only ever a *hint* --
-#: :func:`is_tie_cell` also accepts a cell structurally, from having no input
-#: pins at all, which is how tie cells are recognised in any library.
+#: Library naming for constant drivers.
 #:
-#: Vendor libraries use their own prefixes. Rather than hardcode one vendor's
-#: scheme, extra alternatives are read from the environment so a site can add
-#: its own without patching this file::
+#: :func:`is_tie_cell` recognises a tie structurally -- a cell with pins but no
+#: inputs -- which works for any library. Naming is only needed for the one
+#: thing structure cannot answer: a tie-high and a tie-low cell are both
+#: output-only and therefore structurally identical, so :func:`tie_value` can
+#: only tell 0 from 1 by the cell name.
 #:
-#:     ATPG_TIE_HIGH_PATTERNS='^mylib_tihi'
-#:     ATPG_TIE_LOW_PATTERNS='^mylib_tilo'
-#:
-#: Each variable holds one or more regular-expression alternatives separated
-#: by ``|``, matched case-insensitively against the cell type.
-_TIE_HIGH_DEFAULT = r"tiehi|tieh\b|tie1|logic1|const1"
-_TIE_LOW_DEFAULT = r"tielo|tiel\b|tie0|logic0|const0"
+#: The defaults below cover the abbreviations libraries actually use
+#: (``tiehi``/``tielo``, ``tihi``/``tilo``, ``tieh``/``tiel``, ``thi``/``tlo``,
+#: ``logic1``/``logic0``, ``const1``/``const0``), so no configuration is
+#: required. ``thi``/``tlo`` keep a trailing word boundary because the bare
+#: forms occur inside ordinary words ("something" contains "thi").
+#: ``ATPG_TIE_HIGH_PATTERNS`` / ``ATPG_TIE_LOW_PATTERNS`` are an optional
+#: escape hatch for a library that names them some other way; each holds extra
+#: regex alternatives separated by ``|``.
+_TIE_HIGH_DEFAULT = r"tiehi|tihi|tieh|thi\b|tie1|logic1|const1"
+_TIE_LOW_DEFAULT = r"tielo|tilo|tiel|tlo\b|tie0|logic0|const0"
 
 
 def _pattern_body(env_var: str, default: str) -> str:
