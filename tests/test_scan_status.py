@@ -324,6 +324,34 @@ def test_tie_cell_is_detected_structurally_not_only_by_name(conn):
     assert is_tie_cell(netlist.modules["m"].instances["u_buf"], netlist) is False
 
 
+def test_a_cell_with_inputs_is_not_a_tie_however_it_is_named(conn):
+    """Structure outranks naming: consuming a value rules out a constant."""
+    from atpg_coverage_debug_agent.analysis.connectivity import is_tie_cell
+
+    netlist = parse_verilog(
+        "module m ( o ); output o; wire n;"
+        # Named like a tie, but it has a real input pin, so it is not one.
+        " and2_tie_hold u_trap ( .a ( n ) , .o ( o ) ) ;"
+        " TIEHIX1 u_real ( .o ( n ) ) ; endmodule")
+
+    trap = netlist.modules["m"].instances["u_trap"]
+    assert is_tie_cell(trap, netlist) is False
+    # The genuine output-only tie next to it is still found.
+    assert is_tie_cell(netlist.modules["m"].instances["u_real"], netlist) is True
+
+
+def test_naming_still_rescues_a_tie_with_no_usable_pin_evidence():
+    """When structure is silent, the cell type is the only evidence there is."""
+    from atpg_coverage_debug_agent.analysis.connectivity import is_tie_cell
+
+    netlist = parse_verilog(
+        "module m ( o ); output o; TIELOX1 u_pinless ( ) ; endmodule")
+    inst = netlist.modules["m"].instances["u_pinless"]
+
+    assert not inst.pins, "the fixture must leave structure with nothing to say"
+    assert is_tie_cell(inst, netlist) is True
+
+
 # ---------------------------------------------------------------------------
 # Unresolved mappings are explained, not silently zeroed (B3)
 # ---------------------------------------------------------------------------

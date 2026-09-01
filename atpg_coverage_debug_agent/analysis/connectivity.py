@@ -73,12 +73,21 @@ def _pin_direction(pin) -> str:
 def is_tie_cell(inst: Instance, netlist: Optional[VerilogNetlist] = None) -> bool:
     """True when *inst* is a constant (tie) driver.
 
-    Two independent tests, either of which is sufficient:
+    Evidence is weighted, not simply OR-ed:
 
-    * **Structural** -- the instance has pins, and none of them is an input.
-      A cell that consumes nothing and produces something is a constant
-      source; this catches tie cells from any library, named anything.
-    * **Naming** -- the cell type matches a known tie-cell convention.
+    * **Structural (decisive)** -- the instance has pins, and none of them is
+      an input. A cell that consumes nothing and produces something is a
+      constant source; this catches tie cells from any library, named
+      anything. Conversely a cell with a known input pin consumes a value and
+      is *not* a constant source, whatever it happens to be called.
+    * **Naming (fallback only)** -- consulted when the structure is silent:
+      the instance records no pins, or none of its pins could be classified.
+      A cell type matching a tie convention is then the only evidence there is.
+
+    Naming can therefore rescue a tie the parser could not resolve, but it can
+    never override structure that positively shows an input. That ordering
+    matters: a wrapper called something like ``and2_tie_hold`` has inputs and
+    must not be reported as a constant driver on the strength of its name.
 
     A hierarchical instance (its cell type is a module we parsed) is never a
     tie cell, however its ports are named.
@@ -88,6 +97,8 @@ def is_tie_cell(inst: Instance, netlist: Optional[VerilogNetlist] = None) -> boo
     directions = [_pin_direction(pin) for pin in inst.pins]
     if directions and all(d == "output" for d in directions):
         return True
+    if any(d == "input" for d in directions):
+        return False
     return bool(_TIE_CELL_TYPE.search(inst.cell_type or ""))
 
 
