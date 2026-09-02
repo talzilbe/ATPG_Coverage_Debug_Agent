@@ -162,6 +162,80 @@ def test_investigation_export_import(panel_with_report, qapp,
 
 
 # ---------------------------------------------------------------------------
+# Fault-row cap: truncation must be visible, not silent
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def panel_with_demo(qapp):
+    """A panel over the demo dataset, which has enough faults to truncate.
+
+    The minimal sample_* fixtures carry fewer faults than the spinner's floor
+    of 10, so the cap can never bite there.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data = os.path.join(here, "sample_data")
+    rep = run_analysis(os.path.join(data, "demo_netlist.v"),
+                       os.path.join(data, "demo_faults.mtfi"),
+                       os.path.join(data, "demo_constraints.do"))
+    panel = AgentPanel()
+    panel.set_report(rep, None)
+    yield panel, rep
+    panel.shutdown()
+
+
+def test_hint_reports_when_every_fault_row_fits(panel_with_demo):
+    panel, rep = panel_with_demo
+    total = len(rep.fault_results)
+
+    panel.maxfaults_spin.setValue(total)
+
+    assert f"all {total:,} rows" in panel.maxfaults_hint.text()
+    assert "omitted" not in panel.maxfaults_hint.text()
+
+
+def test_hint_warns_when_fault_rows_are_dropped(panel_with_demo):
+    """The payload only says '... N more faults omitted', which is easy to miss."""
+    panel, rep = panel_with_demo
+    total = len(rep.fault_results)
+    cap = total // 2
+    assert cap >= panel.maxfaults_spin.minimum(), "fixture must allow a cut"
+
+    panel.maxfaults_spin.setValue(cap)
+
+    text = panel.maxfaults_hint.text()
+    assert "omitted" in text
+    assert f"{total - cap:,}" in text
+    # The tooltip must say the aggregate analysis is still complete, so the
+    # warning is not read as "the agent only saw half the design".
+    tip = panel.maxfaults_hint.toolTip()
+    assert "triage still cover all" in tip
+    assert "Agentic" in tip
+
+
+def test_hint_is_empty_before_an_analysis_exists(qapp):
+    panel = AgentPanel()
+    try:
+        assert panel.maxfaults_hint.text() == ""
+    finally:
+        panel.shutdown()
+
+
+def test_cap_limits_the_table_but_not_the_summary_or_triage(panel_with_demo):
+    """The knob must never cut the aggregate analysis, only the row dump."""
+    from atpg_coverage_debug_agent.agent.debug_agent import build_user_payload
+
+    _panel, rep = panel_with_demo
+    payload = build_user_payload(rep, max_faults=1)
+
+    assert "more faults omitted" in payload
+    assert "## Summary" in payload
+    assert "## Evidence Basis of the Coverage Loss" in payload
+    assert "## Offline Triage Conclusions (report section S4)" in payload
+    assert "## Ranked Fix Plan (report section S5)" in payload
+    # Whole-population figures survive the cap.
+    assert str(rep.summary.coverage_loss_count) in payload
+
+
+# ---------------------------------------------------------------------------
 # "Agent is working" indicator
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("seconds,expected", [

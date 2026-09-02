@@ -433,9 +433,26 @@ class AgentPanel(QWidget):
         self.maxfaults_spin = QSpinBox()
         self.maxfaults_spin.setRange(10, 5000)
         self.maxfaults_spin.setValue(200)
+        self.maxfaults_spin.setToolTip(
+            "How many coverage-loss fault rows are written into the prompt.\n"
+            "Each row costs roughly 26 tokens, so a large design cannot be "
+            "sent whole.\n"
+            "This caps the per-fault TABLE only: the summary, the evidence "
+            "basis and the\ntriage are computed over every fault and are "
+            "always included in full.\n"
+            "In Agentic mode the agent can fetch any fault it wants on demand "
+            "through\nthe list_faults / get_fault_detail tools, so the cap "
+            "does not hide evidence from it.")
         self.maxfaults_spin.valueChanged.connect(self._notify_config_changed)
-        knobs.addWidget(QLabel("Max faults in prompt:"))
+        self.maxfaults_spin.valueChanged.connect(self._update_maxfaults_hint)
+        knobs.addWidget(QLabel("Fault rows in prompt:"))
         knobs.addWidget(self.maxfaults_spin)
+
+        # Truncation is silent in the payload ("... N more faults omitted"),
+        # which is easy to miss. Say so next to the knob instead.
+        self.maxfaults_hint = QLabel("")
+        self.maxfaults_hint.setStyleSheet("color: #555;")
+        knobs.addWidget(self.maxfaults_hint)
         knobs.addStretch(1)
         form.addRow("", self._wrap(knobs))
 
@@ -926,10 +943,33 @@ class AgentPanel(QWidget):
         if skill_manager is not None:
             self._skill_manager = skill_manager
         self._update_button_state()
+        self._update_maxfaults_hint()
         if report is not None:
             self.status_label.setText(
                 f"Report ready: {report.summary.coverage_loss_count} "
                 "coverage-loss faults available for the agent.")
+
+    def _update_maxfaults_hint(self) -> None:
+        """Say whether the per-fault table in the prompt is being truncated."""
+        if self._report is None:
+            self.maxfaults_hint.setText("")
+            self.maxfaults_hint.setToolTip("")
+            return
+        total = len(self._report.fault_results)
+        cap = int(self.maxfaults_spin.value())
+        if cap >= total:
+            self.maxfaults_hint.setText(f"(all {total:,} rows included)")
+            self.maxfaults_hint.setToolTip(
+                "The prompt carries every coverage-loss fault row.")
+            return
+        omitted = total - cap
+        self.maxfaults_hint.setText(
+            f"⚠ {omitted:,} of {total:,} rows omitted")
+        self.maxfaults_hint.setToolTip(
+            f"The prompt carries {cap:,} of {total:,} coverage-loss fault "
+            f"rows.\nThe summary, evidence basis and triage still cover all "
+            f"{total:,}.\nIn Agentic mode the agent can fetch any of the "
+            f"omitted rows on demand.")
 
     def set_compare(self, compare) -> None:
         """Attach (or clear) a baseline report payload for regression tools."""

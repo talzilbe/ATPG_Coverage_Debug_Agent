@@ -502,8 +502,23 @@ in a line.</p>
 <p>After a run, use <b>Follow-up Chat</b> to ask questions about the diagnosis;
 the conversation keeps the full analysis context (e.g. &ldquo;which module
 contributes the most loss?&rdquo;, &ldquo;how would a control point on X
-help?&rdquo;). <b>Max tokens</b>, <b>Temperature</b>, and <b>Max faults in
-prompt</b> tune size and determinism (temperature&nbsp;0 is most repeatable).</p>
+help?&rdquo;). <b>Max tokens</b> and <b>Temperature</b> tune size and
+determinism (temperature&nbsp;0 is most repeatable).</p>
+
+<h3>Fault rows in prompt</h3>
+<p>This caps how many coverage-loss fault rows are written into the prompt's
+per-fault table. Each row costs roughly 26&nbsp;tokens, so a large partition
+cannot be sent whole &mdash; 80,000&nbsp;faults would be over 2&nbsp;million
+tokens, far past any model's context window. The label next to the spinner
+tells you when rows are being left out.</p>
+<p>It caps the <i>table only</i>. The summary, the evidence basis and the whole
+triage &mdash; categories, hotspots, blocking sources, fix plan &mdash; are
+computed over <b>every</b> fault and are always sent in full, so the agent
+always reasons about the complete population. In <b>Agentic</b> mode it can
+also pull any individual fault on demand with the <code>list_faults</code> and
+<code>get_fault_detail</code> tools, so the cap hides nothing from it. Raise it
+when you want the model to eyeball raw rows for a pattern the clustering
+missed; lower it for a small-context endpoint or to cut cost.</p>
 
 <h3>Bigger, easier-to-read panels &mdash; pop-out windows</h3>
 <p>Each of the four panels &mdash; <b>Assembled Prompt</b>, <b>Agent Tool
