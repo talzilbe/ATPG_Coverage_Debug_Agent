@@ -299,6 +299,120 @@ class AgentConfig:
 # ---------------------------------------------------------------------------
 # Payload builder
 # ---------------------------------------------------------------------------
+def _triage_payload(report: Any) -> List[str]:
+    """Serialise the offline triage conclusions and the ranked fix plan.
+
+    The deterministic pass does not stop at per-fault evidence: it aggregates
+    the loss into categories, scores how actionable each one is, locates where
+    it concentrates, traces what is blocking it and emits a ranked fix plan.
+    Those conclusions are report sections S4 and S5, and the system prompt asks
+    the model to *review* them -- section C for disagreements, section F for the
+    plan. Without them in the payload the model would be critiquing something it
+    was never shown, so they are included in both agentic and non-agentic runs.
+
+    Returns an empty list for a report that predates the triage (an older
+    session file), keeping the payload backwards compatible.
+    """
+    stats = getattr(report, "statistics", None)
+    if stats is None:
+        return []
+
+    lines: List[str] = ["## Offline Triage Conclusions (report section S4)"]
+    lines.append(
+        "These are the deterministic pass's OWN conclusions, already shown to "
+        "the user. They are INPUT: do not restate them. Disagree with them in "
+        "section C, and review the plan below in section F."
+    )
+    lines.append(
+        f"- Detected: {stats.detected_count} ({stats.detected_pct:.2f}%); "
+        f"coverage loss: {stats.loss_count} ({stats.loss_pct:.2f}%). "
+        f"Aggregated from the fault list -- NOT the tool's test-coverage figure."
+    )
+
+    loss_stats = getattr(stats, "loss_stats", None) or []
+    if loss_stats:
+        lines.append("- Loss categories (category | faults | % of all | sa0 | "
+                     "sa1 | imbalance):")
+        for st in loss_stats:
+            lines.append(f"    {st.subclass_id} | {st.count} | {st.pct:.2f}% | "
+                         f"{st.sa0} | {st.sa1} | {st.sa_asymmetry:.2f}")
+
+    selected = getattr(report, "selected_categories", None) or []
+    for cat in selected:
+        lines.append(f"### {cat.rank}. {cat.subclass_id} -- {cat.reason}")
+
+        verdict = getattr(cat, "verdict", None)
+        if verdict is not None:
+            patterns = ", ".join(verdict.patterns) if verdict.patterns else "-"
+            lines.append(
+                f"- Scored verdict: worth acting on = {verdict.actionable} "
+                f"({verdict.confidence.value} confidence). {verdict.reason} "
+                f"Patterns: {patterns}.")
+
+        clusters = getattr(cat, "clusters", None)
+        if clusters is not None and clusters.clusters:
+            lines.append(
+                f"- Concentration (WHERE to look, not a root cause): "
+                f"{len(clusters.clusters)} cluster(s) at depth {clusters.depth}.")
+            for cluster in clusters.clusters[:3]:
+                lines.append(f"    {cluster.prefix} | {cluster.count} faults | "
+                             f"{cluster.pct:.1f}% | sa0={cluster.sa0} "
+                             f"sa1={cluster.sa1}")
+
+        att = getattr(cat, "attribution", None)
+        if att is not None and att.attributed:
+            lines.append(
+                f"- Blocking sources (STRUCTURAL ESTIMATE from fan-in cones, "
+                f"not the ATPG tool's attribution): {att.attributed} of "
+                f"{att.analysed} traced ({att.coverage:.0%}), verdict "
+                f"{att.verdict}. {att.note}")
+            for src in [s for s in att.tie_sources if s.kind != "tie_cell"][:3]:
+                lines.append(
+                    f"    driver {src.driver} ({src.cell_type or '-'}) holds "
+                    f"{src.tie_value or '?'}, kind={src.kind}, "
+                    f"reprogrammable={'yes' if src.is_configurable else 'no'}, "
+                    f"{src.count} fault(s)")
+            for src in att.constraint_sources[:3]:
+                lines.append(f"    constraint {src.signal} "
+                             f"({src.kind or '-'}) = {src.value or '?'}, "
+                             f"{src.count} fault(s)")
+
+        prof = getattr(cat, "reachability", None)
+        if prof is not None and prof.profiled:
+            lines.append(
+                f"- Structural signature of the aborted sites: "
+                f"{prof.profiled} of {prof.analysed} profiled, dominant "
+                f"'{prof.dominant}' ({prof.dominant_share:.0%}). {prof.note} "
+                f"A narrow bottleneck and a reconvergent cone need OPPOSITE "
+                f"fixes, so check the signature before endorsing more abort "
+                f"budget.")
+    lines.append("")
+
+    recommendations = getattr(report, "recommendations", None) or []
+    if recommendations:
+        lines.append("## Ranked Fix Plan (report section S5)")
+        lines.append(
+            "The plan you must review in section F. Take each proposal and say "
+            "agree / re-rank / reject with the reason. Do not invent a parallel "
+            "plan; add a proposal only for something this misses."
+        )
+        for rec in recommendations:
+            gain = ("benefit must be MEASURED by a re-run; no gain is predicted"
+                    if rec.requires_measurement else "benefit is estimated")
+            lines.append(
+                f"### {rec.rank}. {rec.title} [{rec.subclass_id}, "
+                f"{rec.fault_count} faults, {rec.pct:.2f}%, "
+                f"{rec.confidence.value} confidence, "
+                f"actionable={rec.actionable}]")
+            lines.append(f"- Rationale: {rec.fix.rationale}")
+            lines.append(f"- {gain}")
+            for caveat in rec.caveats[:3]:
+                lines.append(f"- Caveat: {caveat}")
+        lines.append("")
+
+    return lines
+
+
 def build_user_payload(report: Any, max_faults: int = 200,
                        agentic: bool = False) -> str:
     """Serialise an :class:`AnalysisReport` into a structured text payload.
@@ -373,6 +487,12 @@ def build_user_payload(report: Any, max_faults: int = 200,
                 lines.append(f"    {count:5d}  {cause}")
         lines.append("")
 
+    # The offline triage conclusions and the ranked fix plan (S4/S5). The
+    # output contract asks the model to correct these and review the plan, so
+    # they must be in the payload in BOTH modes -- in agentic mode the tools
+    # are for drilling deeper, not for re-deriving what is already here.
+    lines.extend(_triage_payload(report))
+
     # Repeated patterns
     if report.pattern_groups:
         lines.append("## Repeated Pattern Groups")
@@ -446,13 +566,20 @@ def build_user_payload(report: Any, max_faults: int = 200,
         lines.append("")
 
     lines.append("## TASK")
+    lines.append(
+        "Everything above is the completed offline analysis: the evidence it "
+        "measured, the conclusions it reached and the fix plan it ranked. Your "
+        "job is to REVIEW it, not to redo it or restate it."
+    )
     if agentic:
         lines.append(
-            "You have access to analysis SKILLS exposed as callable tools. "
-            "Decide which skills are relevant to the coverage loss above, CALL "
-            "them (you may call several, in any order, and call one again with "
-            "different arguments if useful), then use their structured findings "
-            "as additional evidence. When you have gathered enough evidence, "
+            "You have access to analysis SKILLS exposed as callable tools. Use "
+            "them to drill into specific faults, paths and categories, and to "
+            "TEST the conclusions above -- not to re-derive figures already "
+            "given. Decide which skills are relevant, CALL them (you may call "
+            "several, in any order, and call one again with different "
+            "arguments if useful), then use their structured findings as "
+            "additional evidence. When you have gathered enough evidence, "
             "produce the full A-F output described in the system prompt. Mark "
             "every ambiguous statement as Observed / Derived / Likely / "
             "Unresolved. Do not invent connectivity that is not present in the "
@@ -460,10 +587,10 @@ def build_user_payload(report: Any, max_faults: int = 200,
         )
     else:
         lines.append(
-            "Using ONLY the structural evidence above, produce the full A-F output "
+            "Using ONLY the analysis above, produce the full A-F output "
             "described in the system prompt. Mark every ambiguous statement as "
-            "Observed / Derived / Likely / Unresolved. Do not invent connectivity "
-            "that is not present in this evidence."
+            "Observed / Derived / Likely / Unresolved. Do not invent "
+            "connectivity that is not present in this evidence."
         )
     return "\n".join(lines)
 

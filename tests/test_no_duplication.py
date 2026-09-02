@@ -16,6 +16,7 @@ to judgement, corrections and narrative.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 
@@ -161,3 +162,55 @@ def test_agent_ranks_the_actionable_population(demo_report):
     assert "ACTIONABLE loss only" in payload
     # The per-fault table is input, and the payload says so.
     assert "do not reproduce it" in payload
+
+
+# ---------------------------------------------------------------------------
+# Agent: reviews the offline analysis, so it must be given the conclusions
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("agentic", [False, True])
+def test_payload_carries_the_offline_triage_and_fix_plan(demo_report, agentic):
+    """Sections C and F review S4/S5, so S4/S5 must be in the payload.
+
+    Without this the model is asked to correct a triage and review a fix plan
+    it was never shown -- in agentic mode it would have to guess to call the
+    right tool, and in non-agentic mode the conclusions were simply absent.
+    """
+    payload = build_user_payload(demo_report, agentic=agentic)
+
+    assert "## Offline Triage Conclusions (report section S4)" in payload
+    assert "## Ranked Fix Plan (report section S5)" in payload
+    # The scored verdict, the concentration and the blocking source are the
+    # conclusions the deterministic pass reached; all three must be visible.
+    assert "Scored verdict:" in payload
+    assert "Concentration (WHERE to look" in payload
+    assert "Blocking sources" in payload
+    # Every ranked proposal is present for the section F review.
+    for rec in demo_report.recommendations:
+        assert rec.title in payload
+
+
+def test_payload_frames_the_offline_analysis_as_input_to_review(demo_report):
+    payload = build_user_payload(demo_report)
+
+    assert "Your job is to REVIEW it" in payload
+    assert "They are INPUT: do not restate them" in payload
+    # The caveat that keeps the aggregate from being read as tool coverage.
+    assert "NOT the tool's test-coverage figure" in payload
+
+
+def test_payload_survives_a_report_without_triage(demo_report):
+    """An older session file has no statistics; the payload must still build."""
+    # demo_report is module-scoped, so work on a shallow copy -- rebinding the
+    # fields on the original would silently corrupt every later test.
+    stripped = copy.copy(demo_report)
+    stripped.statistics = None
+    stripped.selected_categories = []
+    stripped.recommendations = []
+
+    payload = build_user_payload(stripped)
+
+    assert "## Offline Triage Conclusions" not in payload
+    assert "## Ranked Fix Plan" not in payload
+    assert "## Summary" in payload and "## TASK" in payload
+    # The original is untouched, so the fixture is still usable.
+    assert demo_report.statistics is not None
