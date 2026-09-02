@@ -513,6 +513,20 @@ to detach that panel into a large, resizable window that is easier to read and
 type in. Live streaming, clickable fault ids, and the chat input all keep
 working in the pop-out. Close the window (or click <b>Dock back</b>) to return
 the panel to its place.</p>
+<p>A pop-out sizes like any ordinary window. Use
+<b class="k">&#11036; Maximize</b> (<b>Ctrl+M</b>) to fill the screen keeping the
+title bar, or <b class="k">&#9974; Full screen</b> (<b>F11</b>) to use the whole
+screen without one; <b>Esc</b> leaves full screen. These buttons drive the
+toolkit directly, so they work even where the window manager ignores the
+title-bar buttons &mdash; the same reason the main window has a <b>View</b>
+menu (see section&nbsp;2).</p>
+
+<h3>Knowing the agent is still working</h3>
+<p>A model call can run for minutes with nothing to show while it thinks, which
+looks the same as a hang. The status line under the buttons animates and counts
+up &mdash; for example <code>/&nbsp;&nbsp;Agent running, calling tools&hellip;
+1m&nbsp;24s</code> &mdash; for as long as a run or a chat reply is in flight,
+and reports the total time when the answer arrives.</p>
 
 <div class="tip"><b>Recommended flow:</b> Analyze &rarr; skim Summary &rarr;
 work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in Agentic mode
@@ -1689,6 +1703,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_settings()
         self._shutdown_report_server()
+        # The agent panel owns background threads (CLI model fetch, agent run,
+        # chat turn). Qt aborts the process if one is still running when it is
+        # destroyed, so drain them before the window goes away.
+        self.agent_panel.shutdown()
         super().closeEvent(event)
 
     def _set_export_enabled(self, enabled: bool) -> None:

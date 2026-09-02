@@ -30,7 +30,11 @@ def panel_with_report(qapp, sample_netlist_path, sample_faults_path,
                        sample_constraints_path)
     panel = AgentPanel()
     panel.set_report(rep, None)
-    return panel, rep
+    yield panel, rep
+    # Constructing the panel schedules a Copilot CLI model fetch on the next
+    # event-loop turn. Any test that pumps events starts that thread for real,
+    # and Qt aborts the process if it outlives its wrapper.
+    panel.shutdown()
 
 
 def test_linkify_creates_fault_anchor(panel_with_report):
@@ -155,4 +159,153 @@ def test_investigation_export_import(panel_with_report, qapp,
     fresh.import_investigation(None)
     assert fresh.response_view.toPlainText().strip() == ""
     assert fresh.chat_view.toPlainText().strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# "Agent is working" indicator
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "0s"),
+    (9, "9s"),
+    (59, "59s"),
+    (60, "1m 00s"),
+    (135, "2m 15s"),
+    (3600, "1h 00m 00s"),
+    (3725, "1h 02m 05s"),
+])
+def test_elapsed_is_formatted_like_a_stopwatch(seconds, expected):
+    assert AgentPanel._format_elapsed(seconds) == expected
+
+
+def test_busy_indicator_animates_and_counts(panel_with_report):
+    """A long call must not look like a hang, so the status line moves."""
+    panel, _rep = panel_with_report
+
+    panel._start_busy("Calling the LLM")
+    assert panel._busy_timer.isActive()
+    first = panel.status_label.text()
+    panel._tick_busy()
+    second = panel.status_label.text()
+
+    assert first != second, "the spinner must advance between ticks"
+    assert first[0] != second[0]
+    for text in (first, second):
+        assert "Calling the LLM" in text
+        assert text.rstrip().endswith("s")   # the elapsed count
+
+    panel._stop_busy()
+    assert not panel._busy_timer.isActive()
+
+
+def test_busy_indicator_stops_on_every_completion_path(panel_with_report):
+    panel, _rep = panel_with_report
+
+    panel._start_busy("Calling the LLM")
+    panel._on_finished("done")
+    assert not panel._busy_timer.isActive()
+    assert "received in" in panel.status_label.text()
+
+    panel._start_busy("Calling the LLM")
+    panel._on_failed("boom")
+    assert not panel._busy_timer.isActive()
+
+    panel._chat_backend = "cli"
+    panel._chat_turns = []
+    panel._start_busy("Agent is replying")
+    panel._on_chat_finished("reply")
+    assert not panel._busy_timer.isActive()
+    assert "Reply received in" in panel.status_label.text()
+
+    panel._start_busy("Agent is replying")
+    panel._on_chat_failed("nope")
+    assert not panel._busy_timer.isActive()
+
+
+# ---------------------------------------------------------------------------
+# Pop-out windows behave like ordinary desktop windows
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def popout(panel_with_report):
+    panel, _rep = panel_with_report
+    box = panel._splitter_boxes[0]
+    panel._toggle_popout(box, "Assembled Prompt")
+    dlg, _btn = panel._popouts[box]
+    yield panel, box, dlg
+    if box in panel._popouts:
+        panel._toggle_popout(box, "Assembled Prompt")
+
+
+def test_popout_asks_for_real_window_controls(popout):
+    """A plain QDialog frame often has no maximise button at all."""
+    from PySide6.QtCore import Qt
+
+    _panel, _box, dlg = popout
+    flags = dlg.windowFlags()
+    assert flags & Qt.Window
+    assert flags & Qt.WindowMinMaxButtonsHint
+
+
+def test_popout_maximize_and_full_screen_toggle(popout):
+    _panel, _box, dlg = popout
+
+    dlg.max_btn.click()
+    assert dlg.isMaximized()
+    assert "Restore down" in dlg.max_btn.text()
+    dlg.max_btn.click()
+    assert not dlg.isMaximized()
+    assert "Maximize" in dlg.max_btn.text()
+
+    dlg.full_btn.click()
+    assert dlg.isFullScreen()
+    assert "Leave full screen" in dlg.full_btn.text()
+    dlg.full_btn.click()
+    assert not dlg.isFullScreen()
+
+
+def test_popout_binds_the_usual_shortcuts(popout):
+    from PySide6.QtGui import QShortcut
+
+    _panel, _box, dlg = popout
+    bound = sorted(s.key().toString() for s in dlg.findChildren(QShortcut))
+    assert bound == ["Ctrl+M", "F11"]
+
+
+def _press_escape(widget) -> None:
+    """Deliver a real Escape key press to *widget*, synchronously.
+
+    ``QTest.keyClick`` would do the same, but nothing here pumps the event
+    loop on purpose: the panel schedules a Copilot CLI model fetch with
+    ``singleShot(0)`` when it is built, and pumping would launch that
+    subprocess in every test.
+    """
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    for kind in (QEvent.KeyPress, QEvent.KeyRelease):
+        QApplication.sendEvent(
+            widget, QKeyEvent(kind, Qt.Key_Escape, Qt.NoModifier))
+
+
+def test_escape_leaves_full_screen_instead_of_closing(popout):
+    """Qt rejects a dialog on Escape; in full screen that loses the window."""
+    panel, box, dlg = popout
+    dlg.full_btn.click()
+    assert dlg.isFullScreen()
+
+    _press_escape(dlg)
+
+    assert not dlg.isFullScreen()
+    assert box in panel._popouts, "Escape must not close a full-screen pop-out"
+    assert "Full screen" in dlg.full_btn.text()
+
+
+def test_escape_still_docks_back_when_not_full_screen(popout):
+    panel, box, dlg = popout
+    assert not dlg.isFullScreen()
+
+    _press_escape(dlg)
+
+    assert box not in panel._popouts
+    assert panel._splitter.indexOf(box) != -1
 

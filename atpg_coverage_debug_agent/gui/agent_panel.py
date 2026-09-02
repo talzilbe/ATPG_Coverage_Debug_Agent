@@ -6,11 +6,13 @@ import html
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Optional
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import (
+    QEvent,
     QObject,
     QProcess,
     QProcessEnvironment,
@@ -19,7 +21,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -64,6 +66,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 _DEFAULT_CLI_PATH = os.path.join(_REPO_ROOT, "tools", "copilot-cli", "copilot")
 _DEFAULT_CLI_HOME = (os.environ.get("COPILOT_HOME", "").strip()
                      or os.path.join(_REPO_ROOT, "copilot-home"))
+
+#: Animation frames and tick rate for the "agent is working" status line.
+#: Plain ASCII so the indicator renders on any font the session provides.
+_BUSY_FRAMES = ("|", "/", "-", "\\")
+_BUSY_TICK_MS = 200
 
 # Suggested model ids for the GitHub Copilot CLI --model flag. This is only a
 # seed for the very first launch: the real list is pulled from the CLI itself
@@ -156,6 +163,96 @@ class _AgenticWorker(QObject):
             self.failed.emit(str(exc))
             return
         self.finished.emit(text)
+
+
+class _PopoutWindow(QDialog):
+    """A detached panel window that behaves like an ordinary desktop window.
+
+    Two things a plain ``QDialog`` gets wrong here:
+
+    * It asks the window manager for a dialog frame, which on many managers
+      carries no maximise button. The flags below request a real window, and
+      the in-window buttons drive Qt directly so they still work on a manager
+      that ignores the title bar (this session's does).
+    * Escape rejects a dialog. In a full-screen pop-out that would throw the
+      panel back into the main window instead of merely leaving full screen,
+      which is not what Escape does in any other application, so it is
+      intercepted while full screen and passed through otherwise.
+    """
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setWindowFlags(Qt.Window
+                            | Qt.WindowMinMaxButtonsHint
+                            | Qt.WindowCloseButtonHint)
+
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(4, 4, 4, 4)
+
+        self.max_btn = QPushButton()
+        self.max_btn.setFlat(True)
+        self.max_btn.setToolTip(
+            "Fill the screen, keeping the title bar (Ctrl+M).")
+        self.max_btn.clicked.connect(self.toggle_maximized)
+        self.full_btn = QPushButton()
+        self.full_btn.setFlat(True)
+        self.full_btn.setToolTip(
+            "Use the whole screen with no title bar (F11; Esc to leave).")
+        self.full_btn.clicked.connect(self.toggle_full_screen)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.max_btn)
+        row.addWidget(self.full_btn)
+        row.addStretch(1)
+        self._layout.addLayout(row)
+        self._sync_labels()
+
+        for seq, slot in (("Ctrl+M", self.toggle_maximized),
+                          ("F11", self.toggle_full_screen)):
+            QShortcut(QKeySequence(seq), self).activated.connect(slot)
+
+    def add_content(self, widget) -> None:
+        self._layout.addWidget(widget)
+
+    def _sync_labels(self) -> None:
+        self.max_btn.setText("\u2750  Restore down" if self.isMaximized()
+                             else "\u2b1c  Maximize")
+        self.full_btn.setText("\u26f6  Leave full screen" if self.isFullScreen()
+                              else "\u26f6  Full screen")
+
+    def toggle_maximized(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._sync_labels()
+
+    def toggle_full_screen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        self._sync_labels()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            self._sync_labels()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # The window manager can maximise us without going through our
+        # buttons, so keep the labels honest either way.
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._sync_labels()
 
 
 class _ChatWorker(QObject):
@@ -393,6 +490,16 @@ class AgentPanel(QWidget):
         self.status_label.setStyleSheet("color: #555;")
         layout.addWidget(self.status_label)
 
+        # Busy indicator. A model call can run for minutes with nothing to
+        # show while it thinks, which is indistinguishable from a hang, so the
+        # status line animates and counts up for as long as work is in flight.
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setInterval(_BUSY_TICK_MS)
+        self._busy_timer.timeout.connect(self._tick_busy)
+        self._busy_started = 0.0
+        self._busy_message = ""
+        self._busy_frame = 0
+
         # --- Prompt / response split ---
         splitter = QSplitter(Qt.Horizontal)
 
@@ -524,12 +631,8 @@ class AgentPanel(QWidget):
             dlg.close()
             return
         btn = self._popout_btns.get(box)
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"{title} \u2014 ATPG Debug Agent")
-        dlg.setModal(False)
-        vlay = QVBoxLayout(dlg)
-        vlay.setContentsMargins(4, 4, 4, 4)
-        vlay.addWidget(box)
+        dlg = _PopoutWindow(f"{title} \u2014 ATPG Debug Agent", self)
+        dlg.add_content(box)
         box.show()
         if btn is not None:
             btn.setText("\u29c9  Dock back")
@@ -1030,7 +1133,7 @@ class AgentPanel(QWidget):
 
     def _run_single_shot(self, config: AgentConfig) -> None:
         self.run_btn.setEnabled(False)
-        self.status_label.setText("Calling LLM… streaming response below.")
+        self._start_busy("Calling the LLM, streaming the response below")
         self._begin_session(config, agentic=False)
         self.response_view.clear()
         self._stream_buf = ""
@@ -1063,7 +1166,7 @@ class AgentPanel(QWidget):
         self.trace_view.clear()
         self._append_trace(f"Starting agentic run with {n} enabled skill(s)…")
         self.run_btn.setEnabled(False)
-        self.status_label.setText("Agentic agent running — calling tools…")
+        self._start_busy("Agent running, calling tools")
         self._begin_session(config, agentic=True)
         self.response_view.clear()
         self._stream_buf = ""
@@ -1089,6 +1192,41 @@ class AgentPanel(QWidget):
         self.response_view.moveCursor(QTextCursor.End)
         self.response_view.insertPlainText(chunk)
         self.response_view.moveCursor(QTextCursor.End)
+
+    # -- busy indicator ------------------------------------------------------
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        """Render a duration the way a stopwatch would."""
+        total = int(seconds)
+        if total >= 3600:
+            return f"{total // 3600}h {(total % 3600) // 60:02d}m {total % 60:02d}s"
+        if total >= 60:
+            return f"{total // 60}m {total % 60:02d}s"
+        return f"{total}s"
+
+    def _start_busy(self, message: str) -> None:
+        """Show *message* with a spinner and a running elapsed count."""
+        self._busy_message = message
+        self._busy_started = time.monotonic()
+        self._busy_frame = 0
+        self._tick_busy()
+        self._busy_timer.start()
+
+    def _tick_busy(self) -> None:
+        frame = _BUSY_FRAMES[self._busy_frame % len(_BUSY_FRAMES)]
+        self._busy_frame += 1
+        elapsed = self._format_elapsed(time.monotonic() - self._busy_started)
+        self.status_label.setText(f"{frame}  {self._busy_message}… {elapsed}")
+
+    def _stop_busy(self) -> float:
+        """Stop the animation and return how long the work took, in seconds."""
+        self._busy_timer.stop()
+        if not self._busy_started:
+            return 0.0
+        elapsed = time.monotonic() - self._busy_started
+        self._busy_started = 0.0
+        return elapsed
 
     def _append_trace(self, line: str) -> None:
         self.trace_view.appendPlainText(line)
@@ -1120,11 +1258,13 @@ class AgentPanel(QWidget):
         return text + "\n" + "\n".join(notice)
 
     def _on_finished(self, text: str) -> None:
+        elapsed = self._stop_busy()
         final = text or getattr(self, "_stream_buf", "")
         final = self._audit_answer(final)
         self._set_response(final)
         self.status_label.setText(
-            "Agent response received — click a fault to focus it, or Verify.")
+            f"Agent response received in {self._format_elapsed(elapsed)} — "
+            "click a fault to focus it, or Verify.")
         self.run_btn.setEnabled(True)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
@@ -1136,6 +1276,7 @@ class AgentPanel(QWidget):
         self.chat_input.setFocus()
 
     def _on_failed(self, message: str) -> None:
+        elapsed = self._stop_busy()
         self._set_response(f"[ERROR] {message}")
         self.run_btn.setEnabled(True)
         if is_cli_auth_error(message):
@@ -1149,11 +1290,38 @@ class AgentPanel(QWidget):
             self.auth_log.appendPlainText("[auth needed] " + message.strip())
             self.tabs.setCurrentIndex(self.tabs.count() - 1)
         else:
-            self.status_label.setText("Agent call failed — see response panel.")
+            self.status_label.setText(
+                f"Agent call failed after {self._format_elapsed(elapsed)} — "
+                "see response panel.")
 
     def _cleanup(self) -> None:
         self._thread = None
         self._worker = None
+
+    def shutdown(self, timeout_ms: int = 5000) -> None:
+        """Stop background workers and wait for them. Safe to call repeatedly.
+
+        The panel starts a Copilot CLI model-list fetch as soon as it is
+        constructed, and a run or a chat turn each start a worker thread. A
+        QThread still running when its wrapper is destroyed is fatal to Qt --
+        it aborts the process -- so they are drained explicitly rather than
+        left to interpreter shutdown.
+        """
+        self._busy_timer.stop()
+        for attr in ("_model_thread", "_thread", "_chat_thread"):
+            thread = getattr(self, attr, None)
+            if thread is None:
+                continue
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(timeout_ms)
+            except RuntimeError:  # already destroyed by Qt
+                pass
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self.shutdown()
+        super().closeEvent(event)
 
     # -- follow-up chat ------------------------------------------------------
 
@@ -1376,7 +1544,7 @@ class AgentPanel(QWidget):
             history = list(self._chat_messages)
 
         self._set_chat_enabled(False)
-        self.status_label.setText("Agent is replying…")
+        self._start_busy("Agent is replying")
         self._chat_stream_buf = ""
         # Live streaming cue appended below the You turn; replaced on finish.
         self._append_html(
@@ -1404,6 +1572,7 @@ class AgentPanel(QWidget):
         self.chat_view.moveCursor(QTextCursor.End)
 
     def _on_chat_finished(self, text: str) -> None:
+        elapsed = self._stop_busy()
         final = text or getattr(self, "_chat_stream_buf", "")
         self._chat_turns.append(("Agent", (final or "").strip()))
         if self._chat_backend != "cli":
@@ -1412,10 +1581,12 @@ class AgentPanel(QWidget):
         self._rebuild_chat_view()
         self._set_chat_enabled(True)
         self.status_label.setText(
-            "Reply received — continue the conversation or re-run.")
+            f"Reply received in {self._format_elapsed(elapsed)} — continue the "
+            "conversation or re-run.")
         self.chat_input.setFocus()
 
     def _on_chat_failed(self, message: str) -> None:
+        self._stop_busy()
         self._chat_turns.append(("Error", (message or "").strip()))
         self._rebuild_chat_view()
         self._set_chat_enabled(True)
