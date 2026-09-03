@@ -196,6 +196,14 @@ class FaultMapper:
         if idx <= 0 or depth >= self.MAX_ANCESTOR_DEPTH:
             return True
         parent_name = parts[idx - 1]
+        # The outermost component of a fault path is normally the top-level
+        # MODULE (or design) name, which is instantiated nowhere -- so looking
+        # for an instance of that name finds nothing. Treat a component that
+        # names the module we have just walked up into as the root of the
+        # chain. Without this, any repeated leaf name is unresolvable as soon
+        # as the fault list quotes the full path, which is the usual case.
+        if parent_name == module:
+            return True
         for parent_module, parent_inst in self._by_name.get(parent_name, []):
             if parent_inst.cell_type != module:
                 continue
