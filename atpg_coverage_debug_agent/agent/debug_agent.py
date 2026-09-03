@@ -25,6 +25,12 @@ from ..analysis import investigate
 
 logger = logging.getLogger(__name__)
 
+#: Cap on the loss categories listed in the prompt. The per-fault table has a
+#: user knob, but the triage census had none, so a design with many small
+#: categories could quietly outgrow the context the knob was meant to protect.
+#: The full census stays one `coverage_triage` call away.
+MAX_TRIAGE_CATEGORIES = 25
+
 #: Repository root (parent of the package dir) — used to set PYTHONPATH for the
 #: MCP server subprocess the Copilot CLI launches.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -115,6 +121,15 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
 
 6. HARD RULES
   - No guessing. If not proven by inputs, mark as unresolved or hypothesis.
+  - "The evidence does not settle this" is a COMPLETE and ACCEPTABLE answer.
+    It is not a failure to answer, and it is strongly preferred over a
+    confident wrong one: a plausible root cause that is wrong costs an
+    engineer days of work on the wrong block. When you reach that point, say
+    which question is unsettled, what the evidence does not show, and what
+    would settle it. Never pad such an answer with a speculative cause.
+  - Before trusting any count, check how much of it rests on faults that
+    actually mapped onto the netlist, and whether an analyst waiver removed
+    faults from the totals.
   - Separate Observed (in input) / Derived (from connectivity) / Hypothesis (likely).
   - Be explicit about uncertainty and naming mismatches.
   - No shallow explanations: name the signal/path, the boundary, what blocks
@@ -239,6 +254,47 @@ Rules for tool use:
   report exactly as specified in the base system prompt.
 - Never claim a skill returned something it did not. If a tool returns no
   findings, say so.
+- Call `report_context` EARLY. It tells you how much of the coverage loss
+  actually mapped onto the netlist, how much sits on hard constants, and
+  whether an analyst has waived faults. A percentage computed over mostly
+  unmapped faults does not mean what it appears to mean, and you cannot know
+  that from the figure alone.
+- When the evidence does not settle a question, call
+  `report_insufficient_evidence` and report that as your answer. It exists so
+  that "not determined" is a real, available action rather than something you
+  have to argue your way into. Use it in preference to a hedged guess.
+- Before quoting any hierarchy path in your answer, pass it through
+  `verify_paths`. A shortened or reconstructed path will not resolve when the
+  reader pastes it into a tool.
+"""
+
+
+#: Used for the single corrective round-trip when an answer trips a guardrail.
+#: Annotating a bad answer leaves the bad answer in front of the reader; this
+#: asks for it to be fixed instead.
+CORRECTION_SYSTEM_PROMPT = """You are correcting a hardware-debug analysis you
+have just written. An automated check found statements that are not supported
+by the source artefacts.
+
+Two kinds of problem are reported:
+
+* UNVERIFIABLE PATH - a hierarchy path that does not appear in the netlist,
+  fault list or constraint file. Usually the path was shortened, elided with
+  "...", or reconstructed from memory. A path that does not resolve when
+  pasted into an ATPG tool is worse than no path at all. Either quote it
+  exactly as it appears in the evidence you were given, or remove the claim
+  and say the exact path was not available.
+
+* UNMEASURED CLAIM - a predicted coverage gain. Nothing can establish a
+  coverage number except re-running ATPG. Remove the prediction. You may still
+  say an action is expected to help, without attaching a figure.
+
+Rewrite the analysis so every flagged item is fixed. Preserve everything else
+exactly: the structure, the section headings, the findings and the wording that
+was not flagged. Do not add new claims, do not soften unrelated conclusions and
+do not add a note about this correction.
+
+Return ONLY the corrected analysis.
 """
 
 
@@ -287,6 +343,11 @@ class AgentConfig:
     #: When True, the CLI agentic run exposes the investigative tools to the
     #: Copilot CLI via a local MCP server so the model drives them itself.
     cli_use_mcp: bool = True
+    #: When True, an answer that trips a guardrail gets ONE corrective
+    #: round-trip before it reaches the user, rather than only a warning
+    #: appended beneath the unsupported claim. Costs an extra call, and only
+    #: when something was actually flagged.
+    guardrail_retry: bool = True
 
     @property
     def configured(self) -> bool:
@@ -331,11 +392,17 @@ def _triage_payload(report: Any) -> List[str]:
 
     loss_stats = getattr(stats, "loss_stats", None) or []
     if loss_stats:
+        shown = loss_stats[:MAX_TRIAGE_CATEGORIES]
         lines.append("- Loss categories (category | faults | % of all | sa0 | "
                      "sa1 | imbalance):")
-        for st in loss_stats:
+        for st in shown:
             lines.append(f"    {st.subclass_id} | {st.count} | {st.pct:.2f}% | "
                          f"{st.sa0} | {st.sa1} | {st.sa_asymmetry:.2f}")
+        if len(loss_stats) > len(shown):
+            hidden = len(loss_stats) - len(shown)
+            lines.append(
+                f"    ... {hidden} smaller categorie(s) omitted from this "
+                f"list. Call coverage_triage for the full census.")
 
     selected = getattr(report, "selected_categories", None) or []
     for cat in selected:
@@ -630,10 +697,12 @@ class DebugAgent:
             )
         user_payload = self.build_prompt(report)
         if self.config.backend == "cli":
-            return self._call_cli(SYSTEM_PROMPT, user_payload,
-                                  session_id=session_id, on_chunk=on_chunk)
-        return self._call_chat_completions(SYSTEM_PROMPT, user_payload,
-                                           on_chunk=on_chunk)
+            answer = self._call_cli(SYSTEM_PROMPT, user_payload,
+                                    session_id=session_id, on_chunk=on_chunk)
+        else:
+            answer = self._call_chat_completions(SYSTEM_PROMPT, user_payload,
+                                                 on_chunk=on_chunk)
+        return self.correct_guardrail_issues(answer, report)
 
     def run_with_prompt(self, system_prompt: str, user_payload: str) -> str:
         """Call the LLM with an explicit system + user prompt pair."""
@@ -642,6 +711,70 @@ class DebugAgent:
         if self.config.backend == "cli":
             return self._call_cli(system_prompt, user_payload)
         return self._call_chat_completions(system_prompt, user_payload)
+
+    def correct_guardrail_issues(self, answer: str, report: Any,
+                                 emit=None) -> str:
+        """Ask the model to fix any unsupported claims in *answer*.
+
+        Flagging a fabricated path underneath an answer still leaves the
+        fabricated path in front of the reader, who may well act on it. One
+        corrective round-trip fixes the answer instead. Only runs when the
+        check actually finds something, so it costs nothing on a clean answer.
+
+        Args:
+            answer: The model's answer.
+            report: The report the answer is about, for the path registry.
+            emit: Optional ``callable(str)`` for trace output.
+
+        Returns:
+            The corrected answer, or the original when there was nothing to
+            correct or the correction could not be made. Never raises: a
+            failed correction must not lose the user their analysis.
+        """
+        if not answer or report is None or not self.config.guardrail_retry:
+            return answer
+        try:
+            from ..analysis.guardrails import (
+                PathRegistry,
+                check_text,
+                issues_as_warnings,
+            )
+            registry = PathRegistry.from_report(report)
+            issues = check_text(answer, registry, "agent answer")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Guardrail check skipped: %s", exc)
+            return answer
+        if not issues:
+            return answer
+
+        listed = "\n".join(f"- {line}" for line in issues_as_warnings(issues))
+        if emit:
+            emit(f"⚠ Guardrail found {len(issues)} unsupported statement(s); "
+                 "asking for a correction.")
+        payload = (f"## Problems found\n{listed}\n\n"
+                   f"## Analysis to correct\n{answer}\n")
+        try:
+            corrected = self.run_with_prompt(CORRECTION_SYSTEM_PROMPT, payload)
+        except Exception as exc:  # noqa: BLE001
+            if emit:
+                emit(f"   ⚠ correction call failed ({exc}); keeping the "
+                     "original answer with its warnings.")
+            return answer
+        corrected = (corrected or "").strip()
+        if not corrected:
+            return answer
+
+        try:
+            remaining = check_text(corrected, registry, "agent answer")
+        except Exception:  # noqa: BLE001
+            remaining = []
+        if emit:
+            if remaining:
+                emit(f"   {len(remaining)} issue(s) still present after the "
+                     "correction; they are flagged on the answer.")
+            else:
+                emit("   ✓ corrected answer passes the guardrail check.")
+        return corrected
 
     def run_agentic(self, report: Any, skill_manager: Any, ctx: Any,
                     on_event=None, max_iterations: int = 8,
@@ -682,9 +815,10 @@ class DebugAgent:
         # enabled skills locally, fold their structural findings into the
         # prompt, and let the CLI reason over that evidence in one shot.
         if self.config.backend == "cli":
-            return self._run_agentic_cli(report, skill_manager, ctx, emit,
-                                         session_id=session_id,
-                                         on_chunk=on_chunk)
+            answer = self._run_agentic_cli(report, skill_manager, ctx, emit,
+                                           session_id=session_id,
+                                           on_chunk=on_chunk)
+            return self.correct_guardrail_issues(answer, report, emit)
 
         enabled = skill_manager.enabled_skills()
         tools = [s.to_tool_schema() for s in enabled]
@@ -716,7 +850,8 @@ class DebugAgent:
 
             if not tool_calls:
                 emit("Model returned a final answer (no tool calls).")
-                return message.get("content") or ""
+                return self.correct_guardrail_issues(
+                    message.get("content") or "", report, emit)
 
             budget_hit = False
             for call in tool_calls:
@@ -774,11 +909,18 @@ class DebugAgent:
         emit("Reached max iterations — asking the model for a final answer.")
         messages.append({
             "role": "user",
-            "content": "Stop calling tools now and produce your final A-F "
-                       "diagnosis using the evidence gathered so far.",
+            "content": (
+                f"You have used all {max_iterations} investigation rounds "
+                "available, so this is your last turn and no further tools "
+                "can be called. Produce your final A-F diagnosis from the "
+                "evidence gathered so far. Where the investigation was cut "
+                "short before settling something, say so and say what you "
+                "would have checked next -- do not present a partial "
+                "investigation as a complete one."),
         })
         final = self._post_chat(messages, tools=None)
-        return final.get("content") or "(no final answer produced)"
+        return self.correct_guardrail_issues(
+            final.get("content") or "(no final answer produced)", report, emit)
 
     def chat(self, message: str, session_id: Optional[str] = None,
              history: Optional[List[dict]] = None, on_chunk=None) -> str:
@@ -824,8 +966,14 @@ class DebugAgent:
 
         enabled = skill_manager.enabled_skills()
         bulk = [s for s in enabled if not getattr(s, "on_demand", False)]
-        emit(f"CLI agentic run: executing {len(bulk)} enabled skill(s) "
-             "locally, then handing evidence to the Copilot CLI.")
+        # Be explicit that this is NOT the agentic loop. The model gets one
+        # pass over evidence chosen in advance and cannot ask for anything
+        # else, so a reader must not credit its answer as an investigation.
+        emit("⚠ NOT agentic: the investigative tools need the local MCP "
+             "server. Enable 'Agentic tools' (MCP), or expect a single pass.")
+        emit(f"Single-pass run: executing {len(bulk)} enabled skill(s) "
+             "locally, then handing the findings to the Copilot CLI. The "
+             "model cannot request further evidence.")
 
         evidence_blocks: List[str] = []
         for skill in bulk:
@@ -844,6 +992,12 @@ class DebugAgent:
         if evidence_blocks:
             payload += ("\n\n## Skill Tool Findings (executed locally)\n"
                         + "\n\n".join(evidence_blocks))
+        payload += (
+            "\n\n## Evidence is fixed for this run\n"
+            "You have no tools available and cannot request more evidence. "
+            "Everything you will get is above. Where it does not settle a "
+            "question, say so plainly and name what would settle it -- do "
+            "not fill the gap with a plausible answer.\n")
         emit("Calling GitHub Copilot CLI for the final diagnosis…")
         return self._call_cli(AGENTIC_SYSTEM_PROMPT, payload,
                               session_id=session_id, on_chunk=on_chunk)
@@ -864,7 +1018,8 @@ class DebugAgent:
             ctx.fault_results, ctx.constraints, ctx.netlist,
             adjacency=getattr(ctx, "adjacency", None),
             compare=getattr(ctx, "compare", None),
-            triage=getattr(ctx, "triage", None))
+            triage=getattr(ctx, "triage", None),
+            context=getattr(ctx, "context", None))
         ev_fd, ev_path = tempfile.mkstemp(prefix="atpg_evidence_", suffix=".json")
         with os.fdopen(ev_fd, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)

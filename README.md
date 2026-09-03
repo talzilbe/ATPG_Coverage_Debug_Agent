@@ -40,13 +40,19 @@ same deterministic tools.
   cell, test data register, unscanned flop or constrained pin responsible.
 - **Structural site profiling** &mdash; estimates why aborted faults were hard
   to test: low controllability, hard observability gap, observability
-  bottleneck, reconvergent complexity or sequential depth explosion.
+  bottleneck, reconvergent complexity or sequential depth explosion. A fan-out
+  cone too large to walk within the search bound is reported as such rather
+  than being given a verdict its partial measurements cannot support.
 - **Fix catalogue** &mdash; ranked, evidence-backed proposals with
   preconditions, caveats and copyable Tessent commands. The tool never runs
   them.
 - **Honesty guardrails** &mdash; every emitted hierarchy path must trace back
   to an input file, and no coverage gain is ever predicted without a measured
   re-run.
+- **Per-category fault dumps** &mdash; each category selected for
+  investigation gets its own CSV and JSON holding *every* fault in it, so a
+  bucket can be debugged, loaded into pandas, or read by the AI agent without
+  re-deriving which faults belong to it.
 
 **Core analysis**
 
@@ -275,6 +281,29 @@ set the **Copilot CLI** field to your `copilot` executable via **Browse…**
 6. Use the **Follow-up Chat** box to ask questions about the diagnosis — the
    conversation keeps the full analysis context.
 
+> With the Copilot CLI backend, **Agentic tools** must stay ticked for a real
+> investigation loop. Unticked, the enabled skills run once locally and the
+> model gets a single pass with no way to request further evidence — the run
+> log says so explicitly.
+
+### How the agent is kept honest
+
+- **Every answer is checked** — the first one and every follow-up — against the
+  same guardrails the offline analysis applies to itself: hierarchy paths must
+  trace back to an input file, and no coverage gain may be predicted without a
+  measured re-run.
+- **A flagged answer is corrected, not just annotated.** The model gets one
+  corrective round-trip; anything still unsupported afterwards is listed
+  beneath the answer. Annotating a fabricated path leaves the fabricated path
+  in front of you, and you may act on it.
+- **"Not determined" is an action it can take.** The `report_insufficient_evidence`
+  tool lets the agent declare that the evidence does not settle a question and
+  say what would settle it, rather than reaching for a plausible answer.
+- **It can check its own footing.** `report_context` reports how much of the
+  coverage loss actually mapped onto the netlist, how much sits on hard
+  constants, and whether you have waived faults — so a percentage computed
+  over mostly unmapped faults is not read at face value.
+
 > Data leaves your machine only when you explicitly configure a backend. With
 > the Copilot CLI, prompts go through GitHub Copilot's authenticated service;
 > for an internal-only setup, use the HTTP backend pointed at your own gateway.
@@ -305,6 +334,31 @@ code on fatal errors (`2` for bad inputs, `1` for unexpected failures).
 ```bash
 python -m atpg_coverage_debug_agent.cli --explain AU.TC
 ```
+
+### Per-category fault files
+
+Writing a Markdown report also writes a sidecar folder beside it holding the
+faults behind each selected category, and the report links to them:
+
+```
+report.md
+report_categories/
+  index.json      # manifest: every category, its files and its counts
+  AU.TC.csv       # all 27 AU.TC faults, same columns as --report-csv
+  AU.TC.json      # the same faults with full evidence + the category's
+                  # verdict, clusters, blocking sources and site profile
+  UO.AAB.csv
+  UO.AAB.json
+  ...
+```
+
+The CSV always holds every fault in the category. The JSON is capped at 5000
+faults &mdash; one constant driver can hold far more &mdash; and says so,
+pointing at its CSV for the remainder. The same folder is produced by
+**Export category faults&hellip;** on the GUI's *Triage &amp; Fix Plan* tab,
+and by **Save Report**, so a saved session is self-contained. The AI agent can
+read a category in-band with the `list_category_faults` tool instead of
+opening files.
 
 ---
 
@@ -447,6 +501,7 @@ atpg_coverage_debug_agent/
   reporting/
     markdown_report.py
     csv_report.py
+    category_dump.py   # one file per category, holding all of its faults
     html_report.py     # print-style document, also shown in the GUI
     session_report.py  # save / load a full analysis as JSON
   skills/              # deterministic and on-demand analysis skills
@@ -474,6 +529,11 @@ README.md
   reason about Boolean satisfiability, multi-driver resolution or
   mode-dependent gating the way ATPG does. Confirm them in a real tool session
   before acting on anything expensive.
+- **Reconvergence is only visible from above the fan-out.** It is counted where
+  paths re-merge, so a site *inside* a reconvergent cone sees one narrow path
+  and reads as an observability bottleneck instead. The two call for opposite
+  fixes &mdash; more abort budget helps a bottleneck and is wasted on
+  reconvergence &mdash; so every bottleneck verdict states this explicitly.
 - **Coverage percentages are fault-list ratios**, not the ATPG tool's
   test-coverage figure, which also accounts for fault collapsing and
   untestable-fault credit.

@@ -41,6 +41,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
     constraints: List[Any] = []
     adjacency: Dict[str, List[str]] = {}
     triage: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None
     load_error = ""
     if path and os.path.isfile(path):
         try:
@@ -49,6 +50,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
             faults, constraints, adjacency = investigate.rehydrate(evidence)
             compare = evidence.get("compare")
             triage = evidence.get("triage")
+            context = evidence.get("context")
         except Exception as exc:  # noqa: BLE001
             load_error = f"Failed to load evidence file '{path}': {exc}"
             compare = None
@@ -61,6 +63,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
         "adjacency": adjacency,
         "compare": compare,
         "triage": triage,
+        "context": context,
         "load_error": load_error,
         "initialized": False,
     }
@@ -146,6 +149,7 @@ def handle_message(msg: Dict[str, Any],
                 adjacency=state["adjacency"],
                 compare=state.get("compare"),
                 triage=state.get("triage"),
+                context=state.get("context"),
             )
         except Exception as exc:  # noqa: BLE001
             return _result(msg_id, {

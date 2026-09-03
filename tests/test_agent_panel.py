@@ -102,6 +102,44 @@ def test_chat_token_streaming_rebuilds_transcript(panel_with_report):
     assert panel._chat_turns[-1][0] == "Agent"
 
 
+# ---------------------------------------------------------------------------
+# Guardrail auditing
+# ---------------------------------------------------------------------------
+def test_the_first_answer_is_audited(panel_with_report):
+    panel, _rep = panel_with_report
+    panel._on_finished("This change will recover 12% coverage.")
+    assert "Guardrail check" in panel.response_view.toPlainText()
+
+
+def test_follow_up_answers_are_audited_too(panel_with_report):
+    """A follow-up is the likelier place for an unmeasured claim.
+
+    "So how much would that recover?" is the natural next question, so an
+    unaudited chat reply is exactly where a fabricated percentage lands.
+    """
+    panel, _rep = panel_with_report
+    panel._chat_backend = "cli"
+    panel._chat_turns = []
+    panel.chat_view.clear()
+    panel._append_chat("You", "how much would that recover?")
+    panel._chat_stream_buf = ""
+
+    panel._on_chat_finished("It will recover 12% coverage.")
+
+    assert "Guardrail check" in panel.chat_view.toPlainText()
+    assert "Guardrail check" in panel._chat_turns[-1][1]
+
+
+def test_a_clean_follow_up_gets_no_notice(panel_with_report):
+    panel, _rep = panel_with_report
+    panel._chat_backend = "cli"
+    panel._chat_turns = []
+    panel.chat_view.clear()
+    panel._chat_stream_buf = ""
+    panel._on_chat_finished("The constraint on pi_hold blocks activation.")
+    assert "Guardrail check" not in panel.chat_view.toPlainText()
+
+
 def test_chat_transcript_is_left_to_right_and_one_block_per_turn(
         panel_with_report, qapp):
     from PySide6.QtCore import Qt

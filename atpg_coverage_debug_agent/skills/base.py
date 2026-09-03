@@ -101,6 +101,10 @@ class AnalysisContext:
     #: Optional coverage-triage payload (derived statistics, selected
     #: categories and ranked fix proposals) for the triage tools.
     triage: Any = None
+    #: Optional evidence-quality context (mapping coverage, scan split,
+    #: repeated patterns, parser warnings and analyst waivers) that qualifies
+    #: how far the other answers can be trusted.
+    context: Any = None
 
 
 # ---------------------------------------------------------------------------

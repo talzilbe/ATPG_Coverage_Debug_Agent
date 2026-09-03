@@ -16,6 +16,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from . import regression
+from ..models import VerdictConfidence
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,22 @@ from . import regression
 def _enum_value(v: Any) -> Any:
     """Return ``.value`` for enums, else the object unchanged."""
     return getattr(v, "value", v)
+
+
+def dotted_class_of(fr: Any) -> str:
+    """Return the dotted category id (``AU.TC``) of a fault analysis result.
+
+    Reads ``FaultRecord.dotted_class`` when present and falls back to the bare
+    fault class, so it works for both live records and the lightweight objects
+    :func:`rehydrate` builds from a serialised payload.
+    """
+    fault = getattr(fr, "fault", None)
+    if fault is None:
+        return ""
+    dotted = getattr(fault, "dotted_class", None)
+    if dotted:
+        return str(dotted)
+    return str(_enum_value(getattr(fault, "fault_class", "")) or "")
 
 
 def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
@@ -40,6 +57,10 @@ def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "fault_object": fr.fault.fault_object,
         "fault_class": _enum_value(fr.fault.fault_class),
+        # The ATPG tool's own dotted root-cause label (AU.TC, UO.AAB, ...).
+        # This is the key the coverage triage groups on, so it must survive
+        # the round-trip into the out-of-process MCP server.
+        "dotted_class": dotted_class_of(fr),
         "instance": mapping.instance_name or None,
         "cell_type": mapping.cell_type or None,
         "confidence": _enum_value(mapping.confidence),
@@ -66,6 +87,7 @@ def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
         row.update({
             "normalized_object": fr.fault.normalized_object,
             "fault_type": fr.fault.fault_type,
+            "raw_class_token": getattr(fr.fault, "raw_class_token", "") or "",
             "line_number": fr.fault.line_number,
             "matched_net": mapping.matched_net,
             "mapping_candidates": list(mapping.candidates or []),
@@ -228,6 +250,67 @@ def list_faults(fault_results: Any, fault_class: Optional[str] = None,
             "scan_boundary_only": scan_boundary_only,
         },
     }
+
+
+def list_category_faults(fault_results: Any, subclass: str,
+                         limit: int = 50, offset: int = 0,
+                         full: bool = False) -> Dict[str, Any]:
+    """Return every analysed fault in one dotted coverage-loss category.
+
+    The triage names the categories worth debugging but reports only their
+    counts. This walks the other way: given a category id, it returns the
+    faults themselves, paged, so a whole bucket can be read without guessing
+    at an instance substring.
+
+    Args:
+        fault_results: The analysed coverage-loss faults.
+        subclass: A dotted category id such as ``AU.TC``, or a bare family
+            such as ``AU``. Matching is exact and case-insensitive; it is not
+            a substring match, so ``AU`` does not pull in ``AU.TC``.
+        limit: Max rows in this page.
+        offset: How many matches to skip, for paging through a large category.
+        full: Include the heavier per-fault evidence instead of compact rows.
+
+    Returns:
+        The page plus the total match count, or an ``error`` when *subclass*
+        is missing. A category that matches nothing returns an empty page with
+        the ids that do exist, rather than a bare zero.
+    """
+    wanted = (subclass or "").strip().upper()
+    if not wanted:
+        return {"error": ("A dotted 'subclass' is required, for example "
+                          "'AU.TC'. Call coverage_triage to see which "
+                          "categories this run has.")}
+
+    results = list(fault_results or [])
+    matched = [fr for fr in results
+               if dotted_class_of(fr).upper() == wanted]
+    if not matched:
+        available = sorted({dotted_class_of(fr) for fr in results
+                            if dotted_class_of(fr)})
+        return {
+            "subclass": subclass,
+            "total_matched": 0,
+            "returned": 0,
+            "faults": [],
+            "available_subclasses": available,
+            "note": ("No analysed fault carries this category id. Matching is "
+                     "exact, so 'AU' and 'AU.TC' are different categories."),
+        }
+
+    start = max(0, int(offset))
+    page = matched[start: start + max(1, int(limit))]
+    payload: Dict[str, Any] = {
+        "subclass": subclass,
+        "total_matched": len(matched),
+        "offset": start,
+        "returned": len(page),
+        "faults": [serialize_fault_result(fr, full=bool(full)) for fr in page],
+    }
+    if start + len(page) < len(matched):
+        payload["more"] = True
+        payload["next_offset"] = start + len(page)
+    return payload
 
 
 def get_fault_detail(fault_results: Any, fault: str,
@@ -537,7 +620,8 @@ def export_evidence(fault_results: Any, constraints: Any,
                     netlist: Any,
                     adjacency: Optional[Dict[str, List[str]]] = None,
                     compare: Optional[Dict[str, Any]] = None,
-                    triage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    triage: Optional[Dict[str, Any]] = None,
+                    context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Serialise everything the investigative tools need into a plain dict.
 
     The result is JSON-serialisable so it can be written to a file and read by a
@@ -560,6 +644,8 @@ def export_evidence(fault_results: Any, constraints: Any,
         evidence["compare"] = compare
     if triage:
         evidence["triage"] = triage
+    if context:
+        evidence["context"] = context
     return evidence
 
 
@@ -605,6 +691,127 @@ _NO_TRIAGE = {
     "error": ("No coverage triage available. Run an analysis first — triage is "
               "derived from the fault list during the analysis pass.")
 }
+
+
+def serialize_context(report: Any) -> Dict[str, Any]:
+    """Serialise the evidence-quality context the tools expose.
+
+    These numbers already appear in the report, but the model could only see
+    the truncated sample folded into its prompt. Everything here qualifies how
+    far the other tools' answers can be trusted, so it needs to be queryable.
+
+    Args:
+        report: An ``AnalysisReport``, or ``None``.
+
+    Returns:
+        A JSON-serialisable dict, empty when there is nothing to report.
+    """
+    if report is None:
+        return {}
+    summary = getattr(report, "summary", None)
+    payload: Dict[str, Any] = {}
+
+    if summary is not None:
+        mapped = getattr(summary, "mapped_count", 0) or 0
+        unmapped = getattr(summary, "unmapped_count", 0) or 0
+        total_loss = mapped + unmapped
+        payload["evidence"] = {
+            "coverage_loss_faults": getattr(summary, "coverage_loss_count", 0),
+            "mapped_onto_netlist": mapped,
+            "never_mapped": unmapped,
+            "mapped_share": (round(mapped / total_loss, 4)
+                             if total_loss else None),
+            "scan_status": dict(
+                getattr(summary, "scan_evidence_counts", {}) or {}),
+            "held_at_a_hard_constant": getattr(
+                summary, "tied_constant_count", 0),
+            "actionable_loss": getattr(summary, "actionable_loss_count", 0),
+            "why_unmapped": dict(
+                getattr(summary, "unresolved_causes", {}) or {}),
+            "note": ("An unmapped fault has UNKNOWN connectivity, not zero. "
+                     "Nothing structural may be concluded from one. Faults "
+                     "held at a hard constant are undetectable by design and "
+                     "are excluded from 'actionable_loss'."),
+        }
+
+    payload["patterns"] = [
+        {"kind": g.kind, "key": g.key, "count": g.count,
+         "sample_faults": list(g.sample_faults)}
+        for g in (getattr(report, "pattern_groups", None) or [])
+    ]
+    payload["warnings"] = list(getattr(report, "warnings", None) or [])
+
+    edits = getattr(report, "edits", None) or {}
+    if edits:
+        payload["waivers"] = {
+            "excluded_classes": list(edits.get("excluded_classes", [])),
+            "excluded_subtypes": list(edits.get("excluded_subtypes", [])),
+            "excluded_ids": list(edits.get("excluded_ids", [])),
+            "removed_count": edits.get("removed_count", 0),
+            "note": edits.get("note", ""),
+            "caveat": ("An analyst removed these faults from the totals. "
+                       "Every count in this session is AFTER that removal."),
+        }
+    return payload
+
+
+def report_context(context: Optional[Dict[str, Any]],
+                   section: Optional[str] = None,
+                   limit: int = 20) -> Dict[str, Any]:
+    """Return the evidence-quality context, optionally one section of it."""
+    if not context:
+        return {"error": ("No report context available. Run an analysis "
+                          "first.")}
+    wanted = (section or "").strip().lower()
+    known = ("evidence", "patterns", "warnings", "waivers")
+    if wanted and wanted not in known:
+        return {"error": f"Unknown section '{section}'. Use one of: "
+                         + ", ".join(known) + ", or leave it empty for all."}
+
+    cap = max(1, int(limit))
+    out: Dict[str, Any] = {}
+    for key in known:
+        if wanted and key != wanted:
+            continue
+        value = context.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            out[key] = value[:cap]
+            if len(value) > cap:
+                out[f"{key}_total"] = len(value)
+                out[f"{key}_truncated"] = True
+        else:
+            out[key] = value
+    if not out:
+        return {"note": ("Nothing recorded for that section in this run."),
+                "sections_available": [k for k in known if context.get(k)]}
+    return out
+
+
+def report_insufficient_evidence(question: str, missing: str = "",
+                                 would_settle_it: str = "") -> Dict[str, Any]:
+    """Record that the evidence does not settle *question*.
+
+    This exists so that "not determined" is a first-class action with its own
+    tool call, rather than something the model has to phrase its way into
+    against the pull of sounding helpful.
+    """
+    question = (question or "").strip()
+    if not question:
+        return {"error": "State the question you cannot answer."}
+    return {
+        "verdict": "insufficient_evidence",
+        "confidence": VerdictConfidence.INSUFFICIENT.value,
+        "question": question,
+        "missing": (missing or "").strip(),
+        "would_settle_it": (would_settle_it or "").strip(),
+        "acknowledged": (
+            "Recorded. Report this as the answer. Reporting that the "
+            "available evidence does not support a conclusion is a correct "
+            "result, and is preferred over a confident guess. Do not follow "
+            "it with a speculative root cause."),
+    }
 
 
 def coverage_triage(triage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -819,6 +1026,25 @@ def _scan_state(d: Dict[str, Any]) -> str:
     return "yes" if raw else "no"
 
 
+def _rehydrated_dotted_class(d: Dict[str, Any]) -> str:
+    """Recover a serialised fault row's dotted category id.
+
+    Payloads written before this field existed are reconstructed from the
+    class token when one is present, so an older evidence file still groups
+    correctly instead of silently matching nothing.
+    """
+    dotted = str(d.get("dotted_class") or "").strip()
+    if dotted:
+        return dotted
+    base = str(d.get("fault_class") or "").strip()
+    token = str(d.get("raw_class_token") or "").strip()
+    if base and "." in token:
+        sub = token.split(".", 1)[1].strip().upper()
+        if sub:
+            return f"{base}.{sub}"
+    return base
+
+
 def rehydrate(evidence: Dict[str, Any]):
     """Rebuild attribute objects from an ``export_evidence`` dict.
 
@@ -832,6 +1058,8 @@ def rehydrate(evidence: Dict[str, Any]):
             fault_object=d.get("fault_object"),
             normalized_object=d.get("normalized_object", d.get("fault_object")),
             fault_class=d.get("fault_class"),
+            dotted_class=_rehydrated_dotted_class(d),
+            raw_class_token=d.get("raw_class_token", ""),
             fault_type=d.get("fault_type"),
             line_number=d.get("line_number"),
         )
@@ -939,6 +1167,24 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                       "description": "fault object / instance substring"},
             "max_matches": {"type": "int", "default": 5,
                             "description": "max faults to detail"},
+        },
+    },
+    "list_category_faults": {
+        "description": (
+            "List every analysed fault in ONE coverage-loss category, by its "
+            "dotted id (AU.TC, UO.AAB, ...). Use this to read a whole triage "
+            "bucket: coverage_triage names the categories and gives counts, "
+            "this returns the faults behind a count. Matching is exact, so "
+            "'AU' and 'AU.TC' are different categories. Page with offset."),
+        "params": {
+            "subclass": {"type": "str",
+                         "description": "dotted category id, e.g. 'AU.TC'"},
+            "limit": {"type": "int", "default": 50,
+                      "description": "max rows in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "matches to skip, for paging"},
+            "full": {"type": "bool", "default": False,
+                     "description": "include full per-fault evidence"},
         },
     },
     "why_blocked": {
@@ -1111,6 +1357,40 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                                      "and unmeasured claims")},
         },
     },
+    "report_context": {
+        "description": (
+            "The state of the evidence itself: how many faults mapped onto "
+            "the netlist and how many did not (and why), the scan-status "
+            "split, how much of the loss sits on hard constants, the repeated "
+            "structural patterns, the parser warnings, and any analyst "
+            "waivers in force. Check this BEFORE trusting a count -- a figure "
+            "computed over mostly unmapped faults means little, and a waiver "
+            "means some faults were deliberately removed."),
+        "params": {
+            "section": {"type": "str", "default": "",
+                        "description": ("evidence | patterns | warnings | "
+                                        "waivers; empty for all")},
+            "limit": {"type": "int", "default": 20,
+                      "description": "max rows per list"},
+        },
+    },
+    "report_insufficient_evidence": {
+        "description": (
+            "Declare that the available evidence does NOT settle the "
+            "question. Use this instead of producing a plausible answer you "
+            "cannot support: an honest 'not determined' is a correct result "
+            "here, and a confident wrong root cause costs an engineer days. "
+            "Say what is missing and what would settle it."),
+        "params": {
+            "question": {"type": "str",
+                         "description": "the question you cannot answer"},
+            "missing": {"type": "str", "default": "",
+                        "description": "what the evidence does not show"},
+            "would_settle_it": {"type": "str", "default": "",
+                                "description": ("the specific artefact, run "
+                                                "or measurement that would")},
+        },
+    },
 }
 
 
@@ -1140,7 +1420,8 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              constraints: Any, netlist: Any,
              adjacency: Optional[Dict[str, List[str]]] = None,
              compare: Optional[Dict[str, Any]] = None,
-             triage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             triage: Optional[Dict[str, Any]] = None,
+             context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
@@ -1151,6 +1432,16 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
     provided the coverage-triage tools become available.
     """
     args = dict(args or {})
+    if name == "report_insufficient_evidence":
+        return report_insufficient_evidence(
+            question=str(args.get("question", "") or ""),
+            missing=str(args.get("missing", "") or ""),
+            would_settle_it=str(args.get("would_settle_it", "") or ""))
+    if name == "report_context":
+        return report_context(
+            context,
+            section=str(args.get("section", "") or "") or None,
+            limit=int(args.get("limit", 20) or 20))
     if name == "scan_status":
         return scan_status(netlist, str(args.get("target", "")))
     if name == "diagnose_unresolved":
@@ -1198,6 +1489,14 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
         return get_fault_detail(
             fault_results, fault=str(args.get("fault", "")),
             max_matches=int(args.get("max_matches", 5) or 5))
+    if name == "list_category_faults":
+        return list_category_faults(
+            fault_results,
+            subclass=str(args.get("subclass", "") or ""),
+            limit=int(args.get("limit", 50) or 50),
+            offset=int(args.get("offset", 0) or 0),
+            full=bool(args.get("full", False)),
+        )
     if name == "why_blocked":
         return why_blocked(fault_results, fault=str(args.get("fault", "")))
     if name == "list_constraints":

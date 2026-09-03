@@ -83,6 +83,20 @@ def test_first_category_is_selected_so_the_panel_is_never_blank(panel):
     assert selected in panel.category_detail.toPlainText()
 
 
+def test_export_button_is_enabled_only_with_categories(panel, qapp):
+    assert panel.export_categories_btn.isEnabled()
+    panel.clear()
+    assert not panel.export_categories_btn.isEnabled()
+
+
+def test_export_button_asks_the_main_window_rather_than_writing_files(panel):
+    """The panel owns no file IO; it only raises the request."""
+    seen = []
+    panel.export_categories_requested.connect(lambda: seen.append(True))
+    panel.export_categories_btn.click()
+    assert seen == [True]
+
+
 # ---------------------------------------------------------------------------
 # Clusters
 # ---------------------------------------------------------------------------

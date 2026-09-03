@@ -387,8 +387,10 @@ class AgentPanel(QWidget):
             "In agentic mode, expose the investigative tools (list_faults, "
             "get_fault_detail, why_blocked, list_constraints, trace_path) to "
             "the Copilot CLI via a local MCP server so the model calls them "
-            "itself and iterates. When off, the enabled skills are run locally "
-            "and their findings are folded into a single prompt.")
+            "itself and iterates.\n\n"
+            "UNCHECKED IS NOT AGENTIC: the enabled skills run once locally, "
+            "their findings are folded into a single prompt, and the model "
+            "gets one pass with no way to ask for anything further.")
         self.cli_mcp_check.toggled.connect(self._notify_config_changed)
         form.addRow("Agentic tools:", self.cli_mcp_check)
 
@@ -437,12 +439,14 @@ class AgentPanel(QWidget):
             "How many coverage-loss fault rows are written into the prompt.\n"
             "Each row costs roughly 26 tokens, so a large design cannot be "
             "sent whole.\n"
-            "This caps the per-fault TABLE only: the summary, the evidence "
-            "basis and the\ntriage are computed over every fault and are "
-            "always included in full.\n"
+            "This caps the per-fault TABLE only. The summary, the evidence "
+            "basis and the\ntriage are computed over every fault and are not "
+            "governed by this knob,\nso it does not bound the whole prompt "
+            "(the category census has its own cap).\n"
             "In Agentic mode the agent can fetch any fault it wants on demand "
-            "through\nthe list_faults / get_fault_detail tools, so the cap "
-            "does not hide evidence from it.")
+            "through\nthe list_faults / list_category_faults / "
+            "get_fault_detail tools, so the cap\ndoes not hide evidence from "
+            "it.")
         self.maxfaults_spin.valueChanged.connect(self._notify_config_changed)
         self.maxfaults_spin.valueChanged.connect(self._update_maxfaults_hint)
         knobs.addWidget(QLabel("Fault rows in prompt:"))
@@ -1036,11 +1040,16 @@ class AgentPanel(QWidget):
         if checked:
             n = (len(self._skill_manager.enabled_skills())
                  if self._skill_manager else 0)
-            self.status_label.setText(
-                f"Agentic mode ON — the agent uses {n} enabled skill(s). With "
-                "the HTTP backend the model calls them as tools; with the "
-                "Copilot CLI backend they run locally and their findings are "
-                "handed to the CLI.")
+            if (self._current_backend() == "cli"
+                    and not self.cli_mcp_check.isChecked()):
+                self.status_label.setText(
+                    f"Agentic mode ON, but 'Agentic tools' is off — the {n} "
+                    "enabled skill(s) run once locally and the CLI gets a "
+                    "single pass. It cannot investigate further.")
+            else:
+                self.status_label.setText(
+                    f"Agentic mode ON — the agent uses {n} enabled skill(s) "
+                    "and calls them as tools, iterating as needed.")
         else:
             self.status_label.setText("Agentic mode OFF — single-shot diagnosis.")
 
@@ -1148,6 +1157,7 @@ class AgentPanel(QWidget):
                 getattr(r, "statistics", None),
                 getattr(r, "selected_categories", None),
                 getattr(r, "recommendations", None)),
+            context=investigate.serialize_context(r),
         )
 
     def on_run(self) -> None:
@@ -1614,6 +1624,10 @@ class AgentPanel(QWidget):
     def _on_chat_finished(self, text: str) -> None:
         elapsed = self._stop_busy()
         final = text or getattr(self, "_chat_stream_buf", "")
+        # Follow-up answers get the same guardrail check as the first one.
+        # They are in fact the likelier place for an unmeasured claim, since
+        # "so how much would that recover?" is a natural follow-up question.
+        final = self._audit_answer(final)
         self._chat_turns.append(("Agent", (final or "").strip()))
         if self._chat_backend != "cli":
             self._chat_messages.append({"role": "assistant", "content": final})

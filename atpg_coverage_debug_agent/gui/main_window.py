@@ -35,6 +35,7 @@ from ..config.settings import AppSettings
 from ..models import AnalysisReport, FaultAnalysisResult
 from ..reporting.csv_report import write_csv
 from ..reporting.html_report import build_html_report
+from ..reporting.category_dump import dump_dir_for, write_category_dumps
 from ..reporting.markdown_report import write_markdown
 from ..reporting.session_report import load_report, save_report
 from ..skills.manager import SkillManager
@@ -147,10 +148,15 @@ derived name. The saved file is a full report you can re-open with
 <tr><td><b class="k">Export Markdown / Export CSV</b></td>
     <td>Save the report as Markdown &mdash; including the coverage triage,
     hierarchy hotspots, blocking sources and the ranked fix plan &mdash; or
-    the coverage-loss table as CSV.</td></tr>
+    the coverage-loss table as CSV. Exporting Markdown also writes a
+    <code>&lt;name&gt;_categories</code> folder beside it holding every fault
+    of each selected category, and links to it.</td></tr>
 <tr><td><b class="k">Save Report / Load Report</b></td>
     <td>Save the full analysis (including the AI investigation) to JSON and
-    reload it later &mdash; no need to re-run Analyze.</td></tr>
+    reload it later &mdash; no need to re-run Analyze. The per-category fault
+    files are written into a folder beside the JSON, so the saved session is
+    self-contained and can be handed to someone else. A reloaded session
+    remembers which files it wrote.</td></tr>
 <tr><td><b class="k">Compare Report</b></td>
     <td>Load a previous (baseline) JSON report and diff it against the current
     one: <b>regressed</b> (new loss), <b>fixed</b>, and <b>changed</b> faults.
@@ -217,7 +223,12 @@ carry different weight &mdash; see section&nbsp;5 for how each is derived.</p>
       <code>partial</code> / <code>false</code>) with a confidence level.
       Select a row to see what the subclass means, the reasoning behind the
       verdict, which structure is blocking the faults, and why they were hard
-      to test.</li>
+      to test. <b>Export category faults&hellip;</b> writes one CSV and one
+      JSON per category into a folder you choose, each holding every fault in
+      that category &mdash; the CSV for spreadsheet or pandas triage, the JSON
+      for the AI agent. The Markdown and HTML reports link to the same files,
+      and the agent can read a category in-band with
+      <code>list_category_faults</code> instead.</li>
   <li class="step"><b>Where the loss is</b> &mdash; hierarchy clustering. A
       dominant prefix tells you <i>where</i> to look; it is never a root
       cause. Sample paths are quoted <b>verbatim</b>, so they can be pasted
@@ -360,7 +371,11 @@ answers:</p>
       rather than presented as evidence.</li>
 </ul>
 <p>Violations appear in <b>Logs / Warnings</b>, and beneath an agent answer as
-a <i>Guardrail check</i> note.</p>
+a <i>Guardrail check</i> note. When an agent answer trips either check, the
+model is first asked <b>once</b> to correct it &mdash; annotating a fabricated
+path still leaves the fabricated path in front of you, and you may act on it.
+Anything still flagged after that correction is shown with the answer. Both the
+first answer and every follow-up reply are checked.</p>
 
 <h3>What this analysis cannot do</h3>
 <p>It is a structural analyser, not a simulator. Cone tracing cannot reason
@@ -432,6 +447,13 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           analysis loaded.</td></tr>
       <tr><td><code>list_clusters</code></td><td>Where in the hierarchy each
           category concentrates, with verbatim samples.</td></tr>
+      <tr><td><code>list_category_faults</code></td><td>Every fault behind one
+          category&rsquo;s count, by its dotted id
+          (<code>AU.TC</code>, <code>UO.AAB</code>, &hellip;). Reads a whole
+          triage bucket without guessing at an instance substring. Matching is
+          exact, so <code>AU</code> and <code>AU.TC</code> are different
+          categories; page through a large one with <code>offset</code>.
+          </td></tr>
       <tr><td><code>list_blocking_sources</code></td><td>Which constant driver
           or constrained signal is blocking the faults.</td></tr>
       <tr><td><code>profile_fault_sites</code></td><td>Why aborted faults were
@@ -455,6 +477,19 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           this.</td></tr>
       <tr><td><code>verify_paths</code></td><td>Whether a path is safe to quote
           before putting it in an answer.</td></tr>
+      <tr><td><code>report_context</code></td><td>The state of the evidence
+          itself: how much of the loss actually mapped onto the netlist (and
+          why the rest did not), the scan-status split, how much sits on hard
+          constants, the repeated patterns, the parser warnings, and any
+          waivers you have applied. A percentage computed over mostly
+          unmapped faults does not mean what it looks like, so the agent is
+          told to check this before trusting a count.</td></tr>
+      <tr><td><code>report_insufficient_evidence</code></td><td>Lets the agent
+          declare that the evidence does <i>not</i> settle a question, and say
+          what would. This exists so &ldquo;not determined&rdquo; is a real
+          action it can take rather than something it has to argue its way
+          into against the pull of sounding helpful &mdash; a confident wrong
+          root cause costs far more than an honest gap.</td></tr>
       <tr><td><code>list_faults</code>, <code>get_fault_detail</code>,
           <code>why_blocked</code>, <code>list_constraints</code>,
           <code>trace_path</code>, <code>suggest_test_points</code></td>
@@ -483,9 +518,16 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
     agent's answer.</td></tr>
 </table>
 <p>Every answer is also checked automatically against the guardrails described
-in section&nbsp;5. If the model shortens a hierarchy path, quotes one that is
-not in your inputs, or predicts a coverage gain, a <b>Guardrail check</b> note
-is appended beneath the answer. Treat anything listed there as unverified.</p>
+in section&nbsp;5 &mdash; the first answer and every follow-up alike. If the
+model shortens a hierarchy path, quotes one that is not in your inputs, or
+predicts a coverage gain, it is asked once to correct the answer; anything
+still unsupported afterwards appears as a <b>Guardrail check</b> note beneath
+it. Treat anything listed there as unverified.</p>
+<p><b>Agentic mode needs the tools.</b> With the Copilot CLI backend, leaving
+<b>Agentic tools</b> unticked is <i>not</i> an agentic run: the enabled skills
+execute once locally, their findings are folded into a single prompt, and the
+model gets one pass with no way to ask for anything further. Tick it (or use
+the HTTP backend) for a real investigation loop.</p>
 <p><b>What the agent will and will not say.</b> It is told that you are already
 looking at the report, so it does not restate fault counts, hotspots, the
 per-fault table or the fix plan &mdash; those are computed exactly and
@@ -706,7 +748,9 @@ class MainWindow(QMainWindow):
         self.save_report_btn = QPushButton("Save Report")
         self.save_report_btn.setToolTip(
             "Save the full analysis to a JSON file you can reload later "
-            "without re-running Analyze.")
+            "without re-running Analyze. The per-category fault files are "
+            "written into a folder beside it, so the whole session can be "
+            "handed to someone else.")
         self.save_report_btn.clicked.connect(self.on_save_report)
         self.load_report_btn = QPushButton("Load Report")
         self.load_report_btn.setToolTip(
@@ -767,6 +811,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_summary_tab(), "Summary")
         self.triage_panel = TriagePanel()
         self.triage_panel.fault_referenced.connect(self._focus_fault_in_table)
+        self.triage_panel.export_categories_requested.connect(
+            self.on_export_category_faults)
         self.tabs.addTab(self.triage_panel, "Triage & Fix Plan")
         self.tabs.addTab(self._build_table_tab(), "Coverage Loss Table")
         # The "Repeated Patterns" tab is intentionally not shown; the backing
@@ -1300,6 +1346,27 @@ class MainWindow(QMainWindow):
         self._populate_logs(report)
 
     def _populate_summary(self, report: AnalysisReport) -> None:
+        try:
+            html = self._build_report_html(report)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Failed to build HTML report: %s", exc)
+            self._set_summary_html(
+                f"<body><h2>Report generation failed</h2><pre>{exc}</pre></body>")
+            return
+        self._report_html = html
+        self._set_summary_html(html)
+        self.open_browser_btn.setEnabled(True)
+
+    def _build_report_html(self, report: AnalysisReport,
+                           category_dumps=None) -> str:
+        """Render the HTML report for *report*.
+
+        Args:
+            report: The report to render.
+            category_dumps: Per-category fault dumps to link from the triage
+                section. Only pass these when the dump files sit beside the
+                HTML being written, otherwise the links would be dead.
+        """
         # Prefer the current file pickers; fall back to source metadata stored
         # in the report (so a loaded report still shows its cover header).
         sources = getattr(report, "sources", None) or {}
@@ -1325,23 +1392,15 @@ class MainWindow(QMainWindow):
         if edits.get("note"):
             note_parts.append(edits["note"])
         analyst_note = "\n".join(note_parts) if note_parts else None
-        try:
-            html = build_html_report(
-                report,
-                design_name=design,
-                netlist_path=netlist or None,
-                faults_path=faults or None,
-                constraints_path=constraints or None,
-                analyst_note=analyst_note,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("Failed to build HTML report: %s", exc)
-            self._set_summary_html(
-                f"<body><h2>Report generation failed</h2><pre>{exc}</pre></body>")
-            return
-        self._report_html = html
-        self._set_summary_html(html)
-        self.open_browser_btn.setEnabled(True)
+        return build_html_report(
+            report,
+            design_name=design,
+            netlist_path=netlist or None,
+            faults_path=faults or None,
+            constraints_path=constraints or None,
+            analyst_note=analyst_note,
+            category_dumps=category_dumps,
+        )
 
     def _populate_table(self, report: AnalysisReport) -> None:
         self.table.setSortingEnabled(False)
@@ -1490,8 +1549,18 @@ class MainWindow(QMainWindow):
             else:
                 serve_dir = tempfile.mkdtemp(prefix="atpg_report_")
             path = os.path.join(serve_dir, "atpg_coverage_report.html")
+            # Write the per-category fault files alongside the HTML first, so
+            # the links the report emits actually resolve for the reader.
+            html = self._report_html
+            if self._report is not None:
+                try:
+                    dumps = write_category_dumps(self._report, path)
+                    if dumps:
+                        html = self._build_report_html(self._report, dumps)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Category dumps not written: %s", exc)
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self._report_html)
+                f.write(html)
         except OSError as exc:
             self._error(f"Could not write the HTML report:\n{exc}")
             return
@@ -1633,6 +1702,35 @@ class MainWindow(QMainWindow):
             self._error(f"Could not write Markdown report:\n{exc}")
             return
         self.statusBar().showMessage(f"Markdown report saved: {path}")
+
+    def on_export_category_faults(self) -> None:
+        """Write one CSV and one JSON per selected category into a folder.
+
+        Operates on the active partition only, like the other exports.
+        """
+        if not self._report:
+            return
+        if not (getattr(self._report, "selected_categories", None) or []):
+            self._error(
+                "This report has no coverage-loss categories selected for "
+                "investigation, so there is nothing to export.")
+            return
+        outdir = self.outdir_picker.path()
+        start = outdir if outdir and os.path.isdir(outdir) else ""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Choose a folder for the category fault files", start)
+        if not directory:
+            return
+        base = os.path.join(directory, "atpg_report")
+        try:
+            dumps = write_category_dumps(self._report, base)
+        except OSError as exc:
+            self._error(f"Could not write the category fault files:\n{exc}")
+            return
+        files = sum(1 for d in dumps for n in (d.csv_name, d.json_name) if n)
+        self.statusBar().showMessage(
+            f"{len(dumps)} category file set(s), {files} files, written to "
+            f"{dump_dir_for(base)}")
 
     def on_export_csv(self) -> None:
         if not self._report:

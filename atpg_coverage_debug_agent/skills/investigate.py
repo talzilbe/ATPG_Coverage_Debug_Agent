@@ -56,6 +56,7 @@ class _InvestigativeSkill(SkillBase):
                 adjacency=getattr(ctx, "adjacency", None),
                 compare=getattr(ctx, "compare", None),
                 triage=getattr(ctx, "triage", None),
+                context=getattr(ctx, "context", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -137,6 +138,25 @@ class ListFaultsSkill(_InvestigativeSkill):
         for row in data.get("faults", [])[:10]:
             result.add_finding(
                 title=f"{row['fault_class']} {row['fault_object']}",
+                description=(f"instance={row.get('instance')} "
+                            f"root_cause={row.get('root_cause')}"),
+                affected_objects=[row.get("instance") or row["fault_object"]],
+                confidence=row.get("confidence", "medium"),
+            )
+
+
+@register
+class ListCategoryFaultsSkill(_InvestigativeSkill):
+    skill_id = "list_category_faults"
+    tool_name = "list_category_faults"
+    display_name = "List Category Faults (query)"
+    description = investigate.TOOL_SPECS["list_category_faults"]["description"]
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for row in data.get("faults", [])[:10]:
+            result.add_finding(
+                title=f"{row.get('dotted_class') or row['fault_class']} "
+                      f"{row['fault_object']}",
                 description=(f"instance={row.get('instance')} "
                             f"root_cause={row.get('root_cause')}"),
                 affected_objects=[row.get("instance") or row["fault_object"]],
@@ -433,6 +453,67 @@ class ProfileFaultSitesSkill(_InvestigativeSkill):
                 + [entry.get("caveat", "")],
                 confidence="high" if entry.get("consensus") else "medium",
                 recommendation=(top or {}).get("meaning", ""))
+
+
+@register
+class ReportContextSkill(_InvestigativeSkill):
+    skill_id = "report_context"
+    tool_name = "report_context"
+    display_name = "Report Context (query)"
+    description = investigate.TOOL_SPECS["report_context"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        evidence = data.get("evidence") or {}
+        share = evidence.get("mapped_share")
+        if share is None:
+            return "report_context: returned."
+        return (f"report_context: {share:.0%} of coverage-loss faults mapped "
+                f"onto the netlist.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        evidence = data.get("evidence") or {}
+        if evidence.get("never_mapped"):
+            result.add_finding(
+                title=(f"{evidence['never_mapped']} coverage-loss fault(s) "
+                       "never mapped onto the netlist"),
+                description=("Their connectivity is unknown, not zero. Any "
+                             "figure computed over them is weaker than it "
+                             "looks."),
+                evidence=[f"{cause}: {n}" for cause, n
+                          in (evidence.get("why_unmapped") or {}).items()][:6],
+                confidence="high")
+        waivers = data.get("waivers")
+        if waivers:
+            result.add_finding(
+                title=(f"An analyst waived {waivers.get('removed_count', 0)} "
+                       "fault(s)"),
+                description=waivers.get("caveat", ""),
+                evidence=[waivers.get("note", "")] if waivers.get("note") else [],
+                confidence="high")
+
+
+@register
+class ReportInsufficientEvidenceSkill(_InvestigativeSkill):
+    skill_id = "report_insufficient_evidence"
+    tool_name = "report_insufficient_evidence"
+    display_name = "Report Insufficient Evidence (query)"
+    description = investigate.TOOL_SPECS[
+        "report_insufficient_evidence"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"report_insufficient_evidence: {data['error']}"
+        return ("report_insufficient_evidence: recorded — the evidence does "
+                "not settle this question.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        if data.get("error"):
+            return
+        result.add_finding(
+            title=f"Not determined: {data.get('question', '')}",
+            description=data.get("missing", ""),
+            recommendation=data.get("would_settle_it", ""),
+            confidence="insufficient")
 
 
 @register

@@ -125,7 +125,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
         if progress:
             progress(4, 5, "Running skills")
         from .skills.base import AnalysisContext
-        from .analysis.investigate import serialize_triage
+        from .analysis.investigate import serialize_context, serialize_triage
         ctx = AnalysisContext(
             netlist=netlist,
             faults=faults,
@@ -136,6 +136,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
             triage=serialize_triage(report.statistics,
                                     report.selected_categories,
                                     report.recommendations),
+            context=serialize_context(report),
         )
         report.skill_results = skill_manager.run_all(ctx)
 
