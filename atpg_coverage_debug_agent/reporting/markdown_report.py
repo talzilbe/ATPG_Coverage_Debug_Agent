@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from typing import List
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..models import AnalysisReport, FaultAnalysisResult
 
@@ -262,8 +262,37 @@ def _hotspot_tables(selected: List) -> List[str]:
     return lines
 
 
-def _triage_section(report: AnalysisReport) -> List[str]:
+def _dumps_by_subclass(dumps: Optional[Sequence[Any]]) -> Dict[str, Any]:
+    """Index category dumps by their subclass id for quick lookup."""
+    return {d.subclass_id: d for d in (dumps or [])}
+
+
+def _dump_links(dump: Any) -> str:
+    """Render the report-relative links to one category's fault files."""
+    parts = []
+    if dump.csv_href:
+        parts.append(f"[CSV]({dump.csv_href})")
+    if dump.json_href:
+        parts.append(f"[JSON]({dump.json_href})")
+    if not parts:
+        return ""
+    suffix = ""
+    if dump.truncated:
+        suffix = (" — the JSON is capped; the CSV holds every fault")
+    return (f"   - _All {dump.dumped_count} faults in this category:_ "
+            f"{' · '.join(parts)}{suffix}")
+
+
+def _triage_section(report: AnalysisReport,
+                    dumps: Optional[Sequence[Any]] = None) -> List[str]:
     """Render the derived-statistics triage and the ranked fix plan.
+
+    Args:
+        report: The analysed report.
+        dumps: Optional :class:`~.category_dump.CategoryDump` objects. When
+            given, each selected category gains a link to the file holding its
+            faults. Omitted for a pure in-memory render, where there are no
+            files to point at.
 
     Returns an empty list when the report predates this section (for example a
     session file saved by an older version), so rendering stays backwards
@@ -300,6 +329,7 @@ def _triage_section(report: AnalysisReport) -> List[str]:
 
     selected = report.selected_categories or []
     if selected:
+        by_subclass = _dumps_by_subclass(dumps)
         lines.append("### Selected for investigation")
         lines.append("")
         for cat in selected:
@@ -317,6 +347,11 @@ def _triage_section(report: AnalysisReport) -> List[str]:
                 if verdict.patterns:
                     lines.append(f"   - _Pattern:_ "
                                  f"{', '.join(verdict.patterns)}")
+            dump = by_subclass.get(cat.subclass_id)
+            if dump is not None:
+                link_line = _dump_links(dump)
+                if link_line:
+                    lines.append(link_line)
         lines.append("")
 
         lines.extend(_hotspot_tables(selected))
@@ -368,8 +403,16 @@ def _triage_section(report: AnalysisReport) -> List[str]:
     return lines
 
 
-def render_markdown(report: AnalysisReport) -> str:
-    """Return a full Markdown document for *report*."""
+def render_markdown(report: AnalysisReport,
+                    dumps: Optional[Sequence[Any]] = None) -> str:
+    """Return a full Markdown document for *report*.
+
+    Args:
+        report: The analysed report.
+        dumps: Optional per-category fault dumps to link from the triage
+            section. ``None`` renders no links, so an in-memory render never
+            points at files that do not exist.
+    """
     s = report.summary
     lines: List[str] = []
     lines.append("# ATPG Coverage-Loss Debug Report")
@@ -432,7 +475,7 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append("")
 
     lines.extend(_evidence_section(report))
-    lines.extend(_triage_section(report))
+    lines.extend(_triage_section(report, dumps))
 
     # Per-fault table
     lines.append("## Per-Fault Detail")
@@ -520,9 +563,29 @@ def render_markdown(report: AnalysisReport) -> str:
     return "\n".join(lines)
 
 
-def write_markdown(report: AnalysisReport, path: str) -> None:
-    """Write the Markdown report to *path*."""
-    content = render_markdown(report)
+def write_markdown(report: AnalysisReport, path: str,
+                   dump_categories: bool = True) -> None:
+    """Write the Markdown report to *path*.
+
+    Args:
+        report: The analysed report.
+        path: Destination of the Markdown file.
+        dump_categories: Also write one file per selected coverage-loss
+            category into a sidecar folder beside *path*, and link them from
+            the triage section. Set False to write the Markdown alone.
+    """
+    dumps = None
+    if dump_categories:
+        from .category_dump import write_category_dumps
+
+        try:
+            dumps = write_category_dumps(report, path)
+        except OSError as exc:
+            # A read-only destination must not cost the user their report.
+            logger.warning("Category dumps not written next to %s: %s",
+                           path, exc)
+            dumps = None
+    content = render_markdown(report, dumps)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(content)
     logger.info("Markdown report written to %s", path)

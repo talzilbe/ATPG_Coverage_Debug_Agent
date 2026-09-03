@@ -19,7 +19,7 @@ import logging
 import os
 from collections import Counter, OrderedDict
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..models import (
     AnalysisReport,
@@ -609,8 +609,16 @@ def _tie_driver_table(report: AnalysisReport) -> str:
     )
 
 
-def _section_triage(report: AnalysisReport) -> str:
-    """Render the coverage triage: categories, hotspots and blocking evidence."""
+def _section_triage(report: AnalysisReport,
+                    category_dumps: Optional[Sequence[Any]] = None) -> str:
+    """Render the coverage triage: categories, hotspots and blocking evidence.
+
+    Args:
+        report: The analysed report.
+        category_dumps: Optional per-category fault dumps written beside this
+            HTML file; each selected category then links to the file holding
+            its faults. ``None`` renders no links.
+    """
     stats = getattr(report, "statistics", None)
     heading = "<h2>4. Coverage Triage</h2>"
     if stats is None:
@@ -661,6 +669,7 @@ def _section_triage(report: AnalysisReport) -> str:
 
     selected = getattr(report, "selected_categories", None) or []
     if selected:
+        dumps_by_id = {d.subclass_id: d for d in (category_dumps or [])}
         items = []
         for cat in selected:
             info = cat.stat.info
@@ -675,6 +684,9 @@ def _section_triage(report: AnalysisReport) -> str:
                     f"<br><i>Verdict:</i> <b>{_esc(verdict.actionable)}</b> "
                     f"({_esc(verdict.confidence.value)} confidence) &mdash; "
                     f"{_esc(verdict.reason)}")
+            links = _dump_links_html(dumps_by_id.get(cat.subclass_id))
+            if links:
+                detail.append(links)
             items.append("<li>" + "".join(detail) + "</li>")
         parts.append("<h3>4.2 Selected for investigation</h3><ol>"
                      + "".join(items) + "</ol>")
@@ -683,6 +695,24 @@ def _section_triage(report: AnalysisReport) -> str:
     parts.append(_triage_blocking(selected))
     parts.append(_triage_profiles(selected))
     return "".join(parts)
+
+
+def _dump_links_html(dump: Any) -> str:
+    """Render links to the file holding one category's faults, if written."""
+    if dump is None:
+        return ""
+    links = []
+    if dump.csv_href:
+        links.append(f'<a href="{_esc(dump.csv_href)}">CSV</a>')
+    if dump.json_href:
+        links.append(f'<a href="{_esc(dump.json_href)}">JSON</a>')
+    if not links:
+        return ""
+    tail = ""
+    if dump.truncated:
+        tail = " (the JSON is capped; the CSV holds every fault)"
+    return (f"<br><i>All {_fmt(dump.dumped_count)} faults in this "
+            f"category:</i> " + " &middot; ".join(links) + _esc(tail))
 
 
 def _triage_hotspots(selected: List) -> str:
@@ -1112,6 +1142,7 @@ def build_html_report(
     faults_path: Optional[str] = None,
     constraints_path: Optional[str] = None,
     analyst_note: Optional[str] = None,
+    category_dumps: Optional[Sequence[Any]] = None,
 ) -> str:
     """Return a complete, self-contained document-style HTML report.
 
@@ -1121,6 +1152,8 @@ def build_html_report(
         netlist_path / faults_path / constraints_path: Optional source file
             paths shown on the cover page.
         analyst_note: Optional analyst note / edit banner shown at the top.
+        category_dumps: Optional per-category fault dumps written beside this
+            HTML file, linked from &sect;4.2.
 
     Returns:
         A full ``<html>`` document string.
@@ -1141,7 +1174,7 @@ def build_html_report(
             + _section_constraints(report, constraints_path)
             + _section_fault_stats(report)
             + _section_evidence(report)
-            + _section_triage(report)
+            + _section_triage(report, category_dumps)
             + _section_fix_plan(report)
             + _section_hotspots(report)
             + _section_root_causes(report)

@@ -75,9 +75,13 @@ class TriagePanel(QWidget):
         fault_referenced: Emitted with a fault object path when the user
             activates a sample, so the main window can focus that fault in the
             coverage-loss table.
+        export_categories_requested: Emitted when the user asks to write one
+            file per category. The panel does no file IO itself; the main
+            window owns the dialog and the writing.
     """
 
     fault_referenced = Signal(str)
+    export_categories_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -125,6 +129,18 @@ class TriagePanel(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
         layout.addWidget(splitter, 1)
+
+        row = QHBoxLayout()
+        self.export_categories_btn = QPushButton("Export category faults…")
+        self.export_categories_btn.setToolTip(
+            "Write one CSV and one JSON per category listed above, each "
+            "holding every fault in that category, into a folder you choose.")
+        self.export_categories_btn.setEnabled(False)
+        self.export_categories_btn.clicked.connect(
+            self.export_categories_requested.emit)
+        row.addWidget(self.export_categories_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
         return widget
 
     def _build_clusters_tab(self) -> QWidget:
@@ -210,6 +226,7 @@ class TriagePanel(QWidget):
         self._populate_categories()
         self._populate_clusters()
         self._populate_fixes()
+        self.export_categories_btn.setEnabled(bool(self._categories))
 
     def clear(self) -> None:
         """Reset every view to its empty state."""
@@ -224,6 +241,7 @@ class TriagePanel(QWidget):
         self.fix_list.clear()
         self.fix_detail.setHtml(_EMPTY_HTML)
         self.copy_commands_btn.setEnabled(False)
+        self.export_categories_btn.setEnabled(False)
 
     def _populate_totals(self, report: Any) -> None:
         stats = getattr(report, "statistics", None)

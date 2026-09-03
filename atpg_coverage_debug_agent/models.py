@@ -425,3 +425,8 @@ class AnalysisReport:
     #: (``analysis.unresolved.UnresolvedDiagnosis``). ``None`` when the report
     #: predates the diagnosis or nothing failed to map.
     unresolved_diagnosis: Any = None
+    #: Per-category fault files written alongside this report
+    #: (``List[reporting.category_dump.CategoryDump]``). Their names are
+    #: relative to the file they were written beside, so they only resolve
+    #: from that location.
+    category_dumps: Any = None

@@ -12,6 +12,7 @@ no longer available).
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List
 
 from ..analysis import investigate
@@ -37,6 +38,8 @@ from ..models import (
 #: Marker + version written at the top of every saved report.
 FORMAT_MARKER = "atpg_coverage_debug_report"
 FORMAT_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +148,37 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         # fix proposals are derived from it deterministically on load.
         "statistics": (report.statistics.as_dict()
                        if getattr(report, "statistics", None) else None),
+        # A manifest of the per-category fault files written beside this
+        # session. The names are relative to the session file, so they only
+        # resolve from the folder it was saved in.
+        "category_dumps": [d.as_dict()
+                           for d in (getattr(report, "category_dumps", None)
+                                     or [])],
     }
 
 
-def save_report(report: AnalysisReport, path: str) -> None:
-    """Write *report* to *path* as JSON."""
+def save_report(report: AnalysisReport, path: str,
+                dump_categories: bool = True) -> None:
+    """Write *report* to *path* as JSON.
+
+    Args:
+        report: The analysed report.
+        path: Destination of the session JSON.
+        dump_categories: Also write one CSV and one JSON per selected
+            coverage-loss category into a sidecar folder beside *path*, so the
+            saved session carries the faults behind each category and the
+            whole folder can be handed to someone else. Set False to write the
+            session JSON alone.
+    """
+    if dump_categories:
+        from .category_dump import write_category_dumps
+
+        try:
+            write_category_dumps(report, path)
+        except OSError as exc:
+            # A read-only destination must not cost the user their session.
+            logger.warning("Category dumps not written next to %s: %s",
+                           path, exc)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(report_to_dict(report), fh, indent=2, default=str)
 
@@ -276,6 +305,13 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
             select_categories(statistics), report.faults or [])
         report.recommendations = build_recommendations(
             statistics, report.selected_categories)
+
+    dumps_payload = data.get("category_dumps") or []
+    if dumps_payload:
+        from .category_dump import CategoryDump
+
+        report.category_dumps = [CategoryDump.from_dict(d)
+                                 for d in dumps_payload]
     return report
 
 

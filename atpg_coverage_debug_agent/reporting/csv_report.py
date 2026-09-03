@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import csv
 import logging
-from typing import Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from ..models import AnalysisReport, FaultAnalysisResult
 
@@ -58,19 +58,35 @@ def _row(r: FaultAnalysisResult) -> Dict[str, str]:
     }
 
 
-def render_rows(report: AnalysisReport) -> List[Dict[str, str]]:
-    """Return a list of dict rows ready for CSV/DataFrame consumption."""
-    return [_row(r) for r in report.fault_results]
+def render_rows(report: AnalysisReport,
+                results: Optional[Iterable[Any]] = None) -> List[Dict[str, str]]:
+    """Return a list of dict rows ready for CSV/DataFrame consumption.
+
+    Args:
+        report: The analysed report.
+        results: An explicit subset of ``FaultAnalysisResult`` objects, for
+            example the faults of a single coverage-loss category. Defaults to
+            every result in *report*.
+
+    Returns:
+        One dict per fault, keyed by :data:`COLUMNS`.
+    """
+    chosen = report.fault_results if results is None else results
+    return [_row(r) for r in chosen]
 
 
-def write_csv(report: AnalysisReport, path: str) -> None:
-    """Write the per-fault table to *path* as CSV."""
-    rows = render_rows(report)
+def write_rows_csv(rows: Iterable[Dict[str, str]], path: str) -> None:
+    """Write pre-rendered *rows* to *path* using :data:`COLUMNS` as the header.
+
+    ``pandas`` is used when importable, with a standard-library fallback so the
+    column set is defined in exactly one place either way.
+    """
+    rows = list(rows)
     try:
         import pandas as pd  # type: ignore
 
         pd.DataFrame(rows, columns=COLUMNS).to_csv(path, index=False)
-        logger.info("CSV report written via pandas to %s", path)
+        logger.info("CSV written via pandas to %s", path)
         return
     except Exception:
         # Fallback to the standard library.
@@ -81,4 +97,9 @@ def write_csv(report: AnalysisReport, path: str) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-    logger.info("CSV report written via csv module to %s", path)
+    logger.info("CSV written via csv module to %s", path)
+
+
+def write_csv(report: AnalysisReport, path: str) -> None:
+    """Write the per-fault table to *path* as CSV."""
+    write_rows_csv(render_rows(report), path)
