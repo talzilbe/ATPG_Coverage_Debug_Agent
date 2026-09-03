@@ -62,6 +62,23 @@ class RootCauseEngine:
             if c.normalized_signal:
                 self._constraint_index.setdefault(
                     c.normalized_signal, []).append(c)
+        # Secondary index keyed on the LEAF name of each constrained signal.
+        # Constraint matching used to scan every constraint for every fault,
+        # which is invisible on a demo netlist and quadratic on a real one.
+        # Every match rule below is anchored on a full path or a leaf, so a
+        # leaf-keyed bucket lets a fault look at only the plausible
+        # candidates and still apply the identical comparisons.
+        self._constraint_by_leaf: Dict[str, List[str]] = {}
+        for norm_sig in self._constraint_index:
+            leaf = norm_sig.split("/")[-1]
+            bucket = self._constraint_by_leaf.setdefault(leaf, [])
+            if norm_sig not in bucket:
+                bucket.append(norm_sig)
+        # Parse order of each constrained signal, so a narrowed search can
+        # still report hits in the order a full scan would have.
+        self._constraint_order: Dict[str, int] = {
+            sig: i for i, sig in enumerate(self._constraint_index)
+        }
 
     # -- public API -------------------------------------------------------
     def analyze_fault(self, fault: FaultRecord) -> FaultAnalysisResult:
@@ -228,13 +245,29 @@ class RootCauseEngine:
             for pin in inst.pins:
                 if pin.net:
                     targets.add(pin.net.replace(".", "/").lstrip("/"))
-        for norm_sig, records in self._constraint_index.items():
+
+        # Narrow to the constraints that could possibly match before doing any
+        # string work. Each rule below either compares whole paths or compares
+        # leaf names, and a component-aligned suffix shares its last
+        # component -- so a constraint whose leaf differs from every target
+        # leaf can never satisfy any of them.
+        candidates: Set[str] = set()
+        for target in targets:
+            candidates.update(
+                self._constraint_by_leaf.get(target.split("/")[-1], ()))
+        if not candidates:
+            return []
+
+        # Walk the candidates in the order the constraints were parsed, so the
+        # result is identical to scanning the whole index.
+        for norm_sig in sorted(candidates,
+                               key=self._constraint_order.__getitem__):
             for target in targets:
                 if norm_sig and (norm_sig == target
                                  or target.endswith("/" + norm_sig)
                                  or norm_sig.endswith("/" + target)
                                  or norm_sig.split("/")[-1] == target.split("/")[-1]):
-                    hits.extend(records)
+                    hits.extend(self._constraint_index[norm_sig])
                     break
         # De-duplicate by line number.
         seen = set()

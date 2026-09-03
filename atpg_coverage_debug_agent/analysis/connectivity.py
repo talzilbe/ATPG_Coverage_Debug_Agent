@@ -169,6 +169,12 @@ class ConnectivityModel:
         self._inst_in_nets: Dict[str, List[str]] = {}
         #: module name -> [(parent_module, instance_name)] instantiating it
         self._module_parents: Dict[str, List[Tuple[str, str]]] = {}
+        #: (module, net, max_hops) -> resolved driver. The netlist is immutable
+        #: for the life of this model, so a resolution can never change. One
+        #: tie cell commonly sits upstream of tens of thousands of faults, and
+        #: without this each of them re-walks the same hierarchy.
+        self._driver_cache: Dict[Tuple[str, str, int],
+                                 Optional["DriverResolution"]] = {}
         self._graph = nx.DiGraph() if _HAVE_NX else None
         self._build()
 
@@ -352,6 +358,17 @@ class ConnectivityModel:
         """
         if not net_name:
             return None
+        cache_key = (module, net_name, int(max_hops))
+        if cache_key in self._driver_cache:
+            return self._driver_cache[cache_key]
+        resolved = self._resolve_driver_uncached(module, net_name, max_hops)
+        self._driver_cache[cache_key] = resolved
+        return resolved
+
+    def _resolve_driver_uncached(self, module: str, net_name: str,
+                                 max_hops: int
+                                 ) -> Optional["DriverResolution"]:
+        """The hierarchy walk behind :meth:`resolve_driver`, without caching."""
         cur_mod, cur_net = module, net_name
         trace: List[str] = []
         seen: Set[Tuple[str, str]] = set()
