@@ -55,6 +55,22 @@ CONSENSUS_SHARE = 0.8
 #: Representative fault paths kept per signature, quoted verbatim.
 DEFAULT_SAMPLES = 3
 
+#: A limitation of measuring reconvergence by counting re-merge points in the
+#: fan-out cone: it is only visible from a site ABOVE the fan-out. From a site
+#: already inside the cone there is genuinely one narrow path onward, so the
+#: same structure reads as a bottleneck. Real ATPG sees it either way, through
+#: the side-input values each path demands, which structural tracing does not
+#: model. The two verdicts call for OPPOSITE fixes -- a bottleneck is helped by
+#: more abort budget, reconvergent complexity is not -- so this is stated
+#: wherever a bottleneck verdict is reported rather than left in a comment.
+RECONVERGENCE_BLIND_SPOT = (
+    "Reconvergence is counted where fan-out paths re-merge, which is only "
+    "visible from a site above the fan-out. A site inside a reconvergent cone "
+    "sees one narrow path and reads as an observability bottleneck instead. "
+    "If a bottleneck verdict here is really reconvergence, a higher abort "
+    "limit will not help and the design bypass is the fix to look at."
+)
+
 #: Verdict id -> (human label, fixes it calls for).
 SIGNATURES: Dict[str, Dict[str, Any]] = {
     "sequential_depth_explosion": {
@@ -93,6 +109,16 @@ SIGNATURES: Dict[str, Dict[str, Any]] = {
                     "search budget rather than design structure."),
         "fix_ids": ["aab_abort_limit"],
     },
+    "cone_truncated": {
+        "label": "Cone too large to profile",
+        "meaning": ("The fan-out cone exceeded this tool's search bound, so "
+                    "the observation-point and re-merge counts are lower "
+                    "bounds rather than measurements. No observability "
+                    "verdict can be drawn from them."),
+        # Deliberately empty: recommending a fix on an admittedly incomplete
+        # measurement is exactly the guess this analysis exists to avoid.
+        "fix_ids": [],
+    },
 }
 
 
@@ -108,6 +134,8 @@ class SiteProfile:
         sequential_depth: Sequential elements on the shortest path to the
             nearest observation point.
         reconvergence: Points in the fan-out cone where paths re-merge.
+        truncated: True when the cone hit ``MAX_CONE_NODES`` and the counts
+            above are therefore lower bounds, not measurements.
         signature: The verdict id these measurements imply.
     """
 
@@ -116,6 +144,7 @@ class SiteProfile:
     observation_points: int = 0
     sequential_depth: int = 0
     reconvergence: int = 0
+    truncated: bool = False
     signature: str = "no_structural_blocker"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -126,6 +155,7 @@ class SiteProfile:
             "observation_points": self.observation_points,
             "sequential_depth": self.sequential_depth,
             "reconvergence": self.reconvergence,
+            "truncated": self.truncated,
             "signature": self.signature,
         }
 
@@ -146,6 +176,8 @@ class ReachabilityProfile:
             describe the category as a whole.
         samples: Verdict id -> representative fault paths, verbatim.
         preferred_fix_ids: Fixes the dominant signature calls for.
+        truncated_sites: Sites whose fan-out cone exceeded the search bound,
+            so their counts are lower bounds.
         note: Human-readable summary.
     """
 
@@ -159,6 +191,7 @@ class ReachabilityProfile:
     consensus: bool = False
     samples: Dict[str, List[str]] = field(default_factory=dict)
     preferred_fix_ids: List[str] = field(default_factory=list)
+    truncated_sites: int = 0
     note: str = ""
 
     @property
@@ -173,6 +206,7 @@ class ReachabilityProfile:
             "analysed": self.analysed,
             "profiled": self.profiled,
             "unresolved_mapping": self.unresolved_mapping,
+            "truncated_sites": self.truncated_sites,
             "dominant": self.dominant,
             "dominant_label": self.dominant_label,
             "dominant_share": round(self.dominant_share, 4),
@@ -193,6 +227,7 @@ class ReachabilityProfile:
             "caveat": ("Estimated by walking the netlist. Real ATPG reasons "
                        "about Boolean satisfiability across the whole cone, "
                        "which structural tracing cannot reproduce."),
+            "known_blind_spot": RECONVERGENCE_BLIND_SPOT,
         }
 
 
@@ -257,6 +292,9 @@ class StructuralProfiler:
             "observation_points": observe_points,
             "sequential_depth": best_depth if best_depth is not None else 0,
             "reconvergence": reconvergence,
+            # The walk stopped early, so every count above is a floor. Callers
+            # must not read "0 observation points" as "no observation points".
+            "truncated": bool(queue) and len(seen) >= MAX_CONE_NODES,
         }
 
     def profile(self, instance_name: Optional[str]) -> Optional[SiteProfile]:
@@ -282,6 +320,7 @@ class StructuralProfiler:
             observation_points=downstream["observation_points"],
             sequential_depth=downstream["sequential_depth"],
             reconvergence=downstream["reconvergence"],
+            truncated=downstream["truncated"],
         )
         profile.signature = classify_site(profile)
         self._cache[key] = profile
@@ -294,19 +333,29 @@ def classify_site(profile: SiteProfile) -> str:
     The order matters and follows the same precedence used when reading
     ``analyze_fault`` output: depth first, then activation, then whether any
     observation point exists at all, then how badly the paths reconverge.
+
+    When the cone was truncated the counts are lower bounds. A threshold that
+    has already been *exceeded* still holds, so those verdicts survive; a
+    verdict that depends on a count being *small* does not, because more
+    searching could only have found more. Those become ``cone_truncated``
+    rather than a confident answer built on an admittedly partial walk.
     """
     if profile.sequential_depth >= SEQ_DEPTH_HIGH:
         return "sequential_depth_explosion"
     if profile.activatable is False:
         return "low_controllability"
+    if profile.reconvergence >= RECONVERGENCE_HIGH:
+        # Measured from the fan-in side too, and already over the threshold.
+        if profile.observation_points == 0 and not profile.truncated:
+            return "hard_observability_gap"
+        return "reconvergent_complexity"
+    if profile.truncated:
+        return "cone_truncated"
     if profile.observation_points == 0:
         return "hard_observability_gap"
-    if profile.reconvergence >= RECONVERGENCE_HIGH:
-        return "reconvergent_complexity"
     if profile.observation_points <= OBS_BOTTLENECK:
         return "observability_bottleneck"
     return "no_structural_blocker"
-
 
 def profile_faults(results: Iterable[Any], profiler: StructuralProfiler,
                    subclass_id: str) -> ReachabilityProfile:
@@ -335,6 +384,8 @@ def profile_faults(results: Iterable[Any], profiler: StructuralProfiler,
             continue
 
         outcome.profiled += 1
+        if profile.truncated:
+            outcome.truncated_sites += 1
         outcome.signatures[profile.signature] = \
             outcome.signatures.get(profile.signature, 0) + 1
         samples = outcome.samples.setdefault(profile.signature, [])
@@ -375,6 +426,19 @@ def _finalise(outcome: ReachabilityProfile) -> None:
         outcome.note += (
             f" {outcome.unresolved_mapping} fault(s) could not be located in "
             f"the netlist and were left out.")
+
+    if outcome.truncated_sites:
+        outcome.note += (
+            f" {outcome.truncated_sites} of {outcome.profiled} site(s) have a "
+            f"fan-out cone larger than this tool searches "
+            f"({MAX_CONE_NODES} nodes), so their observation-point and "
+            f"re-merge counts are lower bounds; no observability verdict was "
+            f"drawn for them.")
+
+    if outcome.dominant == "observability_bottleneck":
+        # These two verdicts call for opposite fixes, and the structural proxy
+        # cannot always tell them apart, so say so where it matters.
+        outcome.note += " " + RECONVERGENCE_BLIND_SPOT
 
 
 #: Categories whose faults were aborted rather than proven untestable, and so

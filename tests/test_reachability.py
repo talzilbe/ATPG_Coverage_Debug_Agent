@@ -127,6 +127,89 @@ def test_depth_outranks_every_other_signal():
 
 
 # ---------------------------------------------------------------------------
+# Truncated cones
+# ---------------------------------------------------------------------------
+# A truncated walk yields LOWER BOUNDS. A threshold already exceeded still
+# holds; a verdict that needs a count to be small does not, because more
+# searching could only have found more.
+def test_a_truncated_cone_refuses_an_observability_verdict():
+    for observation_points in (0, 1, 6):
+        profile = SiteProfile(activatable=True,
+                              observation_points=observation_points,
+                              truncated=True)
+        assert classify_site(profile) == "cone_truncated", observation_points
+
+
+def test_a_truncated_cone_keeps_the_verdicts_a_lower_bound_supports():
+    deep = SiteProfile(activatable=True, sequential_depth=SEQ_DEPTH_HIGH,
+                       truncated=True)
+    assert classify_site(deep) == "sequential_depth_explosion"
+
+    dead = SiteProfile(activatable=False, truncated=True)
+    assert classify_site(dead) == "low_controllability"
+
+    tangled = SiteProfile(activatable=True, observation_points=9,
+                          reconvergence=RECONVERGENCE_HIGH, truncated=True)
+    assert classify_site(tangled) == "reconvergent_complexity"
+
+
+def test_truncation_does_not_disturb_a_complete_walk():
+    """Every verdict must be unchanged when the cone was fully explored."""
+    for profile, expected in (
+        (SiteProfile(activatable=True, observation_points=0),
+         "hard_observability_gap"),
+        (SiteProfile(activatable=True, observation_points=1),
+         "observability_bottleneck"),
+        (SiteProfile(activatable=True, observation_points=6),
+         "no_structural_blocker"),
+    ):
+        assert profile.truncated is False
+        assert classify_site(profile) == expected
+
+
+def test_a_truncated_site_is_never_called_a_gap():
+    """The failure this prevents: 'no capture point' that is really 'gave up'.
+
+    A hard observability gap sends an engineer looking for missing DFT. If the
+    zero came from abandoning the walk, that search is wasted.
+    """
+    gave_up = SiteProfile(activatable=True, observation_points=0,
+                          truncated=True)
+    assert classify_site(gave_up) != "hard_observability_gap"
+
+
+def test_a_truncated_profile_serialises_its_uncertainty():
+    profile = SiteProfile(instance="u_x", activatable=True,
+                          observation_points=0, truncated=True)
+    profile.signature = classify_site(profile)
+    assert profile.as_dict()["truncated"] is True
+    assert profile.as_dict()["signature"] == "cone_truncated"
+
+
+def test_the_truncated_signature_recommends_no_fix():
+    """Recommending a fix from an admittedly partial measurement is a guess."""
+    from atpg_coverage_debug_agent.analysis.reachability import SIGNATURES
+
+    assert SIGNATURES["cone_truncated"]["fix_ids"] == []
+
+
+def test_a_bottleneck_verdict_states_the_reconvergence_blind_spot():
+    """These two verdicts call for opposite fixes and can be confused."""
+    from atpg_coverage_debug_agent.analysis.reachability import (
+        RECONVERGENCE_BLIND_SPOT,
+        ReachabilityProfile,
+        _finalise,
+    )
+
+    outcome = ReachabilityProfile(subclass_id="UO.AAB")
+    outcome.analysed = outcome.profiled = 10
+    outcome.signatures = {"observability_bottleneck": 10}
+    _finalise(outcome)
+    assert RECONVERGENCE_BLIND_SPOT in outcome.note
+    assert "abort limit will not help" in outcome.note
+
+
+# ---------------------------------------------------------------------------
 # Measuring real structure
 # ---------------------------------------------------------------------------
 def test_cone_with_no_capture_point_is_an_observability_gap():
