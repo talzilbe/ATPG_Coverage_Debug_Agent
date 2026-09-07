@@ -1158,6 +1158,7 @@ class AgentPanel(QWidget):
                 getattr(r, "selected_categories", None),
                 getattr(r, "recommendations", None)),
             context=investigate.serialize_context(r),
+            design=investigate.serialize_design(getattr(r, "netlist", None), r),
         )
 
     def on_run(self) -> None:

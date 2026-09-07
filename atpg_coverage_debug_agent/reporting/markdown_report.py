@@ -6,6 +6,7 @@ import logging
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..analysis.census import build_census
 from ..models import AnalysisReport, FaultAnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,223 @@ def _fault_row(r: FaultAnalysisResult) -> str:
             scan=r.scan_boundary_state,
             rc=r.root_cause.value,
         )
+
+
+def _metrics_section(report: AnalysisReport) -> List[str]:
+    """Render the three Tessent coverage metrics with their inputs.
+
+    Percentages are shown next to the counts they come from so any figure can
+    be re-derived by hand, and a metric that is undefined for this population
+    is printed as ``n/a`` rather than as a fabricated number.
+    """
+    stats = getattr(report, "statistics", None)
+    if stats is None or not hasattr(stats, "metrics"):
+        return []
+    m = stats.metrics()
+    roles = m["roles"]
+
+    def _fmt(value: Optional[float]) -> str:
+        return "n/a" if value is None else f"{value:.4f}%"
+
+    lines = ["### Coverage metrics", ""]
+    lines.append(f"> Possibly-detected credit (`posdet_credit`) = "
+                 f"**{m['posdet_credit']}**. Numerator is "
+                 f"`DT + posdet_credit x PD` = {m['detected_credit']}.")
+    header = getattr(report, "fault_list_header", None)
+    if header is not None:
+        lines.append(f"> Fault population is **{header.collapsing_label}** "
+                     f"(model(s): {', '.join(header.fault_models) or 'n/a'}). "
+                     f"A collapsed and an uncollapsed census are not "
+                     f"comparable.")
+    lines.append("")
+    lines.append("| Metric | Value | Formula | Numeric substitution |")
+    lines.append("| --- | --- | --- | --- |")
+    # Every figure carries the arithmetic that produced it. UD below is the
+    # FULL undetectable population from the role map; reading it as a single
+    # class is what once put the headline metric ~2 points out.
+    formulas = m.get("formulas", {})
+    for key, label in (("test_coverage", "Test coverage"),
+                       ("fault_coverage", "Fault coverage"),
+                       ("atpg_effectiveness", "ATPG effectiveness")):
+        spec = formulas.get(key, {})
+        lines.append(f"| {label} | {_fmt(m[key])} | "
+                     f"`{spec.get('formula', '')}` | "
+                     f"`{spec.get('substitution', '')}` |")
+    lines.append("")
+    lines.append(f"> {m.get('ud_definition', '')}")
+    lines.append(f"> {m.get('basis', '')}")
+    lines.append("")
+    lines.append("| Role | Meaning | Faults |")
+    lines.append("| --- | --- | --- |")
+    meanings = {
+        "DT": "detected",
+        "PD": "possibly detected (partial credit)",
+        "UD": "undetectable (removed from the test-coverage denominator)",
+        "AU": "ATPG untestable (stays in the denominator)",
+        "ND": "not detected — coverage loss",
+    }
+    for role, meaning in meanings.items():
+        lines.append(f"| {role} | {meaning} | {roles.get(role, 0)} |")
+    lines.append(f"| FU | total fault population | {m['total_faults']} |")
+    if m["unrecognised"]:
+        lines.append(f"| (unrecognised) | class not in the configured role "
+                     f"map — excluded from every metric | "
+                     f"{m['unrecognised']} |")
+    lines.append("")
+    if not m["census_balances"]:
+        lines.append("> **The census does not reconcile with the parsed "
+                     "record count.** Treat every figure above as unusable.")
+        lines.append("")
+    return lines
+
+
+def _census_section(report: AnalysisReport) -> List[str]:
+    """Render the complete fault census (S2b), grouped by coverage role.
+
+    Always emitted. Every class present is listed under the role it was
+    counted as, and the section closes with the sum check, so a reader never
+    has to work out whether what they are looking at is the whole population.
+    """
+    census = build_census(report)
+    lines = ["## S2b. Complete Fault Census", ""]
+    if not census.entries:
+        lines.append("_No faults were parsed, so there is no census._")
+        lines.append("")
+        return lines
+
+    lines.append(
+        f"Every one of the {census.class_count} fault class(es) in the fault "
+        f"list, grouped by coverage role. This is the complete census: no "
+        f"class is filtered out, including the ones that are not debug "
+        f"targets. Any other class listing in this report is a subset and "
+        f"says so.")
+    lines.append("")
+
+    for role in census.roles:
+        lines.append(f"### {role.role} — {role.label} ({role.count} faults, "
+                     f"{100.0 * role.count / census.total_faults if census.total_faults else 0.0:.2f}%)")
+        lines.append("")
+        lines.append(f"> {role.scope}")
+        lines.append("")
+        lines.append("| Family | Subclass | Count | % of all | sa0 | sa1 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for family in role.families:
+            for entry in family.entries:
+                lines.append(
+                    f"| {family.family} | {entry.subclass} | {entry.count} | "
+                    f"{entry.pct:.2f}% | {entry.sa0} | {entry.sa1} |")
+        lines.append("")
+
+    rec = census.reconciliation()
+    lines.append("### Census self-check")
+    lines.append("")
+    lines.append(f"- Sum of all {rec['classes']} class counts: "
+                 f"**{rec['sum_of_class_counts']}**")
+    lines.append(f"- Total faults analysed: **{rec['total_faults']}**")
+    if rec["reconciles"]:
+        lines.append("- Delta: **0** — the census accounts for every parsed "
+                     "fault.")
+    else:
+        lines.append(f"- Delta: **{rec['delta']}** — **THE CENSUS DOES NOT "
+                     f"RECONCILE.** No figure derived from it is "
+                     f"trustworthy until this is attributed. Do not assign "
+                     f"the delta to a category; it does not have one.")
+    if rec["unclassified_tokens"]:
+        lines.append(f"- Unclassified class token(s): "
+                     f"{', '.join(rec['unclassified_tokens'])} — not in the "
+                     f"configured class-role map, so they contribute to no "
+                     f"coverage metric.")
+    lines.append("")
+    return lines
+
+
+def _input_quality_section(report: AnalysisReport) -> List[str]:
+    """Report how completely the inputs were understood.
+
+    Kept separate from the findings on purpose. A directive that failed to
+    parse and a design with no constraints look identical in a report that
+    only prints results, and presenting the first as the second turns a tool
+    limitation into a claim about the hardware.
+    """
+    header = getattr(report, "fault_list_header", None)
+    diagnostics = getattr(report, "class_diagnostics", None)
+    constraint_status = getattr(report, "constraint_diagnostics", None)
+    if header is None and diagnostics is None and not constraint_status:
+        return []
+
+    lines = ["## Input Quality", ""]
+
+    if header is not None:
+        lines.append("### Fault list as declared")
+        lines.append("")
+        lines.append("| Property | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Format | {header.file_format} |")
+        lines.append(f"| Compression (from magic bytes) | {header.compression} |")
+        lines.append(f"| Declared version | {header.version or 'not declared'} |")
+        lines.append(f"| Fault collapsing | {header.collapsing_label} |")
+        lines.append(f"| Fault model(s) | "
+                     f"{', '.join(header.fault_models) or 'not declared'} |")
+        lines.append(f"| Declared column order | "
+                     f"{', '.join(header.format_fields) or 'not declared'} |")
+        lines.append("")
+        if len(header.per_model_counts) > 1:
+            lines.append("#### Census per fault model")
+            lines.append("")
+            for model, counts in header.per_model_counts.items():
+                total = sum(counts.values())
+                lines.append(f"- **{model}**: {total} fault(s) across "
+                             f"{len(counts)} class(es)")
+            lines.append("")
+
+    if diagnostics is not None and getattr(diagnostics, "tokens", None):
+        lines.append("### Unrecognised fault classes")
+        lines.append("")
+        lines.append(f"> {diagnostics.count} of {diagnostics.total} record(s) "
+                     f"({diagnostics.pct:.4f}%) carried a class the "
+                     f"configuration does not describe. They are excluded "
+                     f"from every coverage metric and are listed here so they "
+                     f"can be inspected and the class map extended.")
+        lines.append("")
+        lines.append("| Class token | Records | First line | Sample |")
+        lines.append("| --- | --- | --- | --- |")
+        for tok in diagnostics.tokens:
+            sample = (tok.samples[0] if tok.samples else "").replace("|", "\\|")
+            lines.append(f"| `{tok.token}` | {tok.count} | "
+                         f"{tok.first_line or '—'} | `{sample}` |")
+        lines.append("")
+
+    if constraint_status:
+        total = constraint_status.get("directives", 0)
+        unresolved = constraint_status.get("unresolved", 0)
+        lines.append("### Constraint file parsing")
+        lines.append("")
+        lines.append("| Property | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Files read (includes followed) | "
+                     f"{len(constraint_status.get('files') or [])} |")
+        lines.append(f"| Directives recognised | "
+                     f"{constraint_status.get('resolved', 0)} of {total} |")
+        lines.append(f"| Directives NOT evaluated | {unresolved} |")
+        lines.append(f"| Objects resolved from collections | "
+                     f"{constraint_status.get('expanded_objects', 0)} |")
+        lines.append("")
+        if unresolved:
+            lines.append(f"> **{unresolved} directive(s) were recognised but "
+                         f"could not be evaluated.** While that is non-zero, "
+                         f"a fault reported with no constraint hit is **not** "
+                         f"proven unconstrained — the constraint file was "
+                         f"only partly understood.")
+            lines.append("")
+        unrecognised = constraint_status.get("unrecognised") or {}
+        for tok in (unrecognised.get("tokens") or []):
+            lines.append(f"- Unknown directive `{tok['token']}` on "
+                         f"{tok['count']} line(s); add it to "
+                         f"`constraint_directives` in the analysis config.")
+        if unrecognised.get("tokens"):
+            lines.append("")
+
+    return lines
 
 
 def _evidence_section(report: AnalysisReport) -> List[str]:
@@ -319,6 +537,14 @@ def _triage_section(report: AnalysisReport,
     if loss_stats:
         lines.append("### Coverage-loss categories")
         lines.append("")
+        lines.append(
+            f"> **This is a subset, not the census.** It lists the "
+            f"{len(loss_stats)} debuggable coverage-loss categorie(s) only; "
+            f"detected, possibly-detected and undetectable classes are "
+            f"excluded by design, so these counts do not sum to the "
+            f"{stats.total_faults} fault(s) analysed. The complete census is "
+            f"in S2b.")
+        lines.append("")
         lines.append("| Category | Faults | % of all | sa0 | sa1 | Imbalance |")
         lines.append("| --- | --- | --- | --- | --- | --- |")
         for st in loss_stats:
@@ -428,14 +654,24 @@ def render_markdown(report: AnalysisReport,
     lines.append(f"- **Total faults analysed:** {s.total_faults}")
     lines.append(f"- **Coverage-loss faults (AU/UO/UC):** {s.coverage_loss_count}")
     lines.append("")
-    lines.append("### Fault class counts")
+    lines.append("### Fault class counts (complete — every class present)")
+    lines.append("")
+    lines.append(f"> Coarse classes only; the dotted breakdown and the "
+                 f"coverage role of each class are in S2b. Sums to "
+                 f"{sum(s.class_counts.values())} of {s.total_faults} faults.")
     lines.append("")
     lines.append("| Class | Count |")
     lines.append("| --- | --- |")
-    for cls in ("DS", "DI", "TI", "AU", "UO", "UC", "UNKNOWN"):
-        if cls in s.class_counts:
-            lines.append(f"| {cls} | {s.class_counts[cls]} |")
+    # Every class actually present is listed, largest first. A fixed list of
+    # classes hides the ones the analyzer was not expecting, which is exactly
+    # how five legitimate Tessent classes once went unreported.
+    for cls, count in sorted(s.class_counts.items(),
+                             key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"| {cls} | {count} |")
     lines.append("")
+
+    lines.extend(_metrics_section(report))
+    lines.extend(_census_section(report))
 
     lines.append("### Top root causes")
     lines.append("")
@@ -475,6 +711,7 @@ def render_markdown(report: AnalysisReport,
     lines.append("")
 
     lines.extend(_evidence_section(report))
+    lines.extend(_input_quality_section(report))
     lines.extend(_triage_section(report, dumps))
 
     # Per-fault table

@@ -105,6 +105,9 @@ class AnalysisContext:
     #: repeated patterns, parser warnings and analyst waivers) that qualifies
     #: how far the other answers can be trusted.
     context: Any = None
+    #: The one parsed-design handle every tool answers from, so no two tools
+    #: can disagree about whether the netlist was read.
+    design: Any = None
 
 
 # ---------------------------------------------------------------------------

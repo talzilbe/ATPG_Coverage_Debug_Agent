@@ -19,9 +19,11 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
+from .. import session
 from ..analysis import investigate
+from ..analysis.census import build_census
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,33 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
 
 6. HARD RULES
   - No guessing. If not proven by inputs, mark as unresolved or hypothesis.
+  - RECONCILE BEFORE YOU QUOTE. Before quoting or deriving anything from a
+    fault-class listing, add it up and check it equals the stated total. The
+    payload opens with a HANDOFF_MANIFEST that states whether the census in
+    it is complete and where the complete form lives; read it first. If a
+    listing is marked a SUBSET, it is not the census -- retrieve the complete
+    one instead of reasoning from the subset.
+  - IF THE SUM CHECK FAILS, STOP. Report that the figures you were handed do
+    not reconcile, name both numbers and the block they came from, and go no
+    further with them. Do NOT name, label or bucket the difference. An
+    invented category printed in a tool's own table format is indistinguish-
+    able from a real one to the next reader, and is a worse outcome than the
+    original omission. Where tools are available, call report_handoff_gap.
+  - NEVER compute a coverage metric from a class list that has not passed the
+    sum check. In particular the undetectable set UD in
+    (DT + c*PD) / (FU - UD) is the WHOLE undetectable population as the class
+    map defines it, not a single class. Prefer the metrics the deterministic
+    pass already printed, each of which carries its own substitution.
+  - A TRUNCATED RESULT IS NOT A READ RESULT. If a tool response is marked
+    truncated or names a spill file, retrieve the complete payload before
+    concluding anything from it. Counts are never truncated; a shortened list
+    of samples says so.
+  - "Unresolved" is reserved for evidence that DOES NOT EXIST -- not for
+    evidence you have not looked at yet. Before declaring anything
+    unresolved, exhaust what is retrievable: uncalled tools, spilled
+    payloads, other sections of report_context. Declaring a retrievable fact
+    unresolved tells the engineer to stop asking, which is worse than the
+    gap itself.
   - "The evidence does not settle this" is a COMPLETE and ACCEPTABLE answer.
     It is not a failure to answer, and it is strongly preferred over a
     confident wrong one: a plausible root cause that is wrong costs an
@@ -254,15 +283,35 @@ Rules for tool use:
   report exactly as specified in the base system prompt.
 - Never claim a skill returned something it did not. If a tool returns no
   findings, say so.
-- Call `report_context` EARLY. It tells you how much of the coverage loss
-  actually mapped onto the netlist, how much sits on hard constants, and
-  whether an analyst has waived faults. A percentage computed over mostly
-  unmapped faults does not mean what it appears to mean, and you cannot know
-  that from the figure alone.
+- Call `report_context` EARLY. It returns the COMPLETE fault census -- every
+  class, by coverage role, with the sum check already done -- plus how much of
+  the coverage loss actually mapped onto the netlist, how much sits on hard
+  constants, and whether an analyst has waived faults. The census is never
+  abridged there, so once you have called it no residual can remain
+  unexplained. A percentage computed over mostly unmapped faults does not mean
+  what it appears to mean, and you cannot know that from the figure alone.
+- If any class listing fails its sum check, call `report_handoff_gap`
+  immediately, report the inconsistency, and stop working with those numbers.
+  That tool exists so that "the figures I was handed contradict each other" is
+  an available action. It is NOT the same as `report_insufficient_evidence`:
+  use that one when evidence is missing, this one when evidence disagrees with
+  itself. Never invent a category to absorb a difference.
+- A tool result carrying `_truncation` is NOT a read result. It names the
+  fields it dropped and, usually, a `spill_path` holding the complete payload.
+  Read the spill, or re-query more narrowly, before concluding. Counts and the
+  census are never truncated, so a missing count means the tool did not return
+  one -- not that it was cut.
 - When the evidence does not settle a question, call
   `report_insufficient_evidence` and report that as your answer. It exists so
   that "not determined" is a real, available action rather than something you
-  have to argue your way into. Use it in preference to a hedged guess.
+  have to argue your way into. Use it in preference to a hedged guess -- but
+  only after exhausting what is retrievable. Evidence you have not fetched is
+  not missing evidence.
+- Scan status comes from `scan_status`. It answers from the live netlist when
+  one is held and otherwise from the instantiation recorded for that site, and
+  its `source` field says which. If it reports the netlist as unavailable
+  while another tool is quoting instantiations, that is a hand-off
+  inconsistency: report it with `report_handoff_gap`.
 - Before quoting any hierarchy path in your answer, pass it through
   `verify_paths`. A shortened or reconstructed path will not resolve when the
   reader pastes it into a tool.
@@ -393,16 +442,22 @@ def _triage_payload(report: Any) -> List[str]:
     loss_stats = getattr(stats, "loss_stats", None) or []
     if loss_stats:
         shown = loss_stats[:MAX_TRIAGE_CATEGORIES]
-        lines.append("- Loss categories (category | faults | % of all | sa0 | "
-                     "sa1 | imbalance):")
+        lines.append(
+            f"- Loss categories — COVERAGE-LOSS SUBSET, {len(shown)} of "
+            f"{len(loss_stats)} loss categorie(s) and NOT the census: "
+            f"detected, possibly-detected and undetectable classes are "
+            f"excluded by design. These counts must NOT be summed against "
+            f"'Total faults analysed'. Complete census: {CENSUS_HOME}. "
+            f"(category | faults | % of all | sa0 | sa1 | imbalance):")
         for st in shown:
             lines.append(f"    {st.subclass_id} | {st.count} | {st.pct:.2f}% | "
                          f"{st.sa0} | {st.sa1} | {st.sa_asymmetry:.2f}")
         if len(loss_stats) > len(shown):
             hidden = len(loss_stats) - len(shown)
             lines.append(
-                f"    ... {hidden} smaller categorie(s) omitted from this "
-                f"list. Call coverage_triage for the full census.")
+                f"    ... {hidden} smaller loss categorie(s) omitted from "
+                f"this list. Call coverage_triage, or read {CENSUS_HOME}, for "
+                f"the complete class breakdown.")
 
     selected = getattr(report, "selected_categories", None) or []
     for cat in selected:
@@ -480,6 +535,177 @@ def _triage_payload(report: Any) -> List[str]:
     return lines
 
 
+#: How many fault classes the digest prints inline. The census is normally far
+#: smaller than this, so the digest normally carries it whole; a design with an
+#: unusually fragmented class list gets a labelled subset instead of a silently
+#: truncated one.
+MAX_DIGEST_CENSUS_ROWS = 40
+
+#: Where the complete census always lives, named in every subset marker.
+CENSUS_HOME = "report_context.census (tool) / report section S2b"
+
+
+def _census_block(report: Any) -> Tuple[List[str], bool]:
+    """Render the fault-class census for the digest.
+
+    Returns ``(lines, partial)``. When the census is too large to print in
+    full, the block is explicitly labelled as a subset and names where the
+    complete form lives -- because the defect this exists to prevent was not a
+    wrong number but an unlabelled one: a six-class listing under a
+    twenty-five-class total, which the reader closed by inventing a category
+    to hold the difference.
+    """
+    census = build_census(report)
+    lines: List[str] = []
+    if not census.entries:
+        return ["- Fault class census: no faults were parsed."], False
+
+    shown = census.entries[:MAX_DIGEST_CENSUS_ROWS]
+    partial = len(shown) < census.class_count
+    marker = census.subset_note([e.subclass for e in shown], CENSUS_HOME)
+
+    if partial:
+        lines.append(f"- Fault class census [{marker}]:")
+    else:
+        lines.append(
+            f"- Fault class census (COMPLETE — all {census.class_count} "
+            f"class(es), grouped by coverage role):")
+    for role in census.roles:
+        printed = [e for e in role.entries if e in shown]
+        if not printed:
+            continue
+        lines.append(f"    {role.role} ({role.label}): {role.count}")
+        for entry in printed:
+            lines.append(f"        {entry.subclass}: {entry.count} "
+                         f"({entry.pct:.2f}%, sa0={entry.sa0} "
+                         f"sa1={entry.sa1})")
+    rec = census.reconciliation()
+    if partial:
+        lines.append(
+            f"    NOT SHOWN: {census.class_count - len(shown)} smaller "
+            f"class(es). The complete census is in {CENSUS_HOME}.")
+    if rec["reconciles"]:
+        lines.append(
+            f"    Sum check: the {rec['classes']} class counts sum to "
+            f"{rec['sum_of_class_counts']}, equal to the "
+            f"{rec['total_faults']} fault(s) analysed. No residual exists.")
+    else:
+        lines.append(
+            f"    SUM CHECK FAILED: {rec['classes']} class counts sum to "
+            f"{rec['sum_of_class_counts']} against {rec['total_faults']} "
+            f"fault(s) analysed, a delta of {rec['delta']}. Call "
+            f"report_handoff_gap and stop; do not name the difference.")
+    if rec["unclassified_tokens"]:
+        lines.append(
+            f"    UNCLASSIFIED class token(s): "
+            f"{', '.join(rec['unclassified_tokens'])} — outside the "
+            f"configured role map, so they feed no coverage metric.")
+    return lines, partial
+
+
+def build_handoff_manifest(report: Any, max_faults: int,
+                           census_partial: bool,
+                           agentic: bool = False) -> List[str]:
+    """Declare, up front, exactly how complete this payload is.
+
+    Every figure below is either whole or names where its whole form lives.
+    The rule: **if a number in this digest is a subset, the digest says so.**
+    A reader that has to detect an omission by finding a sum that does not
+    close will eventually fail to detect one -- and the failure mode is not a
+    missing answer, it is a confident fabricated one.
+    """
+    census = build_census(report)
+    rec = census.reconciliation()
+    summary = getattr(report, "summary", None)
+    loss = len(getattr(report, "fault_results", None) or [])
+    shown = min(loss, max_faults)
+
+    if census_partial:
+        census_line = (f"partial ({min(census.class_count, MAX_DIGEST_CENSUS_ROWS)}"
+                       f" of {census.class_count} classes)")
+    else:
+        census_line = f"complete ({census.class_count} of {census.class_count} classes)"
+
+    metrics_basis = "unavailable"
+    stats = getattr(report, "statistics", None)
+    if stats is not None and hasattr(stats, "metrics"):
+        metrics_basis = ("full_census" if rec["reconciles"]
+                         else "UNRECONCILED_CENSUS — do not quote")
+
+    constraint_state = "not_supplied"
+    diag = getattr(report, "constraint_diagnostics", None) or {}
+    if diag:
+        unresolved = int(diag.get("unresolved", 0) or 0)
+        total = int(diag.get("directives", 0) or 0)
+        constraint_state = (
+            f"fully_parsed ({total} directives)" if not unresolved else
+            f"partially_parsed ({unresolved} of {total} unevaluated)")
+
+    netlist_parsed = bool(getattr(getattr(report, "netlist", None),
+                                  "modules", None))
+    sources = dict(getattr(report, "sources", None) or {})
+
+    lines = [
+        "HANDOFF_MANIFEST",
+        "This block states how complete the rest of this payload is. Check it "
+        "before deriving anything. Where a figure is a subset, the complete "
+        "form is named; retrieve it rather than reconstructing it.",
+        f"  design: {sources.get('design') or 'unnamed'}",
+        f"  total_faults: {rec['total_faults']}",
+        f"  census_in_digest: {census_line}",
+        f"  census_sums_to_total: {rec['reconciles']} "
+        f"(sum={rec['sum_of_class_counts']}, delta={rec['delta']})",
+        f"  census_complete_via: {CENSUS_HOME}",
+        f"  coverage_loss_faults: "
+        f"{getattr(summary, 'coverage_loss_count', loss)}",
+        f"  faults_in_fault_table: {shown} of {loss} "
+        f"({'complete' if shown >= loss else 'sampled'})",
+        f"  metrics_basis: {metrics_basis}",
+        f"  unclassified_classes: "
+        f"{', '.join(rec['unclassified_tokens']) or 'none'}",
+        f"  constraint_file: {constraint_state}",
+        f"  netlist_parsed: {'yes' if netlist_parsed else 'no'}",
+        f"  tools_available: {'yes (MCP)' if agentic else 'no'}",
+    ]
+    if not rec["reconciles"]:
+        lines.append(
+            "  ACTION REQUIRED: the census does not reconcile. Do not compute "
+            "any coverage metric from it, do not name the residual, and "
+            "report the inconsistency (report_handoff_gap when tools are "
+            "available).")
+    lines.append("")
+    return lines
+
+
+def _metrics_lines(report: Any) -> List[str]:
+    """The coverage metrics, each with the arithmetic that produced it.
+
+    Printed rather than left for the model to derive, because deriving them
+    means picking a denominator, and picking a denominator from an incomplete
+    class list is how a headline figure ended up two points out.
+    """
+    stats = getattr(report, "statistics", None)
+    if stats is None or not hasattr(stats, "metrics"):
+        return []
+    m = stats.metrics()
+    lines = [f"- Coverage metrics (computed from the COMPLETE census above; "
+             f"posdet_credit={m['posdet_credit']}):"]
+    for key, label in (("test_coverage", "test coverage"),
+                       ("fault_coverage", "fault coverage"),
+                       ("atpg_effectiveness", "atpg effectiveness")):
+        spec = m.get("formulas", {}).get(key, {})
+        value = m[key]
+        shown = "n/a" if value is None else f"{value:.4f}%"
+        lines.append(f"    {label}: {shown}  [{spec.get('formula', '')}]  "
+                     f"{spec.get('substitution', '')}")
+    lines.append(f"    roles: " + ", ".join(
+        f"{r}={m['roles'].get(r, 0)}" for r in ("DT", "PD", "UD", "AU", "ND"))
+        + f", FU={m['total_faults']}")
+    lines.append(f"    {m.get('ud_definition', '')}")
+    lines.append(f"    {m.get('basis', '')}")
+    return lines
+
+
 def build_user_payload(report: Any, max_faults: int = 200,
                        agentic: bool = False) -> str:
     """Serialise an :class:`AnalysisReport` into a structured text payload.
@@ -501,15 +727,17 @@ def build_user_payload(report: Any, max_faults: int = 200,
     s = report.summary
     lines: List[str] = []
 
+    census_lines, census_partial = _census_block(report)
+
     lines.append("# ATPG STRUCTURAL ANALYSIS EVIDENCE (machine-extracted)")
     lines.append("")
+    lines.extend(build_handoff_manifest(report, max_faults, census_partial,
+                                        agentic=agentic))
     lines.append("## Summary")
     lines.append(f"- Total faults analysed: {s.total_faults}")
     lines.append(f"- Coverage-loss faults (AU/UO/UC): {s.coverage_loss_count}")
-    lines.append("- Fault class counts:")
-    for cls in ("DS", "DI", "TI", "AU", "UO", "UC", "UNKNOWN"):
-        if cls in s.class_counts:
-            lines.append(f"    {cls}: {s.class_counts[cls]}")
+    lines.extend(census_lines)
+    lines.extend(_metrics_lines(report))
     lines.append("- Top root-cause categories (structural heuristic):")
     for name, count in s.top_root_causes:
         lines.append(f"    {count:5d}  {name}")
@@ -1013,20 +1241,34 @@ class DebugAgent:
         the Copilot CLI with that config so the model can call
         ``list_faults`` / ``get_fault_detail`` / ``why_blocked`` /
         ``list_constraints`` / ``trace_path`` itself.
+
+        Every artefact goes into one directory named after the design and this
+        run, and is deleted when the run ends. Flat temp files from earlier
+        runs of *other* designs were being left where an agent doing
+        filesystem discovery could read them as current input; nothing in a
+        bare ``atpg_evidence_xxxx.json`` says which design it describes.
         """
+        sources = dict(getattr(report, "sources", None) or {})
+        stamp = session.stamp(sources.get("design"), sources)
+        work_dir = session.session_dir(stamp["design"], stamp["run_id"],
+                                       reuse_env=False)
         evidence = investigate.export_evidence(
             ctx.fault_results, ctx.constraints, ctx.netlist,
             adjacency=getattr(ctx, "adjacency", None),
             compare=getattr(ctx, "compare", None),
             triage=getattr(ctx, "triage", None),
-            context=getattr(ctx, "context", None))
-        ev_fd, ev_path = tempfile.mkstemp(prefix="atpg_evidence_", suffix=".json")
-        with os.fdopen(ev_fd, "w", encoding="utf-8") as fh:
+            context=getattr(ctx, "context", None),
+            design=investigate.serialize_design(
+                getattr(ctx, "netlist", None), report),
+            stamp=stamp)
+        ev_path = os.path.join(work_dir, "evidence.json")
+        with open(ev_path, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)
 
         server_env = {
             "PYTHONPATH": _REPO_ROOT,
             "ATPG_EVIDENCE_FILE": ev_path,
+            session.SESSION_DIR_ENV: work_dir,
         }
         if self.config.cli_home.strip():
             server_env["COPILOT_HOME"] = self.config.cli_home.strip()
@@ -1041,8 +1283,8 @@ class DebugAgent:
                 }
             }
         }
-        cfg_fd, cfg_path = tempfile.mkstemp(prefix="atpg_mcp_", suffix=".json")
-        with os.fdopen(cfg_fd, "w", encoding="utf-8") as fh:
+        cfg_path = os.path.join(work_dir, "mcp-config.json")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
             json.dump(mcp_cfg, fh)
 
         tool_names = ", ".join(investigate.TOOL_SPECS)
@@ -1066,11 +1308,7 @@ class DebugAgent:
                 extra_args=["--additional-mcp-config", "@" + cfg_path],
                 on_chunk=on_chunk)
         finally:
-            for p in (ev_path, cfg_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            session.cleanup(work_dir)
 
     def _call_cli(self, system_prompt: str, user_payload: str,
                   session_id: Optional[str] = None,

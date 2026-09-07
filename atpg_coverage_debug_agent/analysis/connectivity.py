@@ -7,12 +7,13 @@ pure-Python fallback keeps the tool functional without the dependency.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
+from ..config.analysis_config import get_config
 from ..models import Instance
 from ..parser.verilog_parser import VerilogNetlist, classify_pin_direction
 
@@ -38,30 +39,55 @@ DEFAULT_MAX_HOPS = 24
 #: output-only and therefore structurally identical, so :func:`tie_value` can
 #: only tell 0 from 1 by the cell name.
 #:
-#: The defaults below cover the abbreviations libraries actually use
-#: (``tiehi``/``tielo``, ``tihi``/``tilo``, ``tieh``/``tiel``, ``thi``/``tlo``,
-#: ``logic1``/``logic0``, ``const1``/``const0``), so no configuration is
-#: required. ``thi``/``tlo`` keep a trailing word boundary because the bare
-#: forms occur inside ordinary words ("something" contains "thi").
-#: ``ATPG_TIE_HIGH_PATTERNS`` / ``ATPG_TIE_LOW_PATTERNS`` are an optional
-#: escape hatch for a library that names them some other way; each holds extra
-#: regex alternatives separated by ``|``.
-_TIE_HIGH_DEFAULT = r"tiehi|tihi|tieh|thi\b|tie1|logic1|const1"
-_TIE_LOW_DEFAULT = r"tielo|tilo|tiel|tlo\b|tie0|logic0|const0"
+#: The pattern lists live in :mod:`..config.analysis_config` and cover the
+#: abbreviations libraries actually use, so no configuration is required for a
+#: typical partition. A library that names constants some other way is
+#: onboarded by extending ``tie_high_patterns`` / ``tie_low_patterns`` there,
+#: or via the ``ATPG_TIE_HIGH_PATTERNS`` / ``ATPG_TIE_LOW_PATTERNS``
+#: environment variables.
 
 
-def _pattern_body(env_var: str, default: str) -> str:
-    extra = os.environ.get(env_var, "").strip()
-    return f"{default}|{extra}" if extra else default
+def _tie_regexes() -> Tuple["re.Pattern", "re.Pattern", "re.Pattern"]:
+    """Compile the active tie-cell patterns, cached per pattern set.
+
+    Recompiled whenever the configuration changes so a test (or a run with a
+    different library) sees its own vocabulary rather than a stale one.
+    """
+    config = get_config()
+    key = (tuple(config.tie_high_patterns), tuple(config.tie_low_patterns))
+    cached = _TIE_CACHE.get(key)
+    if cached is None:
+        high_body = "|".join(config.tie_high_patterns) or r"(?!)"
+        low_body = "|".join(config.tie_low_patterns) or r"(?!)"
+        cached = (
+            re.compile(f"({high_body}|{low_body}|_tie)", re.I),
+            re.compile(f"({high_body})", re.I),
+            re.compile(f"({low_body})", re.I),
+        )
+        _TIE_CACHE.clear()
+        _TIE_CACHE[key] = cached
+    return cached
 
 
-_TIE_HIGH_BODY = _pattern_body("ATPG_TIE_HIGH_PATTERNS", _TIE_HIGH_DEFAULT)
-_TIE_LOW_BODY = _pattern_body("ATPG_TIE_LOW_PATTERNS", _TIE_LOW_DEFAULT)
+_TIE_CACHE: Dict[Tuple[Tuple[str, ...], Tuple[str, ...]], Tuple] = {}
 
-_TIE_CELL_TYPE = re.compile(
-    f"({_TIE_HIGH_BODY}|{_TIE_LOW_BODY}|_tie)", re.I)
-_TIE_HIGH_TYPE = re.compile(f"({_TIE_HIGH_BODY})", re.I)
-_TIE_LOW_TYPE = re.compile(f"({_TIE_LOW_BODY})", re.I)
+
+def is_unconnected_net(net: Optional[str]) -> bool:
+    """True when *net* names a dangling net left by synthesis or scan stitch.
+
+    Matching uses the configurable ``unconnected_net_patterns`` globs, so a
+    flow that marks open nets with its own convention is handled without a
+    code change. An empty net name counts as unconnected: a pin bound to
+    nothing is exactly the situation these patterns describe.
+    """
+    if net is None:
+        return True
+    name = net.strip()
+    if not name:
+        return True
+    lowered = name.lower()
+    return any(fnmatch.fnmatch(lowered, pattern.lower())
+               for pattern in get_config().unconnected_net_patterns)
 
 
 def _pin_direction(pin) -> str:
@@ -99,14 +125,15 @@ def is_tie_cell(inst: Instance, netlist: Optional[VerilogNetlist] = None) -> boo
         return True
     if any(d == "input" for d in directions):
         return False
-    return bool(_TIE_CELL_TYPE.search(inst.cell_type or ""))
+    return bool(_tie_regexes()[0].search(inst.cell_type or ""))
 
 
 def tie_value(cell_type: str) -> Optional[str]:
     """Return ``'1'`` / ``'0'`` for a tie cell type, else ``None``."""
-    if _TIE_HIGH_TYPE.search(cell_type or ""):
+    _any_tie, high, low = _tie_regexes()
+    if high.search(cell_type or ""):
         return "1"
-    if _TIE_LOW_TYPE.search(cell_type or ""):
+    if low.search(cell_type or ""):
         return "0"
     return None
 

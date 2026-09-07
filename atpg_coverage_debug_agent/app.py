@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from .analysis.summarizer import build_report
+from .config.analysis_config import AnalysisConfig, resolve
 from .models import AnalysisReport
-from .parser.constraint_parser import parse_constraints_file
-from .parser.fault_parser import parse_fault_list_file
+from .parser.constraint_parser import parse_constraints_file_ex
+from .parser.fault_parser import parse_fault_list_file_ex
 from .parser.verilog_parser import parse_verilog_file
 
 logger = logging.getLogger(__name__)
@@ -59,23 +60,35 @@ def _source_metadata(inputs: "AnalysisInputs") -> dict:
 
 
 def analyze_paths(inputs: AnalysisInputs, progress=None,
-                  skill_manager=None) -> AnalysisReport:
+                  skill_manager=None,
+                  config: Optional[AnalysisConfig] = None) -> AnalysisReport:
     """Parse the three artefacts and run the analysis pipeline.
 
     Args:
         inputs: Resolved input paths.
         progress: Optional ``callable(done, total, msg)`` progress callback.
         skill_manager: Optional SkillManager to run analysis skills.
+        config: Analysis configuration. When omitted the active configuration
+            is used, which is loaded from ``ATPG_ANALYSIS_CONFIG`` or falls
+            back to the documented defaults. Everything design-specific — the
+            fault-class role map, scan and clock pin names, tie-cell and
+            dangling-net conventions, thresholds — lives there, so a new
+            partition is onboarded without touching code.
 
     Returns:
         A populated :class:`AnalysisReport`.
 
     Raises:
         FileNotFoundError / ValueError: when required inputs are missing.
+        ..diagnostics.ThresholdExceeded: when too large a share of the fault
+            list carries a class the configuration does not describe. Failing
+            here is deliberate: a census that silently drops records produces
+            coverage numbers that look plausible and are wrong.
     """
     _validate(inputs.netlist_path, "Netlist")
     _validate(inputs.faults_path, "Fault list")
 
+    config = resolve(config)
     warnings: List[str] = []
 
     if progress:
@@ -84,17 +97,23 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 
     if progress:
         progress(1, 5, "Parsing fault list")
-    faults, fault_warnings = parse_fault_list_file(inputs.faults_path)
-    warnings.extend(fault_warnings)
+    fault_parse = parse_fault_list_file_ex(inputs.faults_path, config=config)
+    faults = fault_parse.records
+    warnings.extend(fault_parse.warnings)
 
     constraints = []
+    constraint_parse = None
     if inputs.constraints_path:
         if os.path.isfile(inputs.constraints_path):
             if progress:
                 progress(2, 5, "Parsing constraints")
-            constraints, con_warnings = parse_constraints_file(
-                inputs.constraints_path)
-            warnings.extend(con_warnings)
+            # The netlist is handed to the constraint parser so ``[get_pins
+            # -hier ...]`` collections resolve to real objects instead of
+            # being recorded as unresolved patterns.
+            constraint_parse = parse_constraints_file_ex(
+                inputs.constraints_path, config=config, netlist=netlist)
+            constraints = constraint_parse.records
+            warnings.extend(constraint_parse.warnings)
         else:
             warnings.append(
                 f"Constraint file not found: {inputs.constraints_path}"
@@ -103,7 +122,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     if progress:
         progress(3, 5, "Running analysis")
     report = build_report(netlist, faults, constraints, warnings,
-                          progress=progress)
+                          progress=progress, config=config)
 
     # Retain the parsed artefacts so the agentic AI layer can build a live
     # AnalysisContext and invoke skills as tools on demand.
@@ -111,6 +130,11 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report.faults = faults
     report.constraints = constraints
     report.sources = _source_metadata(inputs)
+    report.fault_list_header = fault_parse.header
+    report.class_diagnostics = fault_parse.unrecognised
+    report.constraint_diagnostics = (constraint_parse.summary()
+                                     if constraint_parse else None)
+    report.analysis_config = config.documented_patterns()
 
     # Self-audit: the paths and claims this tool just generated must trace
     # back to the inputs. A violation here is a defect in the tool, so it is
@@ -125,7 +149,8 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
         if progress:
             progress(4, 5, "Running skills")
         from .skills.base import AnalysisContext
-        from .analysis.investigate import serialize_context, serialize_triage
+        from .analysis.investigate import (serialize_context, serialize_design,
+                                           serialize_triage)
         ctx = AnalysisContext(
             netlist=netlist,
             faults=faults,
@@ -137,6 +162,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
                                     report.selected_categories,
                                     report.recommendations),
             context=serialize_context(report),
+            design=serialize_design(netlist, report),
         )
         report.skill_results = skill_manager.run_all(ctx)
 
@@ -147,12 +173,14 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 
 def run_analysis(netlist_path: str, faults_path: str,
                  constraints_path: Optional[str] = None,
-                 progress=None, skill_manager=None) -> AnalysisReport:
+                 progress=None, skill_manager=None,
+                 config: Optional[AnalysisConfig] = None) -> AnalysisReport:
     """Convenience wrapper accepting raw path strings."""
     return analyze_paths(
         AnalysisInputs(netlist_path, faults_path, constraints_path),
         progress=progress,
         skill_manager=skill_manager,
+        config=config,
     )
 
 
@@ -165,7 +193,9 @@ class PartitionInputs:
 
 
 def analyze_partitions(partitions: List["PartitionInputs"], progress=None,
-                       skill_manager=None) -> List[Tuple[str, AnalysisReport]]:
+                       skill_manager=None,
+                       config: Optional[AnalysisConfig] = None
+                       ) -> List[Tuple[str, AnalysisReport]]:
     """Analyse several partitions and return ``[(name, report), ...]``.
 
     Each partition is analysed independently through :func:`analyze_paths`, so
@@ -184,7 +214,7 @@ def analyze_partitions(partitions: List["PartitionInputs"], progress=None,
             if progress:
                 progress(_i, total, f"[{_name}] {msg}")
         report = analyze_paths(part.inputs, progress=_sub,
-                               skill_manager=skill_manager)
+                               skill_manager=skill_manager, config=config)
         results.append((part.name, report))
     if progress:
         progress(total, total, "All partitions complete")

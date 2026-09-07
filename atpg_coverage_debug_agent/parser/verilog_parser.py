@@ -22,6 +22,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from ..config.analysis_config import (
+    DEFAULT_SCAN_IN_PINS,
+    DEFAULT_SCAN_OUT_PINS,
+    DEFAULT_SHIFT_ENABLE_PINS,
+    get_config,
+)
 from ..models import Instance, Module, Net, Pin
 
 logger = logging.getLogger(__name__)
@@ -65,28 +71,36 @@ _VERILOG_KEYWORDS = {
 # A cell is scannable when it has BOTH a dedicated scan-data input and a
 # shift-enable pin. These sets are the vocabulary for that test; matching is on
 # the literal pin name of an instantiation, never on the instance name.
-_SCAN_IN_PINS = frozenset({"si", "sd", "ti", "sin", "scan_in", "scanin",
-                           "sdi", "test_si", "tie"})
-_SCAN_OUT_PINS = frozenset({"so", "to", "sout", "scan_out", "scanout",
-                            "sdo", "test_so", "q_so"})
-_SHIFT_ENABLE_PINS = frozenset({"se", "ssb", "sen", "scan_en", "scan_enable",
-                                "shift_en", "test_se", "sh", "smc"})
+#
+# The vocabulary lives in :mod:`..config.analysis_config` so a library that
+# names its scan pins differently is onboarded by configuration rather than by
+# editing this module. The frozensets below are the historic defaults, kept
+# only as a fallback for callers that bypass the configuration.
+_SCAN_IN_PINS = frozenset(DEFAULT_SCAN_IN_PINS)
+_SCAN_OUT_PINS = frozenset(DEFAULT_SCAN_OUT_PINS)
+_SHIFT_ENABLE_PINS = frozenset(DEFAULT_SHIFT_ENABLE_PINS)
 
 
 def scan_pin_role(pin_name: str) -> Optional[str]:
     """Return ``'scan_in'`` / ``'scan_out'`` / ``'shift_enable'`` or ``None``.
 
+    The pin vocabulary comes from the active analysis configuration, so a
+    partition whose library calls its shift enable something unusual is
+    handled by adding one name to the config.
+
     Args:
         pin_name: The literal pin name from an instantiation.
     """
-    name = (pin_name or "").strip().lstrip(".").lower()
-    if name in _SCAN_IN_PINS:
-        return "scan_in"
-    if name in _SCAN_OUT_PINS:
-        return "scan_out"
-    if name in _SHIFT_ENABLE_PINS:
-        return "shift_enable"
-    return None
+    return get_config().scan_pin_role(pin_name)
+
+
+def is_clock_pin(pin_name: str) -> bool:
+    """True when *pin_name* is a clock pin under the configured vocabulary.
+
+    A clock pin is what makes a cell sequential, which is the only kind of
+    neighbour that can form a real scan/non-scan boundary.
+    """
+    return get_config().is_clock_pin(pin_name)
 
 
 @dataclass
@@ -201,6 +215,41 @@ def _parse_connections(conns: str) -> List[Pin]:
     return pins
 
 
+def parse_instantiation(text: str) -> Optional[Instance]:
+    """Parse one verbatim instantiation into an :class:`Instance`.
+
+    The report and the exported evidence both carry the literal instantiation
+    text for a fault site. This turns that text back into a pin list, so a
+    process that no longer holds the parsed netlist -- the out-of-process MCP
+    server, or a reloaded session -- can still answer a pin-evidence question
+    from the *same* text a reader would see, instead of reporting that no
+    netlist is available while another tool happily quotes the instantiation.
+
+    Args:
+        text: Verbatim instantiation, including continuation lines.
+
+    Returns:
+        An :class:`Instance` with its pins, or ``None`` when *text* is not an
+        instantiation. Never guesses: an unparsable string yields ``None``
+        rather than an instance with an empty pin list.
+    """
+    if not text or not text.strip():
+        return None
+    match = _INSTANCE_RE.search(_strip_comments(text))
+    if not match:
+        return None
+    cell_type = match.group("type")
+    if not _looks_like_instance(cell_type):
+        return None
+    return Instance(
+        name=match.group("name"),
+        cell_type=cell_type,
+        module="",
+        pins=_parse_connections(match.group("conns")),
+        source_text=text.strip(),
+    )
+
+
 def classify_pin_direction(pin_name: str) -> str:
     """Heuristically classify a pin as input/output by common naming.
 
@@ -212,10 +261,13 @@ def classify_pin_direction(pin_name: str) -> str:
     an input, and mis-directing a scan-out pin makes a scan cell look like it
     has no scan connection at all.
     """
-    name = pin_name.lower()
-    if name in _SCAN_OUT_PINS:
+    name = (pin_name or "").strip().lstrip(".").lower()
+    role = get_config().scan_pin_role(name)
+    if role == "scan_out":
         return "output"
-    if name in _SCAN_IN_PINS or name in _SHIFT_ENABLE_PINS:
+    if role in ("scan_in", "shift_enable"):
+        return "input"
+    if get_config().is_clock_pin(name):
         return "input"
     output_like = ("q", "qn", "y", "z", "o", "out", "co", "s", "sum")
     input_like = ("a", "b", "c", "d", "ci", "ck", "clk", "clock", "rn", "sn",

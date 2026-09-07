@@ -89,13 +89,99 @@ used to corroborate it when one is present:
 
 - `constraint_induced_controllability_loss`
 - `constraint_induced_observability_loss`
-- `scan_to_non_scan_boundary`
-- `non_scan_blocks_propagation`
+- `scan_to_non_scan_boundary` — only ever from a **sequential** neighbour
+- `non_scan_blocks_propagation` — likewise
+- `scan_capable_but_not_chain_connected` — the cell has a scan-data input and
+  a shift-enable but its scan-in/scan-out is dangling; re-stitch it, do not
+  add a wrapper
 - `tied_or_constant_hardware`
 - `clock_reset_or_test_enable_blocking`
 - `structural_masking_or_reconvergence`
 - `unresolved_connectivity`
 - `other_structural_cause`
+
+---
+
+## Coverage metrics
+
+The analyzer assigns every fault class a **coverage role**, and the role — never
+the class label — drives the numbers:
+
+| Role | Meaning | Default classes | Effect |
+| --- | --- | --- | --- |
+| `DT` | detected | `DS`, `DI.*` | numerator, full credit |
+| `PD` | possibly detected | `PT`, `PU` | numerator, `posdet_credit` |
+| `UD` | undetectable | `UU`, `TI`, `BL`, `RE` | removed from the test-coverage denominator |
+| `AU` | ATPG untestable | `AU.*` | stays in the denominator |
+| `ND` | not detected | `UO.*`, `UC.*` | coverage loss |
+
+```
+test_coverage      = (DT + posdet_credit*PD) / (FU - UD)
+fault_coverage     = (DT + posdet_credit*PD) / FU
+atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU
+```
+
+Every percentage is printed next to the counts it came from, and a metric that
+is undefined for the population (no faults, or every fault undetectable) is
+reported as `n/a` rather than as a fabricated number. After parsing, the
+analyzer asserts `DT + PD + UD + AU + ND == records parsed`; a census that does
+not reconcile aborts instead of shipping plausible-looking wrong figures.
+
+A class the role map does not describe is **never** merged into a catch-all: it
+keeps its verbatim token, is warned about by name with retained sample records,
+is excluded from every metric, and past a configurable threshold it fails the
+run outright.
+
+---
+
+## Configuration — onboarding a new partition
+
+Everything design-specific lives in one JSON file, so a different design,
+hierarchy depth, cell library, Tessent version or fault model is a
+configuration change and never a code change. Point `ATPG_ANALYSIS_CONFIG` at
+it, or pass `config=` to `run_analysis`.
+
+| Key | Default | What it controls |
+| --- | --- | --- |
+| `class_roles` | `DS,DI→DT`, `PT,PU→PD`, `UU,TI,BL,RE→UD`, `AU→AU`, `UO,UC→ND` | Fault class → coverage role |
+| `posdet_credit` | `0.5` | Credit given to a `PD` fault |
+| `unknown_class_threshold_pct` | `0.1` | Unrecognised-class share that fails the run |
+| `unknown_class_fatal` | `true` | Whether that threshold raises |
+| `unresolved_constraint_threshold_pct` | `10.0` | Unknown-directive share before escalation |
+| `unresolved_constraint_fatal` | `false` | Whether that threshold raises |
+| `unmapped_object_threshold_pct` | `100.0` | Unmapped-fault-object share before escalation |
+| `unmapped_object_fatal` | `false` | Whether that threshold raises |
+| `sample_limit` | `20` | Verbatim samples kept per unrecognised token |
+| `scan_in_pins` | `si, sd, ti, sin, scan_in, scanin, sdi, test_si, tie` | Scan-data input pin names |
+| `scan_out_pins` | `so, to, sout, scan_out, scanout, sdo, test_so, q_so` | Scan-data output pin names |
+| `shift_enable_pins` | `se, ssb, sen, scan_en, scan_enable, shift_en, test_se, sh, smc` | Shift-enable pin names |
+| `clock_pins` | `clk, ck, clock, cp, gclk, clkin, clkb, ckn, clk_n` | Clock pin names (what makes a cell sequential) |
+| `unconnected_net_patterns` | `SYNOPSYS_UNCONNECTED*, *_UNCONNECTED*, *UNCONNECTED*, *_OPEN*, *_DANGLING*` | Dangling-net naming (globs) |
+| `tie_high_patterns` | `tiehi, tihi, tieh, thi\b, tie1, logic1, const1` | Tie-high cell naming (regex) |
+| `tie_low_patterns` | `tielo, tilo, tiel, tlo\b, tie0, logic0, const0` | Tie-low cell naming (regex) |
+| `constraint_directives` | Tessent `add_*` / `set_*` set | Dofile directive → constraint kind |
+| `constraint_value_codes` | `C0/C1/CX`, `T0/T1/TX`, `0/1/X` | Constraint value token → logical value |
+| `replace_defaults` | `false` | Replace the defaults instead of merging into them |
+
+Maps and lists are **merged** into the defaults, so a partition only names what
+differs:
+
+```json
+{
+  "class_roles": { "NC": "UD" },
+  "scan_in_pins": ["chain_data_in"],
+  "shift_enable_pins": ["shiftctl"],
+  "clock_pins": ["clkin"],
+  "unconnected_net_patterns": ["nc_house_style_*"],
+  "tie_high_patterns": ["mylib_tiehi"]
+}
+```
+
+Scan-ness, sequential-ness and tie-ness are decided from **pin lists and
+connectivity**, never from instance or cell-type names; the vocabularies above
+only say what a pin is called. The active configuration is recorded in every
+report, so a reader can tell "this library has no scan cells" apart from "we
+were never told what this library calls its scan pins".
 
 ---
 

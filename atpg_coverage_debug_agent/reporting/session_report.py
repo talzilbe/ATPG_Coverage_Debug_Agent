@@ -100,6 +100,12 @@ def _constraint_to_dict(c: ConstraintRecord) -> Dict[str, Any]:
         "normalized_signal": c.normalized_signal,
         "value": c.value,
         "notes": c.notes,
+        "directive": c.directive,
+        "options": dict(c.options or {}),
+        "targets": list(c.targets or []),
+        "resolved": c.resolved,
+        "source_file": c.source_file,
+        "conditional": c.conditional,
     }
 
 
@@ -154,6 +160,19 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         "category_dumps": [d.as_dict()
                            for d in (getattr(report, "category_dumps", None)
                                      or [])],
+        # What the inputs declared and how well they were understood. These
+        # travel with the session because a reloaded report must be able to
+        # say whether its census is collapsed, which classes it could not
+        # interpret, and how much of the constraint file it actually parsed.
+        "fault_list_header": (report.fault_list_header.as_dict()
+                              if getattr(report, "fault_list_header", None)
+                              else None),
+        "class_diagnostics": (report.class_diagnostics.as_dict()
+                              if getattr(report, "class_diagnostics", None)
+                              else None),
+        "constraint_diagnostics": getattr(report, "constraint_diagnostics",
+                                          None),
+        "analysis_config": getattr(report, "analysis_config", None),
     }
 
 
@@ -242,6 +261,12 @@ def _dict_to_constraint(d: Dict[str, Any]) -> ConstraintRecord:
         normalized_signal=d.get("normalized_signal"),
         value=d.get("value"),
         notes=d.get("notes", ""),
+        directive=d.get("directive", ""),
+        options=dict(d.get("options") or {}),
+        targets=list(d.get("targets") or []),
+        resolved=bool(d.get("resolved", True)),
+        source_file=d.get("source_file", ""),
+        conditional=bool(d.get("conditional", False)),
     )
 
 
@@ -293,6 +318,28 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     report.sources = data.get("sources", {}) or {}
     report.investigation = data.get("investigation")
     report.edits = data.get("edits")
+
+    from ..diagnostics import UnrecognisedReport, UnrecognisedToken
+    from ..parser.fault_parser import FaultListHeader
+
+    report.fault_list_header = FaultListHeader.from_dict(
+        data.get("fault_list_header"))
+    diag = data.get("class_diagnostics")
+    if diag:
+        report.class_diagnostics = UnrecognisedReport(
+            domain=str(diag.get("domain", "fault class")),
+            total=int(diag.get("total", 0) or 0),
+            threshold_pct=float(diag.get("threshold_pct", 0.0) or 0.0),
+            fatal=bool(diag.get("fatal", False)),
+            tokens=[UnrecognisedToken(
+                token=str(t.get("token", "")),
+                count=int(t.get("count", 0) or 0),
+                samples=list(t.get("samples") or []),
+                first_line=t.get("first_line"),
+            ) for t in (diag.get("tokens") or [])],
+        )
+    report.constraint_diagnostics = data.get("constraint_diagnostics")
+    report.analysis_config = data.get("analysis_config")
 
     stats_payload = data.get("statistics")
     if stats_payload:

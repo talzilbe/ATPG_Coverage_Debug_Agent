@@ -1,0 +1,53 @@
+FaultInformation {
+ version : 1;
+ FaultType (Stuck) {
+  FaultList {
+   FaultCollapsing : FALSE;
+   Format : Identifier, Class, Location;
+   Instance ("") {
+      0,  DS,        "/top/blk_a/u_and0/y";
+      1,  DS,        "/top/blk_a/u_and0/a";
+      0,  DS,        "/top/blk_a/u_and1/y";
+      1,  DS,        "/top/blk_a/u_and1/a";
+      0,  DS,        "/top/blk_a/u_buf0/y";
+      1,  DS,        "/top/blk_a/u_buf0/a";
+      0,  DS,        "/top/AUX_DS_TIE_RE_block/u_deep0/y";
+      1,  DS,        "/top/AUX_DS_TIE_RE_block/u_deep0/a";
+      0,  DS,        "/top/AUX_DS_TIE_RE_block/u_deep1/y";
+      1,  DS,        "/top/AUX_DS_TIE_RE_block/u_deep1/a";
+      0,  DI.SCAN,   "/top/blk_scan/u_ff0/si";
+      1,  DI.SCAN,   "/top/blk_scan/u_ff0/so";
+      0,  DI.SCAN,   "/top/blk_scan/u_ff1/si";
+      1,  DI.SCAN,   "/top/blk_scan/u_ff1/so";
+      0,  PT,        "/top/blk_pd/u_p0/y";
+      1,  PT,        "/top/blk_pd/u_p1/y";
+      0,  PU,        "/top/blk_pd/u_p2/y";
+      1,  PU,        "/top/blk_pd/u_p3/y";
+      0,  UU,        "/top/blk_ud/u_uu0/y";
+      1,  UU,        "/top/blk_ud/u_uu1/y";
+      0,  UU,        "/top/blk_ud/u_uu2/y";
+      1,  TI,        "/top/blk_ud/u_ti0/y";
+      0,  TI,        "/top/blk_ud/u_ti1/y";
+      1,  TI,        "/top/blk_ud/u_ti2/y";
+      0,  BL,        "/top/blk_ud/u_bl0/y";
+      1,  BL,        "/top/blk_ud/u_bl1/y";
+      0,  RE,        "/top/blk_ud/u_re0/y";
+      1,  RE,        "/top/blk_ud/u_re1/y";
+      0,  AU.TC,     "/top/blk_tc/u_tc0/d";
+      1,  AU.TC,     "/top/blk_tc/u_tc1/d";
+      0,  AU.TC,     "/top/blk_tc/u_tc2/d";
+      1,  AU.TC,     "/top/blk_tc/u_tc3/d";
+      0,  AU.TC,     "/top/blk_tc/u_tc4/d";
+      1,  AU.PC,     "/top/blk_pc/u_pc0/a";
+      0,  AU.PC,     "/top/blk_pc/u_pc1/a";
+      1,  AU.PC,     "/top/blk_pc/u_pc2/a";
+      0,  UO.AAB,    "/top/blk_aab/u_ab0/y";
+      1,  UO.AAB,    "/top/blk_aab/u_ab1/y";
+      0,  UO.AAB,    "/top/blk_aab/u_ab2/y";
+      1,  UO.AAB,    "/top/blk_aab/u_ab3/y";
+      0,  UC,        "/top/blk_uc/u_uc0/a";
+      1,  UC,        "/top/blk_uc/u_uc1/a";
+   }
+  }
+ }
+}

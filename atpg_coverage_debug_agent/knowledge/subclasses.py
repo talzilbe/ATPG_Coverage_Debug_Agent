@@ -18,8 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-#: Fault classes that never represent coverage loss and are therefore excluded
-#: from triage (mirrors the "ignore DS/DI/RE" rule used during manual debug).
+#: Fault classes that never represent coverage loss.
+#:
+#: Retained for readability and for callers that want the historic list. It is
+#: no longer the decision procedure: :func:`is_coverage_loss_class` consults
+#: the configurable coverage-role map instead, which also excludes ``UU``,
+#: ``BL``, ``PT`` and ``PU`` and can absorb classes added per partition.
 DETECTED_FAMILIES = ("DS", "DI", "RE", "TI")
 
 
@@ -430,11 +434,15 @@ def describe_subclass(dotted_class: str) -> Optional[SubclassInfo]:
 def is_coverage_loss_class(dotted_class: str) -> bool:
     """True when *dotted_class* represents coverage loss worth debugging.
 
-    Detected families (``DS``, ``DI``, ``RE``) and tied faults (``TI``) are
-    excluded — they are never debug targets — and so is ``UNKNOWN``, which
-    means the class token was not recognised rather than that coverage was lost.
+    The verdict comes from the configurable coverage-role map: only roles
+    ``AU`` (ATPG-untestable) and ``ND`` (not detected) are loss. Detected
+    (``DS``/``DI``), possibly-detected (``PT``/``PU``) and undetectable
+    (``UU``/``TI``/``BL``/``RE``) classes are excluded, and so is a class the
+    map does not know — an unrecognised token means the tool was not taught
+    the class, which is not evidence that coverage was lost.
+
+    Args:
+        dotted_class: A class id such as ``AU.TC``, ``UO.AAB`` or ``UC``.
     """
-    family = (dotted_class or "").strip().upper().split(".", 1)[0]
-    if not family or family == "UNKNOWN":
-        return False
-    return family not in DETECTED_FAMILIES
+    from ..config.analysis_config import get_config
+    return get_config().is_loss_class(dotted_class)

@@ -17,16 +17,27 @@ from typing import Any, Dict, List, Optional
 # Enumerations
 # ---------------------------------------------------------------------------
 class FaultClass(str, Enum):
-    """Tessent-style fault classification codes that we understand.
+    """Tessent fault classification codes the analyzer models explicitly.
 
-    Only a subset of the full Tessent fault dictionary is modelled here; the
-    classes that matter for coverage-loss debugging are ``AU``, ``UO`` and
-    ``UC``. Unknown codes are preserved verbatim via :class:`FaultRecord`.
+    The full standard stuck-at set is present, not just the coverage-loss
+    subset. An incomplete enum here is what previously let five legitimate
+    classes (``UU``, ``BL``, ``RE``, ``PT``, ``PU``) fall into ``UNKNOWN``
+    without a warning and corrupt every derived metric.
+
+    A class that this enum does not name is *not* silently reclassified: the
+    verbatim token is kept in :attr:`FaultRecord.raw_class_token`, the record
+    is reported by :mod:`..diagnostics`, and the coverage role still comes
+    from :mod:`..config.analysis_config`, which is overridable per partition.
     """
 
     DS = "DS"  # Detected by simulation
     DI = "DI"  # Detected by implication
-    TI = "TI"  # Tied (constant) by hardware
+    PT = "PT"  # Possibly detected, testable
+    PU = "PU"  # Possibly detected, untestable
+    UU = "UU"  # Undetectable, unused
+    TI = "TI"  # Undetectable, tied (constant) by hardware
+    BL = "BL"  # Undetectable, blocked
+    RE = "RE"  # Undetectable, redundant
     AU = "AU"  # ATPG untestable -> coverage loss
     UO = "UO"  # Unobserved -> coverage loss
     UC = "UC"  # Uncontrolled -> coverage loss
@@ -43,6 +54,11 @@ class FaultClass(str, Enum):
 
 
 #: Fault classes that represent actual coverage loss we want to root-cause.
+#:
+#: Kept as a constant for readability only. The authoritative decision is
+#: :meth:`..config.analysis_config.AnalysisConfig.is_loss_class`, which is
+#: driven by the configurable role map so a partition can onboard a class this
+#: tuple has never heard of.
 COVERAGE_LOSS_CLASSES = (FaultClass.AU, FaultClass.UO, FaultClass.UC)
 
 #: Fault classes that count as detected coverage.
@@ -94,6 +110,12 @@ class RootCause(str, Enum):
     CONSTRAINT_OBSERVABILITY = "constraint_induced_observability_loss"
     SCAN_TO_NON_SCAN = "scan_to_non_scan_boundary"
     NON_SCAN_PROPAGATION = "non_scan_blocks_propagation"
+    #: The cell has a scan-data input and a shift-enable, so it is scannable,
+    #: but its scan-in and/or scan-out binds to a dangling net: it was never
+    #: stitched into a chain. Structurally distinct from a scan/non-scan
+    #: boundary and fixed differently (re-stitch, not add a wrapper), so it
+    #: must not be folded into the boundary categories.
+    SCAN_NOT_CHAIN_CONNECTED = "scan_capable_but_not_chain_connected"
     TIED_OR_CONSTANT = "tied_or_constant_hardware"
     #: Alias: the ``tied_constant`` bucket. A fault site whose resolved driver
     #: is a tie cell belongs here and NOT in ``other_structural_cause`` -- it
@@ -194,8 +216,22 @@ class FaultRecord:
 
     @property
     def is_coverage_loss(self) -> bool:
-        """True when this fault contributes to coverage loss."""
-        return self.fault_class in COVERAGE_LOSS_CLASSES
+        """True when this fault contributes to debuggable coverage loss.
+
+        Decided from the configurable coverage-role map rather than a
+        hard-coded class tuple, so a partition that introduces a new class
+        only needs a configuration entry. Roles ``AU`` and ``ND`` are loss;
+        ``DT``, ``PD`` and ``UD`` are not, and an unrecognised class is never
+        counted as loss because that would be an inference, not a reading.
+        """
+        from .config.analysis_config import get_config
+        return get_config().is_loss_class(self.dotted_class)
+
+    @property
+    def coverage_role(self) -> str:
+        """Coverage role of this fault (``DT``/``PD``/``UD``/``AU``/``ND``)."""
+        from .config.analysis_config import get_config
+        return get_config().role_of(self.dotted_class).value
 
     @property
     def subclass(self) -> Optional[str]:
@@ -213,9 +249,17 @@ class FaultRecord:
 
     @property
     def dotted_class(self) -> str:
-        """Canonical ``CLASS`` or ``CLASS.SUB`` identifier for this fault."""
-        sub = self.subclass
+        """Canonical ``CLASS`` or ``CLASS.SUB`` identifier for this fault.
+
+        When the class family is one this build does not model, the verbatim
+        token from the fault list is used rather than the string ``UNKNOWN``,
+        so an unrecognised class stays visible and inspectable instead of
+        merging with every other unrecognised class.
+        """
         base = self.fault_class.value
+        if self.fault_class is FaultClass.UNKNOWN and self.raw_class_token:
+            return self.raw_class_token.strip().upper()
+        sub = self.subclass
         return f"{base}.{sub}" if sub else base
 
     @property
@@ -228,7 +272,14 @@ class FaultRecord:
 
 @dataclass
 class ConstraintRecord:
-    """A structured representation of one constraint line."""
+    """A structured representation of one constraint directive.
+
+    The first six fields are the historic shape and are what fault matching
+    uses. The rest record what the dofile grammar understood, so a reader can
+    tell "no constraint affects this fault" apart from "the constraint file
+    could not be parsed" — presenting the second as the first turns a parser
+    limitation into a claim about the design.
+    """
 
     raw_text: str
     line_number: int
@@ -237,6 +288,21 @@ class ConstraintRecord:
     normalized_signal: Optional[str] = None
     value: Optional[str] = None
     notes: str = ""
+    #: Verbatim command name as written, e.g. ``add_cell_constraints``.
+    directive: str = ""
+    #: Option flags and their values, e.g. ``{"-hier": "", "-pulse_always": ""}``.
+    options: Dict[str, str] = field(default_factory=dict)
+    #: Every object this directive applies to, after collection expansion.
+    targets: List[str] = field(default_factory=list)
+    #: False when the directive was recognised but could not be evaluated
+    #: (an unexpanded variable, an unresolvable collection, a condition).
+    resolved: bool = True
+    #: File the directive came from, which differs from the top-level
+    #: constraint file once ``dofile`` includes are followed.
+    source_file: str = ""
+    #: True when the directive sits inside an ``if``/``else`` branch that was
+    #: not evaluated, so it may or may not apply to a given run.
+    conditional: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +481,22 @@ class AnalysisReport:
     #: Fault-class breakdown derived from the fault list alone
     #: (``analysis.statistics.DerivedStatistics``).
     statistics: Any = None
+    #: What the fault list declared about itself: format, compression,
+    #: version, fault models and whether the faults are collapsed
+    #: (``parser.fault_parser.FaultListHeader``). ``None`` for older reports.
+    fault_list_header: Any = None
+    #: Per-token accounting of fault classes the tool did not recognise
+    #: (``diagnostics.UnrecognisedReport``). ``None`` for older reports.
+    class_diagnostics: Any = None
+    #: What the constraint file actually gave us: how many directives were
+    #: recognised, how many could not be evaluated, and which directive names
+    #: are unknown (``parser.constraint_parser.ConstraintParseResult.summary``).
+    #: Distinguishes "no constraint affects this fault" from "the constraint
+    #: file was only partly parsed".
+    constraint_diagnostics: Any = None
+    #: The configurable conventions this run used
+    #: (``config.analysis_config.AnalysisConfig.documented_patterns``).
+    analysis_config: Any = None
     #: Coverage-loss categories picked for investigation
     #: (``List[analysis.statistics.SelectedCategory]``).
     selected_categories: Any = None

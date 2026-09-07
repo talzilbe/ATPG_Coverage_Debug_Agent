@@ -57,6 +57,7 @@ class _InvestigativeSkill(SkillBase):
                 compare=getattr(ctx, "compare", None),
                 triage=getattr(ctx, "triage", None),
                 context=getattr(ctx, "context", None),
+                design=getattr(ctx, "design", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -514,6 +515,30 @@ class ReportInsufficientEvidenceSkill(_InvestigativeSkill):
             description=data.get("missing", ""),
             recommendation=data.get("would_settle_it", ""),
             confidence="insufficient")
+
+
+@register
+class ReportHandoffGapSkill(_InvestigativeSkill):
+    skill_id = "report_handoff_gap"
+    tool_name = "report_handoff_gap"
+    display_name = "Report Hand-off Gap (query)"
+    description = investigate.TOOL_SPECS["report_handoff_gap"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"report_handoff_gap: {data['error']}"
+        return ("report_handoff_gap: recorded — the figures handed over do "
+                "not reconcile with each other.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        if data.get("error"):
+            return
+        result.add_finding(
+            title=f"Hand-off inconsistency in {data.get('where') or 'the payload'}",
+            description=data.get("observed", ""),
+            recommendation=data.get("next_step", ""),
+            evidence=[e for e in (data.get("expected", ""),) if e],
+            confidence="high")
 
 
 @register

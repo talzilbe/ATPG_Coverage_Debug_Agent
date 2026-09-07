@@ -256,7 +256,34 @@ def test_help_states_the_key_honesty_caveats():
     from atpg_coverage_debug_agent.gui.main_window import _HELP_HTML
 
     # Claims the tool must never let a reader assume otherwise.
-    assert "not</b> the ATPG tool's test-coverage number" in _HELP_HTML
+    #
+    # The old caveat here said the reported figure was "not the ATPG tool's
+    # test-coverage number". The tool now computes the real metrics, so the
+    # honest statements are different ones: that a metric is undefined rather
+    # than invented, that collapsed and uncollapsed censuses are not
+    # comparable, and that a partly-parsed constraint file does not prove a
+    # fault unconstrained.
+    assert "collapsed" in _HELP_HTML and "uncollapsed" in _HELP_HTML
+    assert "not</b> proven\nunconstrained" in _HELP_HTML
+    assert "rather than invented" in _HELP_HTML
     assert "never predicts a coverage gain" in _HELP_HTML
     assert "never a root\n      cause" in _HELP_HTML
     assert "estimates" in _HELP_HTML
+
+
+def test_help_documents_the_coverage_metric_formulas():
+    """A reader must be able to re-derive any figure the tool prints."""
+    from atpg_coverage_debug_agent.gui.main_window import _HELP_HTML
+
+    assert "test_coverage      = (DT + posdet_credit*PD) / (FU - UD)" in _HELP_HTML
+    assert "fault_coverage     = (DT + posdet_credit*PD) / FU" in _HELP_HTML
+    assert "atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU" in _HELP_HTML
+
+
+def test_help_documents_how_to_onboard_a_new_partition():
+    """Onboarding must be documented as configuration, never a code change."""
+    from atpg_coverage_debug_agent.gui.main_window import _HELP_HTML
+
+    assert "ATPG_ANALYSIS_CONFIG" in _HELP_HTML
+    assert "scan_capable_but_not_chain_connected" in _HELP_HTML
+    assert "sequential" in _HELP_HTML

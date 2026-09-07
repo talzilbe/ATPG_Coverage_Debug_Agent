@@ -11,6 +11,8 @@ import logging
 from collections import Counter
 from typing import List, Optional, Tuple
 
+from ..config.analysis_config import AnalysisConfig, resolve
+from ..diagnostics import UnrecognisedTracker
 from ..models import (
     AnalysisReport,
     AnalysisSummary,
@@ -23,6 +25,7 @@ from ..models import (
 )
 from ..parser.verilog_parser import VerilogNetlist
 from .attribution import attribute_categories
+from .census import build_census, census_warnings
 from .connectivity import ConnectivityModel
 from .mapper import FaultMapper
 from .reachability import profile_categories
@@ -171,7 +174,8 @@ class Summarizer:
 def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
                  constraints: List[ConstraintRecord],
                  parser_warnings: Optional[List[str]] = None,
-                 progress=None) -> AnalysisReport:
+                 progress=None,
+                 config: Optional[AnalysisConfig] = None) -> AnalysisReport:
     """Run the full analysis pipeline and return an :class:`AnalysisReport`.
 
     Args:
@@ -181,10 +185,12 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         parser_warnings: Aggregated warnings from the parsing stage.
         progress: Optional ``callable(done:int, total:int, msg:str)`` for UI
             progress reporting.
+        config: Analysis configuration; the active one is used when omitted.
 
     Returns:
         A populated :class:`AnalysisReport`.
     """
+    config = resolve(config)
     warnings: List[str] = list(parser_warnings or [])
     warnings.extend(netlist.warnings)
 
@@ -201,10 +207,29 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
     loss_faults = [f for f in faults if f.is_coverage_loss]
     results: List[FaultAnalysisResult] = []
     total = len(loss_faults)
+    # Unmapped fault objects get the same treatment as an unrecognised class:
+    # counted per distinct cause, sampled verbatim, and measured against a
+    # configurable threshold. Silent fallback is banned tool-wide, not just in
+    # the fault-class map.
+    mapping_tracker = UnrecognisedTracker(
+        domain="unmapped fault object",
+        threshold_pct=config.unmapped_object_threshold_pct,
+        sample_limit=config.sample_limit,
+        fatal=config.unmapped_object_fatal,
+    )
     for idx, fault in enumerate(loss_faults, start=1):
-        results.append(engine.analyze_fault(fault))
+        result = engine.analyze_fault(fault)
+        results.append(result)
+        mapping_tracker.seen()
+        if not result.connectivity_known:
+            leaf = (fault.normalized_object or "").split("/")[-1] or "(empty)"
+            mapping_tracker.add(leaf, sample=fault.fault_object,
+                                line_number=fault.line_number)
         if progress is not None and (idx % 25 == 0 or idx == total):
             progress(idx, total, f"Analysed {idx}/{total} coverage-loss faults")
+
+    mapping_report = mapping_tracker.enforce()
+    warnings.extend(mapping_report.warnings())
 
     summarizer = Summarizer(faults, results, constraints)
 
@@ -222,7 +247,7 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
     summary = summarizer.summary(warnings, diagnosis.by_cause)
     patterns = summarizer.patterns()
 
-    statistics = compute_statistics(faults)
+    statistics = compute_statistics(faults, config=config)
     selected = enrich_categories(select_categories(statistics), faults)
     attribute_categories(selected, results, connectivity, constraints)
     profile_categories(selected, results, connectivity, constraints)
@@ -233,7 +258,7 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         "%d pattern group(s).",
         len(faults), len(results), len(patterns),
     )
-    return AnalysisReport(
+    report = AnalysisReport(
         summary=summary,
         fault_results=results,
         pattern_groups=patterns,
@@ -243,3 +268,14 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         recommendations=recommendations,
         unresolved_diagnosis=diagnosis,
     )
+
+    # Hard self-check, on every run rather than only under test: the fault
+    # classes must sum to the population the report puts on its cover. A
+    # residual here is a defect in this tool, and the one thing that must
+    # never happen to it is being quietly absorbed -- a reader who finds an
+    # unexplained delta will invent a bucket to hold it.
+    census_issues = census_warnings(build_census(report, config=config))
+    if census_issues:
+        report.warnings.extend(census_issues)
+        report.summary.warnings = list(report.warnings)
+    return report

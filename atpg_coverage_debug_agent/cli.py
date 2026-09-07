@@ -189,10 +189,16 @@ def _print_summary(report: AnalysisReport) -> None:
             parts = ", ".join(f"{k}={v}" for k, v in
                               sorted(causes.items(), key=lambda kv: -kv[1]))
             print(f"  unmapped because    : {parts}")
-    print("\nFault class counts:")
-    for cls in ("DS", "DI", "TI", "AU", "UO", "UC", "UNKNOWN"):
-        if cls in s.class_counts:
-            print(f"  {cls:8s}: {s.class_counts[cls]}")
+    print("\nFault class counts (complete — every class present; the dotted "
+          "breakdown by coverage role is in the census below):")
+    # Every class present, largest first. A fixed list silently omits any
+    # class the analyzer was not written to expect.
+    for cls, count in sorted(s.class_counts.items(),
+                             key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {cls:10s}: {count}")
+    _print_metrics(report)
+    _print_census(report)
+    _print_input_quality(report)
     print("\nTop root causes:")
     for name, count in s.top_root_causes:
         print(f"  {count:4d}  {name}")
@@ -206,6 +212,112 @@ def _print_summary(report: AnalysisReport) -> None:
         if len(report.warnings) > 10:
             print(f"  ... and {len(report.warnings) - 10} more.")
     print("=" * 60)
+
+
+def _print_metrics(report: AnalysisReport) -> None:
+    """Print the three Tessent coverage metrics with their inputs."""
+    stats = getattr(report, "statistics", None)
+    if stats is None or not hasattr(stats, "metrics"):
+        return
+    m = stats.metrics()
+    roles = m["roles"]
+
+    def _val(key: str) -> str:
+        value = m[key]
+        return "n/a" if value is None else f"{value:.4f}%"
+
+    print("\nCoverage metrics (posdet_credit="
+          f"{m['posdet_credit']}, numerator={m['detected_credit']}):")
+    formulas = m.get("formulas", {})
+    for key, label in (("test_coverage", "test coverage      "),
+                       ("fault_coverage", "fault coverage     "),
+                       ("atpg_effectiveness", "atpg effectiveness ")):
+        spec = formulas.get(key, {})
+        print(f"  {label} : {_val(key)}   {spec.get('formula', '')}")
+        if spec.get("substitution"):
+            print(f"                        {spec['substitution']}")
+    print("  roles               : "
+          + ", ".join(f"{r}={roles.get(r, 0)}" for r in
+                      ("DT", "PD", "UD", "AU", "ND"))
+          + f", FU={m['total_faults']}")
+    print(f"  UD is              : {m.get('ud_definition', '')}")
+    if m["unrecognised"]:
+        print(f"  unrecognised class  : {m['unrecognised']} "
+              f"(excluded from every metric)")
+    if not m["census_balances"]:
+        print("  !! census does not reconcile with the parsed record count; "
+              "the figures above are unusable")
+
+
+def _print_census(report: AnalysisReport) -> None:
+    """Print the complete fault census (S2b) with its self-check.
+
+    Every class present, grouped by coverage role, followed by the sum check.
+    Printed on every run: a partial listing that a reader has to reconcile by
+    hand is how a residual turns into an invented fault category.
+    """
+    from .analysis.census import build_census
+
+    census = build_census(report)
+    if not census.entries:
+        return
+    print(f"\nComplete fault census (S2b) — {census.class_count} class(es) "
+          f"across {len(census.roles)} coverage role(s):")
+    for role in census.roles:
+        print(f"  {role.role:<13s} {role.label:<20s} {role.count:>10d}")
+        for family in role.families:
+            for entry in family.entries:
+                print(f"      {entry.subclass:<16s} {entry.count:>10d}  "
+                      f"{entry.pct:6.2f}%  sa0={entry.sa0} sa1={entry.sa1}")
+    rec = census.reconciliation()
+    if rec["reconciles"]:
+        print(f"  self-check: {rec['sum_of_class_counts']} counted == "
+              f"{rec['total_faults']} analysed (delta 0).")
+    else:
+        print(f"  !! SELF-CHECK FAILED: {rec['sum_of_class_counts']} counted "
+              f"vs {rec['total_faults']} analysed, delta {rec['delta']}. "
+              f"Do not attribute the delta to a category.")
+    if rec["unclassified_tokens"]:
+        print(f"  !! unclassified class token(s): "
+              f"{', '.join(rec['unclassified_tokens'])} — not in the "
+              f"class-role map, so they feed no coverage metric.")
+
+
+def _print_input_quality(report: AnalysisReport) -> None:
+    """Print how completely the inputs were understood."""
+    header = getattr(report, "fault_list_header", None)
+    if header is not None:
+        print("\nFault list as declared:")
+        print(f"  format / compression: {header.file_format} / "
+              f"{header.compression}")
+        print(f"  fault collapsing    : {header.collapsing_label}")
+        print(f"  fault model(s)      : "
+              f"{', '.join(header.fault_models) or 'not declared'}")
+        print(f"  declared columns    : "
+              f"{', '.join(header.format_fields) or 'not declared'}")
+
+    diagnostics = getattr(report, "class_diagnostics", None)
+    if diagnostics is not None and getattr(diagnostics, "tokens", None):
+        print(f"\nUnrecognised fault classes "
+              f"({diagnostics.count}/{diagnostics.total} record(s), "
+              f"{diagnostics.pct:.4f}%):")
+        for tok in diagnostics.tokens:
+            sample = tok.samples[0] if tok.samples else ""
+            print(f"  {tok.token:12s} x{tok.count}  first line "
+                  f"{tok.first_line or '?'}  e.g. {sample}")
+
+    status = getattr(report, "constraint_diagnostics", None)
+    if status:
+        unresolved = status.get("unresolved", 0)
+        print("\nConstraint file parsing:")
+        print(f"  files read          : {len(status.get('files') or [])}")
+        print(f"  directives evaluated: {status.get('resolved', 0)} of "
+              f"{status.get('directives', 0)}")
+        print(f"  NOT evaluated       : {unresolved}")
+        print(f"  objects expanded    : {status.get('expanded_objects', 0)}")
+        if unresolved:
+            print("  !! a fault with no constraint hit is NOT proven "
+                  "unconstrained: the file was only partly understood")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

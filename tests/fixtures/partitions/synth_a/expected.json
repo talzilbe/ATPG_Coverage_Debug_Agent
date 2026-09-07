@@ -1,0 +1,46 @@
+{
+  "description": "Synthetic partition A. Hand-counted from faults.mtfi; these values are the FIXTURE, not values copied out of the tool. Onboarding another partition means dropping in a sibling folder with its own inputs and expected.json -- no code change.",
+
+  "total_faults": 42,
+
+  "class_counts": {
+    "DS": 10,
+    "DI.SCAN": 4,
+    "PT": 2,
+    "PU": 2,
+    "UU": 3,
+    "TI": 3,
+    "BL": 2,
+    "RE": 2,
+    "AU.TC": 5,
+    "AU.PC": 3,
+    "UO.AAB": 4,
+    "UC": 2
+  },
+
+  "roles": {
+    "DT": 14,
+    "PD": 4,
+    "UD": 10,
+    "AU": 8,
+    "ND": 6
+  },
+
+  "unrecognised_class_records": 0,
+  "posdet_credit": 0.5,
+  "detected_credit": 16.0,
+
+  "test_coverage": 50.0,
+  "fault_coverage": 38.0952,
+  "atpg_effectiveness": 80.9524,
+
+  "fault_collapsing": false,
+  "fault_models": ["Stuck"],
+  "format_fields": ["identifier", "class", "location"],
+  "declared_version": "1",
+
+  "constraints": {
+    "unrecognised_directive_tokens": ["site_specific_wrapper_command"],
+    "min_unresolved": 1
+  }
+}

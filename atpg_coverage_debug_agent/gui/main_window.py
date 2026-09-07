@@ -304,9 +304,59 @@ coarse class is known and the confidence drops accordingly &mdash; you will
 see this reported as <code>reduced</code>.</p>
 
 <h3>Coverage figures</h3>
-<p>The detected and coverage-loss percentages are counted from the fault list.
-They are <b>not</b> the ATPG tool's test-coverage number, which also accounts
-for fault collapsing and untestable-fault credit.</p>
+<p>Every fault class is assigned a <b>coverage role</b>, and the role &mdash;
+never the class label &mdash; drives the numbers. <code>DS</code> and
+<code>DI.*</code> are <code>DT</code> (detected); <code>PT</code> and
+<code>PU</code> are <code>PD</code> (possibly detected, partial credit);
+<code>UU</code>, <code>TI</code>, <code>BL</code> and <code>RE</code> are
+<code>UD</code> (undetectable, removed from the test-coverage denominator);
+<code>AU.*</code> is <code>AU</code>; <code>UO.*</code> and <code>UC.*</code>
+are <code>ND</code> (coverage loss).</p>
+<pre>test_coverage      = (DT + posdet_credit*PD) / (FU - UD)
+fault_coverage     = (DT + posdet_credit*PD) / FU
+atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU</pre>
+<p>Counts are printed next to every percentage so any figure can be
+re-derived, and a metric that is undefined for this population is shown as
+<code>n/a</code> rather than invented. The report also states whether the
+fault list declared itself <b>collapsed</b> or <b>uncollapsed</b>, because the
+two are not comparable. After parsing, the analyzer checks that
+<code>DT + PD + UD + AU + ND</code> equals the number of records parsed and
+aborts if it does not.</p>
+<p>A class the configuration does not describe is never merged into a
+catch-all. It keeps its verbatim token, is listed by name under <b>Input
+Quality</b> with sample records, is excluded from every metric, and past a
+configurable threshold it fails the run.</p>
+
+<h3>Input quality &mdash; what the files actually gave us</h3>
+<p>The report separates <i>&ldquo;no constraint affects this fault&rdquo;</i>
+from <i>&ldquo;the constraint file could not be fully parsed&rdquo;</i>. The
+constraint dofile is read as Tcl commands, not as lines: continuations,
+comments, <code>set</code> variables, <code>dofile</code> includes,
+<code>if</code>/<code>else</code> bodies and <code>[get_pins&nbsp;-hier&nbsp;...]</code>
+collections are all handled. A directive that cannot be evaluated is recorded
+as <b>unresolved</b> with its source line and counted &mdash; while that count
+is non-zero, a fault reported with no constraint hit is <b>not</b> proven
+unconstrained.</p>
+
+<h3>Configuration &mdash; onboarding a new partition</h3>
+<p>Nothing design-specific is written into the tool. The fault-class role map,
+scan / scan-out / shift-enable / clock pin names, tie-cell and dangling-net
+naming, the possibly-detected credit factor and every input-quality threshold
+live in a JSON file named by the <code>ATPG_ANALYSIS_CONFIG</code> environment
+variable. Values are merged into the documented defaults, so a partition only
+lists what differs. The configuration actually used is recorded in the report,
+which is what lets you tell <i>&ldquo;this library has no scan cells&rdquo;</i>
+from <i>&ldquo;we were never told what this library calls its scan
+pins&rdquo;</i>. See the README for the full key list and defaults.</p>
+<p>Scan-ness, sequential-ness and tie-ness are always decided from pin lists
+and resolved connectivity, never from instance or cell-type names; the
+vocabularies only say what a pin is <i>called</i>. A scan/non-scan boundary is
+claimed only when the neighbour is <b>sequential</b> &mdash; every
+combinational cell is trivially non-scan, so counting those as boundaries
+would fire on almost every fault. A scannable cell whose scan-in or scan-out
+is dangling gets its own category,
+<code>scan_capable_but_not_chain_connected</code>, because it needs
+re-stitching rather than a wrapper.</p>
 
 <h3>Hierarchy clustering &mdash; where, not why</h3>
 <p>Faults are grouped by hierarchy prefix. The depth is chosen automatically:
@@ -477,19 +527,32 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           this.</td></tr>
       <tr><td><code>verify_paths</code></td><td>Whether a path is safe to quote
           before putting it in an answer.</td></tr>
-      <tr><td><code>report_context</code></td><td>The state of the evidence
-          itself: how much of the loss actually mapped onto the netlist (and
-          why the rest did not), the scan-status split, how much sits on hard
-          constants, the repeated patterns, the parser warnings, and any
-          waivers you have applied. A percentage computed over mostly
-          unmapped faults does not mean what it looks like, so the agent is
-          told to check this before trusting a count.</td></tr>
+      <tr><td><code>report_context</code></td><td>Called first. Returns the
+          <b>complete fault census</b> &mdash; every class, grouped by
+          coverage role, with the sum check already done &mdash; plus the
+          state of the evidence itself: how much of the loss actually mapped
+          onto the netlist (and why the rest did not), the scan-status split,
+          how much sits on hard constants, the coverage metrics with their
+          formulas, the repeated patterns, the parser warnings, and any
+          waivers you have applied. The census is never abridged here, so
+          once the agent has called it, no fault can be left unaccounted
+          for.</td></tr>
       <tr><td><code>report_insufficient_evidence</code></td><td>Lets the agent
           declare that the evidence does <i>not</i> settle a question, and say
           what would. This exists so &ldquo;not determined&rdquo; is a real
           action it can take rather than something it has to argue its way
           into against the pull of sounding helpful &mdash; a confident wrong
-          root cause costs far more than an honest gap.</td></tr>
+          root cause costs far more than an honest gap. It is reserved for
+          evidence that does not exist, not for evidence the agent has not
+          fetched yet.</td></tr>
+      <tr><td><code>report_handoff_gap</code></td><td>Lets the agent report
+          that the <i>numbers it was handed contradict each other</i> &mdash;
+          a class list that does not sum to its stated total, or two sections
+          disagreeing. Without this channel the path of least resistance is
+          to close the arithmetic privately and invent a category to hold the
+          difference, which reads exactly like a real fault bucket to the
+          next person. The correct action is to report the inconsistency and
+          stop, and this makes that possible.</td></tr>
       <tr><td><code>list_faults</code>, <code>get_fault_detail</code>,
           <code>why_blocked</code>, <code>list_constraints</code>,
           <code>trace_path</code>, <code>suggest_test_points</code></td>

@@ -111,69 +111,182 @@ def serialize_fault_result(fr: Any, full: bool = False) -> Dict[str, Any]:
     return row
 
 
-def scan_status(netlist: Any, target: str) -> Dict[str, Any]:
+def scan_status(netlist: Any, target: str, fault_results: Any = None,
+                design: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Answer "is this a scan cell?" strictly from netlist pin evidence.
 
+    Three sources are tried, in descending order of what they can prove, and
+    the answer always says which one it used:
+
+    1. the live parsed netlist, which also supports the three corroborations;
+    2. the instantiation recorded for this fault site during the analysis
+       pass -- literally the same text, carried in the exported evidence, so
+       an out-of-process server is not blind;
+    3. nothing, in which case the verdict is ``unresolved``.
+
+    Source 2 exists because of a concrete failure: in one session
+    ``get_fault_detail`` returned instantiations with line numbers while this
+    tool answered "no parsed netlist is available", and the agent is required
+    to prove scan status *here*. Two tools disagreeing about whether the
+    design was loaded silently closed off the agent's primary evidence path.
+
     Args:
-        netlist: The parsed netlist, or ``None`` when unavailable.
+        netlist: The parsed netlist, or ``None`` when out of process.
         target: Fault object or hierarchical instance path.
+        fault_results: Analysed faults, whose recorded instantiations are the
+            fallback pin evidence.
+        design: The shared design handle (see :func:`serialize_design`), used
+            to report accurately whether a netlist was parsed at all.
 
     Returns:
-        The :meth:`~..analysis.scan_status.ScanStatus.as_dict` payload. With no
-        netlist loaded the verdict is ``unresolved`` and ``answer`` is the
-        required sentence -- a fault-table row can never decide scan status.
+        The :meth:`~..analysis.scan_status.ScanStatus.as_dict` payload, with a
+        ``source`` key naming the evidence it rests on.
     """
     from . import scan_status as scan_status_mod
 
     target = (target or "").strip()
     if not target:
         return {"error": "Provide a fault object or instance path."}
-    if netlist is None or not getattr(netlist, "modules", None):
-        return scan_status_mod.unresolved(
+
+    if netlist is not None and getattr(netlist, "modules", None):
+        conn = getattr(netlist, "_atpg_connectivity", None)
+        mapper = getattr(netlist, "_atpg_mapper", None)
+        if conn is None or mapper is None:
+            from .connectivity import ConnectivityModel
+            from .mapper import FaultMapper
+
+            conn = ConnectivityModel(netlist)
+            mapper = FaultMapper(conn)
+            try:
+                netlist._atpg_connectivity = conn
+                netlist._atpg_mapper = mapper
+            except Exception:  # pragma: no cover - immutable netlist stand-ins
+                pass
+
+        payload = scan_status_mod.determine_scan_status(
+            target, mapper, conn, netlist).as_dict()
+        payload["source"] = "live parsed netlist"
+        return payload
+
+    match = _match_for_scan_evidence(fault_results, target)
+    if match is not None:
+        payload = scan_status_mod.classify_instantiation_text(
             target,
-            "No parsed netlist is available in this session. Load the "
-            "hierarchical netlist and re-run; fault-table fields carry no pin "
-            "evidence.",
+            instantiation=str(getattr(match, "scan_evidence", "") or ""),
+            instance=getattr(getattr(match, "mapping", None),
+                             "instance_name", None),
+            cell_type=getattr(getattr(match, "mapping", None),
+                              "cell_type", None),
         ).as_dict()
+        payload["source"] = (
+            "instantiation recorded during the analysis pass (same text "
+            "get_fault_detail returns for this site)")
+        return payload
 
-    conn = getattr(netlist, "_atpg_connectivity", None)
-    mapper = getattr(netlist, "_atpg_mapper", None)
-    if conn is None or mapper is None:
-        from .connectivity import ConnectivityModel
-        from .mapper import FaultMapper
+    return _scan_status_unavailable(target, fault_results, design)
 
-        conn = ConnectivityModel(netlist)
-        mapper = FaultMapper(conn)
-        try:
-            netlist._atpg_connectivity = conn
-            netlist._atpg_mapper = mapper
-        except Exception:  # pragma: no cover - immutable netlist stand-ins
-            pass
 
-    return scan_status_mod.determine_scan_status(
-        target, mapper, conn, netlist).as_dict()
+def _match_for_scan_evidence(fault_results: Any, target: str) -> Any:
+    """Return the fault result whose recorded instantiation covers *target*."""
+    if not fault_results:
+        return None
+    for fr in fault_results:
+        if not str(getattr(fr, "scan_evidence", "") or "").strip():
+            continue
+        if _matches_fault(fr, target):
+            return fr
+    return None
+
+
+def _scan_status_unavailable(target: str, fault_results: Any,
+                             design: Optional[Dict[str, Any]]
+                             ) -> Dict[str, Any]:
+    """Build the unresolved answer, saying exactly what is and is not held.
+
+    Never claims the design was not parsed when it was: the handle records
+    that, and an inaccurate "not loaded" is what stopped the agent asking.
+    """
+    from . import scan_status as scan_status_mod
+
+    parsed = bool((design or {}).get("netlist_parsed"))
+    if parsed:
+        blocker = (
+            f"The netlist WAS parsed for this analysis "
+            f"({(design or {}).get('modules', '?')} module(s), "
+            f"{(design or {}).get('instances', '?')} instance(s)), but the "
+            f"live object is not held in this process and no instantiation "
+            f"was recorded for '{target}'. Either the object never mapped "
+            f"onto an instance, or it is outside the analysed coverage-loss "
+            f"population. Check get_fault_detail and diagnose_unresolved for "
+            f"this site before concluding anything about its scan status.")
+    else:
+        blocker = (
+            "No netlist was parsed for this analysis at all, so no pin "
+            "evidence exists anywhere in this session. Re-run with the "
+            "hierarchical netlist; fault-table fields carry no pin evidence.")
+    payload = scan_status_mod.unresolved(target, blocker).as_dict()
+    payload["source"] = "none"
+    payload["netlist_parsed"] = parsed
+    payload["sites_with_recorded_pin_evidence"] = sum(
+        1 for fr in (fault_results or [])
+        if str(getattr(fr, "scan_evidence", "") or "").strip())
+    return payload
 
 
 def diagnose_unresolved_tool(fault_results: Any, netlist: Any,
-                             limit: int = 20) -> Dict[str, Any]:
+                             limit: int = 20,
+                             design: Optional[Dict[str, Any]] = None
+                             ) -> Dict[str, Any]:
     """Explain why fault objects failed to map onto the netlist.
+
+    Recomputed from the live netlist when one is held; otherwise the
+    diagnosis the analysis pass already produced is returned. The tool must
+    not report "no netlist in this session" while the analysis that produced
+    the session clearly had one.
 
     Args:
         fault_results: The analysed coverage-loss faults.
         netlist: The parsed netlist, or ``None``.
         limit: Max groups to return.
+        design: The shared design handle, carrying the recorded diagnosis.
 
     Returns:
-        The :meth:`~..analysis.unresolved.UnresolvedDiagnosis.as_dict` payload.
+        The :meth:`~..analysis.unresolved.UnresolvedDiagnosis.as_dict`
+        payload, with a ``source`` key naming where it came from.
     """
     from .unresolved import diagnose_unresolved
 
-    if netlist is None or not getattr(netlist, "modules", None):
-        return {"error": ("No parsed netlist in this session, so mapping "
-                          "failures cannot be attributed. Load the "
-                          "hierarchical netlist and re-run.")}
-    return diagnose_unresolved(fault_results, netlist,
-                               max_groups=max(1, int(limit))).as_dict()
+    if netlist is not None and getattr(netlist, "modules", None):
+        payload = diagnose_unresolved(
+            fault_results, netlist, max_groups=max(1, int(limit))).as_dict()
+        payload["source"] = "recomputed from the live parsed netlist"
+        return payload
+
+    recorded = (design or {}).get("unresolved_diagnosis")
+    if recorded:
+        payload = dict(recorded)
+        groups = list(payload.get("groups") or [])
+        cap = max(1, int(limit))
+        if len(groups) > cap:
+            payload["groups"] = groups[:cap]
+            payload["groups_total"] = len(groups)
+            payload["groups_truncated"] = True
+        payload["source"] = (
+            "the diagnosis computed during the analysis pass, when the "
+            "netlist was parsed")
+        return payload
+
+    if (design or {}).get("netlist_parsed"):
+        return {"error": ("The netlist was parsed for this analysis but no "
+                          "mapping diagnosis was recorded, which happens "
+                          "when every fault object mapped successfully. "
+                          "Check report_context for the mapped/unmapped "
+                          "split before assuming otherwise."),
+                "source": "design handle"}
+    return {"error": ("No netlist was parsed for this analysis, so mapping "
+                      "failures cannot be attributed. Re-run with the "
+                      "hierarchical netlist."),
+            "source": "none"}
 
 
 def serialize_constraint(c: Any) -> Dict[str, Any]:
@@ -621,7 +734,9 @@ def export_evidence(fault_results: Any, constraints: Any,
                     adjacency: Optional[Dict[str, List[str]]] = None,
                     compare: Optional[Dict[str, Any]] = None,
                     triage: Optional[Dict[str, Any]] = None,
-                    context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    context: Optional[Dict[str, Any]] = None,
+                    design: Optional[Dict[str, Any]] = None,
+                    stamp: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Serialise everything the investigative tools need into a plain dict.
 
     The result is JSON-serialisable so it can be written to a file and read by a
@@ -629,6 +744,11 @@ def export_evidence(fault_results: Any, constraints: Any,
     *adjacency* (e.g. from a reloaded report) is used for path tracing. When a
     *compare* baseline payload is given, the regression tools are enabled, and
     when a *triage* payload is given the coverage-triage tools are enabled.
+
+    The *stamp* names the design and the input files this evidence was built
+    from. It is written into the file so an evidence file found on disk can
+    always be tied back to its run, and never mistaken for a stale one left by
+    an unrelated design.
     """
     if netlist is not None:
         adj = build_adjacency(netlist)
@@ -640,13 +760,59 @@ def export_evidence(fault_results: Any, constraints: Any,
         "constraints": [serialize_constraint(c) for c in (constraints or [])],
         "adjacency": adj,
     }
+    if stamp:
+        evidence["stamp"] = stamp
     if compare:
         evidence["compare"] = compare
     if triage:
         evidence["triage"] = triage
     if context:
         evidence["context"] = context
+    if design:
+        evidence["design"] = design
     return evidence
+
+
+def serialize_design(netlist: Any, report: Any = None) -> Dict[str, Any]:
+    """Serialise the shared parsed-design handle.
+
+    Every tool answers from this one handle, so no two tools can disagree
+    about whether a design was loaded. It carries what the netlist *was*
+    (parsed or not, and how big) plus the results the analysis pass already
+    derived from it, so an out-of-process server answers from recorded
+    evidence instead of denying the netlist ever existed.
+
+    Args:
+        netlist: The parsed netlist, or ``None``.
+        report: The ``AnalysisReport``, for the design name, source paths and
+            the recorded mapping diagnosis.
+
+    Returns:
+        A small JSON-serialisable dict. Always includes ``netlist_parsed``.
+    """
+    modules = getattr(netlist, "modules", None) or {}
+    sources = dict(getattr(report, "sources", None) or {})
+    diagnosis = getattr(report, "unresolved_diagnosis", None)
+    payload: Dict[str, Any] = {
+        "netlist_parsed": bool(modules),
+        "design": sources.get("design"),
+        "sources": {
+            "netlist": sources.get("netlist"),
+            "faults": sources.get("faults"),
+            "constraints": sources.get("constraints"),
+        },
+        "modules": len(modules),
+        "instances": sum(len(m.instances) for m in modules.values()),
+        "top_module": getattr(netlist, "top_module", None),
+        "note": ("The single parsed-design handle every tool answers from. "
+                 "If 'netlist_parsed' is true, the design WAS read during the "
+                 "analysis pass even when the live object is not held in this "
+                 "process; a tool must not report the netlist as missing in "
+                 "that case."),
+    }
+    if diagnosis is not None and hasattr(diagnosis, "as_dict"):
+        payload["unresolved_diagnosis"] = diagnosis.as_dict()
+    return payload
 
 
 def serialize_triage(statistics: Any, selected: Any,
@@ -711,6 +877,14 @@ def serialize_context(report: Any) -> Dict[str, Any]:
     summary = getattr(report, "summary", None)
     payload: Dict[str, Any] = {}
 
+    # The complete fault census travels inline, always. This is the tool the
+    # model is told to call first, so a residual it cannot attribute must be
+    # impossible from here on. Counts are small; it is samples and prose that
+    # make a payload large, so completeness costs nothing worth saving.
+    from .census import build_census
+
+    payload["census"] = build_census(report).as_dict()
+
     if summary is not None:
         mapped = getattr(summary, "mapped_count", 0) or 0
         unmapped = getattr(summary, "unmapped_count", 0) or 0
@@ -741,6 +915,35 @@ def serialize_context(report: Any) -> Dict[str, Any]:
     ]
     payload["warnings"] = list(getattr(report, "warnings", None) or [])
 
+    # What the inputs declared and how well they were understood. The model
+    # must be able to tell "no constraint affects this fault" apart from "the
+    # constraint file was only partly parsed", and must never quote a coverage
+    # figure without knowing whether the census is collapsed.
+    header = getattr(report, "fault_list_header", None)
+    if header is not None:
+        payload["fault_list"] = header.as_dict()
+
+    diagnostics = getattr(report, "class_diagnostics", None)
+    if diagnostics is not None and getattr(diagnostics, "tokens", None):
+        payload["unrecognised_fault_classes"] = diagnostics.as_dict()
+
+    constraint_status = getattr(report, "constraint_diagnostics", None)
+    if constraint_status:
+        payload["constraint_parsing"] = dict(constraint_status)
+        payload["constraint_parsing"]["note"] = (
+            "'unresolved' directives were recognised but could not be "
+            "evaluated. While that count is non-zero, a fault with no "
+            "constraint hit is NOT proven unconstrained."
+        )
+
+    statistics = getattr(report, "statistics", None)
+    if statistics is not None and hasattr(statistics, "metrics"):
+        payload["coverage_metrics"] = statistics.metrics()
+
+    config_used = getattr(report, "analysis_config", None)
+    if config_used:
+        payload["analysis_config"] = dict(config_used)
+
     edits = getattr(report, "edits", None) or {}
     if edits:
         payload["waivers"] = {
@@ -755,26 +958,44 @@ def serialize_context(report: Any) -> Dict[str, Any]:
     return payload
 
 
+#: Sections :func:`report_context` can return, in the order it returns them.
+#: ``census`` is first and is returned unconditionally: it is the one thing
+#: that makes an unexplained residual impossible, and a caller must not be
+#: able to filter it away by asking for something else.
+CONTEXT_SECTIONS = ("census", "evidence", "coverage_metrics", "fault_list",
+                    "unrecognised_fault_classes", "constraint_parsing",
+                    "analysis_config", "patterns", "warnings", "waivers")
+
+
 def report_context(context: Optional[Dict[str, Any]],
                    section: Optional[str] = None,
                    limit: int = 20) -> Dict[str, Any]:
-    """Return the evidence-quality context, optionally one section of it."""
+    """Return the evidence-quality context, optionally one section of it.
+
+    The complete fault census is always included, whatever *section* asks
+    for, and it is never abridged. Everything else may be capped by *limit*;
+    a capped list says so and reports its true length.
+    """
     if not context:
         return {"error": ("No report context available. Run an analysis "
                           "first.")}
     wanted = (section or "").strip().lower()
-    known = ("evidence", "patterns", "warnings", "waivers")
-    if wanted and wanted not in known:
+    if wanted and wanted not in CONTEXT_SECTIONS:
         return {"error": f"Unknown section '{section}'. Use one of: "
-                         + ", ".join(known) + ", or leave it empty for all."}
+                         + ", ".join(CONTEXT_SECTIONS)
+                         + ", or leave it empty for all."}
 
     cap = max(1, int(limit))
     out: Dict[str, Any] = {}
-    for key in known:
-        if wanted and key != wanted:
-            continue
+    for key in CONTEXT_SECTIONS:
         value = context.get(key)
         if value is None:
+            continue
+        # The census is exempt from both the section filter and the cap.
+        if key == "census":
+            out[key] = value
+            continue
+        if wanted and key != wanted:
             continue
         if isinstance(value, list):
             out[key] = value[:cap]
@@ -783,9 +1004,10 @@ def report_context(context: Optional[Dict[str, Any]],
                 out[f"{key}_truncated"] = True
         else:
             out[key] = value
-    if not out:
-        return {"note": ("Nothing recorded for that section in this run."),
-                "sections_available": [k for k in known if context.get(k)]}
+    if len(out) <= 1 and wanted:
+        out["note"] = "Nothing recorded for that section in this run."
+        out["sections_available"] = [k for k in CONTEXT_SECTIONS
+                                     if context.get(k)]
     return out
 
 
@@ -810,8 +1032,73 @@ def report_insufficient_evidence(question: str, missing: str = "",
             "Recorded. Report this as the answer. Reporting that the "
             "available evidence does not support a conclusion is a correct "
             "result, and is preferred over a confident guess. Do not follow "
-            "it with a speculative root cause."),
+            "it with a speculative root cause. Note: this is for evidence "
+            "that does NOT EXIST. If the evidence exists but you have not "
+            "retrieved it yet -- a truncated tool result, a spilled payload, "
+            "an uncalled tool -- retrieve it instead of declaring it "
+            "unresolved."),
     }
+
+
+def report_handoff_gap(observed: str, expected: str = "", where: str = "",
+                       question: str = "",
+                       context: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
+    """Record that the numbers handed over do not reconcile with each other.
+
+    This is deliberately a separate channel from
+    :func:`report_insufficient_evidence`. That one means "the evidence does
+    not exist"; this one means "the evidence I was given contradicts itself".
+    Without somewhere to put the second, the path of least resistance for a
+    language model is to close the arithmetic on its own -- which is exactly
+    what produced an invented fault category holding a 133k residual, printed
+    in a format that made it look like a real bucket.
+
+    The correct behaviour is: report the inconsistency, name both figures, and
+    stop. Never name or attribute the residual.
+
+    Args:
+        observed: What the digest or a tool actually reported.
+        expected: What it should have been, and how that was derived.
+        where: The section, tool or block the inconsistency was found in.
+        question: The question the inconsistency blocks, if any.
+        context: The report context, so the answer can quote the authoritative
+            census the model should have been reconciling against.
+
+    Returns:
+        A structured complaint, plus the complete census when one is held.
+    """
+    observed = (observed or "").strip()
+    if not observed:
+        return {"error": ("State what you observed that does not reconcile, "
+                          "quoting both figures.")}
+    payload: Dict[str, Any] = {
+        "verdict": "handoff_gap",
+        "observed": observed,
+        "expected": (expected or "").strip(),
+        "where": (where or "").strip(),
+        "blocked_question": (question or "").strip(),
+        "acknowledged": (
+            "Recorded as a defect in the hand-off, not in the design. Report "
+            "it as such: name both figures and the block they came from, and "
+            "stop. Do NOT invent a category, bucket or label for the "
+            "difference, do not distribute it across existing categories, and "
+            "do not compute any coverage metric from a class list that failed "
+            "the sum check."),
+    }
+    census = (context or {}).get("census")
+    if census:
+        payload["authoritative_census"] = census
+        payload["next_step"] = (
+            "The complete census is included above and is the figure of "
+            "record. If it reconciles, re-derive from it and say which block "
+            "was the subset. If it does not reconcile either, the analyser "
+            "itself is at fault; report that and stop.")
+    else:
+        payload["next_step"] = (
+            "No census is held in this session, so the inconsistency cannot "
+            "be resolved from here. Report it and stop.")
+    return payload
 
 
 def coverage_triage(triage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -819,14 +1106,31 @@ def coverage_triage(triage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not triage:
         return dict(_NO_TRIAGE)
     stats = triage.get("statistics", {})
+    categories = [c for c in stats.get("subclasses", []) if c.get("count")]
+    counted = sum(int(c.get("count", 0) or 0) for c in categories)
+    total = int(stats.get("total_faults", 0) or 0)
     return {
         "totals": {
-            "total_faults": stats.get("total_faults", 0),
+            "total_faults": total,
             "detected": stats.get("detected_count", 0),
             "coverage_loss": stats.get("loss_count", 0),
             "detected_pct": stats.get("detected_pct", 0.0),
             "loss_pct": stats.get("loss_pct", 0.0),
         },
+        # Emitted next to the categories so the sum check is a read, not an
+        # exercise. 'categories' below is the COMPLETE class list.
+        "census_check": {
+            "categories": len(categories),
+            "sum_of_category_counts": counted,
+            "total_faults": total,
+            "delta": total - counted,
+            "reconciles": counted == total,
+            "instruction": ("'categories' is complete and must sum to "
+                            "total_faults. If it does not, call "
+                            "report_handoff_gap and stop; do not name the "
+                            "difference."),
+        },
+        "coverage_metrics": stats.get("metrics"),
         "note": ("Percentages are aggregated from the fault list. They are not "
                  "the ATPG tool's test-coverage figure, which also accounts "
                  "for fault collapsing and untestable-fault credit."),
@@ -1113,12 +1417,15 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Decide whether an instance is a SCAN cell by reading its actual "
             "netlist instantiation. Returns the verbatim instantiation, the "
-            "scan-in / shift-enable / scan-out pins, and three corroborating "
-            "checks. This is the ONLY admissible basis for a scan-status "
-            "claim: without a netlist, or when the object does not map, it "
-            "returns 'Unresolved - scan status cannot be determined without "
-            "netlist pin evidence.' Fault-table fan-in/fan-out/confidence "
-            "values never decide scan status."),
+            "scan-in / shift-enable / scan-out pins, three corroborating "
+            "checks, and a 'source' field naming the evidence used: the live "
+            "netlist, or the instantiation recorded for that site during the "
+            "analysis pass (the same text get_fault_detail returns). This is "
+            "the ONLY admissible basis for a scan-status claim: when neither "
+            "exists it returns 'Unresolved - scan status cannot be determined "
+            "without netlist pin evidence' and says whether a netlist was "
+            "parsed at all. Fault-table fan-in/fan-out/confidence values "
+            "never decide scan status."),
         "params": {
             "target": {"type": "str",
                        "description": "fault object or hierarchical "
@@ -1359,19 +1666,50 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "report_context": {
         "description": (
-            "The state of the evidence itself: how many faults mapped onto "
-            "the netlist and how many did not (and why), the scan-status "
-            "split, how much of the loss sits on hard constants, the repeated "
+            "Call this FIRST. Returns the COMPLETE fault census -- every "
+            "class, grouped by coverage role, with the sum check already "
+            "done -- plus the state of the evidence itself: how many faults "
+            "mapped onto the netlist and how many did not (and why), the "
+            "scan-status split, how much of the loss sits on hard constants, "
+            "the coverage metrics with their formulas, the repeated "
             "structural patterns, the parser warnings, and any analyst "
-            "waivers in force. Check this BEFORE trusting a count -- a figure "
-            "computed over mostly unmapped faults means little, and a waiver "
-            "means some faults were deliberately removed."),
+            "waivers in force. The census is always included and is never "
+            "abridged, so no class listing anywhere else can leave you with "
+            "an unexplained residual. Check this BEFORE trusting a count."),
         "params": {
             "section": {"type": "str", "default": "",
-                        "description": ("evidence | patterns | warnings | "
-                                        "waivers; empty for all")},
+                        "description": ("census | evidence | "
+                                        "coverage_metrics | fault_list | "
+                                        "unrecognised_fault_classes | "
+                                        "constraint_parsing | "
+                                        "analysis_config | patterns | "
+                                        "warnings | waivers; empty for all. "
+                                        "The census is returned either way")},
             "limit": {"type": "int", "default": 20,
-                      "description": "max rows per list"},
+                      "description": "max rows per list (never the census)"},
+        },
+    },
+    "report_handoff_gap": {
+        "description": (
+            "Report that the numbers you were handed do not reconcile with "
+            "each other -- a class list that does not sum to its stated "
+            "total, two sections disagreeing, a metric computed from an "
+            "incomplete census. This is NOT the same as missing evidence: it "
+            "means the evidence contradicts itself. Use it the moment a sum "
+            "check fails, and stop there. Never invent a category, bucket or "
+            "label to hold the difference, and never compute a coverage "
+            "metric from a class list that failed the check."),
+        "params": {
+            "observed": {"type": "str",
+                         "description": ("what does not reconcile, quoting "
+                                         "both figures")},
+            "expected": {"type": "str", "default": "",
+                         "description": "what it should have been, and why"},
+            "where": {"type": "str", "default": "",
+                      "description": ("the section, block or tool the "
+                                      "inconsistency came from")},
+            "question": {"type": "str", "default": "",
+                         "description": "the question this blocks"},
         },
     },
     "report_insufficient_evidence": {
@@ -1421,7 +1759,8 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              adjacency: Optional[Dict[str, List[str]]] = None,
              compare: Optional[Dict[str, Any]] = None,
              triage: Optional[Dict[str, Any]] = None,
-             context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             context: Optional[Dict[str, Any]] = None,
+             design: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
@@ -1429,7 +1768,9 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
     *adjacency* is provided (out-of-process MCP server), ``trace_path`` uses it
     instead of a live netlist. When *compare* (a baseline report payload) is
     provided, the regression tools become available, and when *triage* is
-    provided the coverage-triage tools become available.
+    provided the coverage-triage tools become available. *design* is the one
+    parsed-design handle every tool answers from, so no two tools can
+    disagree about whether the netlist was read.
     """
     args = dict(args or {})
     if name == "report_insufficient_evidence":
@@ -1437,17 +1778,25 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
             question=str(args.get("question", "") or ""),
             missing=str(args.get("missing", "") or ""),
             would_settle_it=str(args.get("would_settle_it", "") or ""))
+    if name == "report_handoff_gap":
+        return report_handoff_gap(
+            observed=str(args.get("observed", "") or ""),
+            expected=str(args.get("expected", "") or ""),
+            where=str(args.get("where", "") or ""),
+            question=str(args.get("question", "") or ""),
+            context=context)
     if name == "report_context":
         return report_context(
             context,
             section=str(args.get("section", "") or "") or None,
             limit=int(args.get("limit", 20) or 20))
     if name == "scan_status":
-        return scan_status(netlist, str(args.get("target", "")))
+        return scan_status(netlist, str(args.get("target", "")),
+                           fault_results=fault_results, design=design)
     if name == "diagnose_unresolved":
         return diagnose_unresolved_tool(
             fault_results, netlist,
-            limit=int(args.get("limit", 20) or 20))
+            limit=int(args.get("limit", 20) or 20), design=design)
     if name == "coverage_triage":
         return coverage_triage(triage)
     if name == "recommend_fixes":

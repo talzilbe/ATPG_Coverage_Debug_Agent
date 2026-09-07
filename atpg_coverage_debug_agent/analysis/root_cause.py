@@ -21,8 +21,9 @@ from ..models import (
     MappingConfidence,
     RootCause,
 )
-from .connectivity import ConnectivityModel
+from .connectivity import ConnectivityModel, is_unconnected_net
 from .mapper import FaultMapper
+from ..config.analysis_config import get_config
 from ..parser.verilog_parser import scan_pin_role
 
 logger = logging.getLogger(__name__)
@@ -282,9 +283,17 @@ class RootCauseEngine:
                        result: FaultAnalysisResult) -> bool:
         """Detect a scan/non-scan boundary in the immediate neighbourhood.
 
-        Scan status is taken from pin evidence only. When either side of a
-        neighbour pair cannot be decided from its pin list, no boundary is
-        claimed -- an undecidable cell is not evidence of non-scan logic.
+        Only **sequential** neighbours can form one. Every combinational cell
+        lacks a scan-data input and a shift-enable, so a predicate that fires
+        on "any non-scan neighbour" fires on essentially every fault: on one
+        real partition it inflated the two scan-boundary categories across
+        thousands of faults whose triggering neighbours were an AND gate, an
+        inverter and a buffer. A boundary is only meaningful where a state
+        element that cannot be loaded or unloaded sits next to one that can.
+
+        Sequential-ness and scan-ness both come from the neighbour's PIN LIST
+        as read from the netlist, never from its instance or cell-type name.
+        When either side cannot be decided from pins, no boundary is claimed.
         """
         if inst is None or module is None:
             return False
@@ -298,18 +307,61 @@ class RootCauseEngine:
             nb_inst = self.conn.find_instance(module, nb)
             if nb_inst is None:
                 continue
+            if not self._is_sequential(nb_inst):
+                # Combinational: not a scan boundary, however "non-scan" it
+                # looks. Skipped silently so the evidence list stays readable.
+                continue
             nb_scan = self._is_scan_cell(nb_inst)
             if nb_scan is None or nb_scan == this_scan:
                 continue
             mixed = True
             result.observed_facts.append(
-                f"Neighbour '{nb}' ({nb_inst.cell_type}) is "
+                f"Sequential neighbour '{nb}' ({nb_inst.cell_type}) is "
                 f"{'scan' if nb_scan else 'non-scan'} while this cell is "
                 f"{'scan' if this_scan else 'non-scan'}; both decided from "
-                f"their pin lists."
+                f"their pin lists, and the neighbour was confirmed "
+                f"sequential by its clock pin."
             )
             break
         return mixed
+
+    @staticmethod
+    def _is_sequential(inst: Instance) -> bool:
+        """True when the cell has a clock pin, i.e. it is a state element.
+
+        Decided from the instantiated pin names against the configurable clock
+        vocabulary. A cell with no parsed pins is not claimed to be
+        sequential: absence of evidence is not evidence.
+        """
+        config = get_config()
+        return any(config.is_clock_pin(pin.name) for pin in inst.pins)
+
+    def _chain_connection(self, inst: Optional[Instance]
+                          ) -> Optional[Tuple[str, str]]:
+        """Report a scannable cell whose chain connection is dangling.
+
+        Returns ``(pin_name, net_name)`` for the first scan-in or scan-out pin
+        bound to an unconnected net, else ``None``.
+
+        This is structurally distinct from a scan/non-scan boundary: the cell
+        *is* scannable, it was simply never stitched into a chain. The two
+        need different fixes (re-stitch versus add a wrapper or test point),
+        so folding them together sends the reader after the wrong change. It
+        is a generic synthesis / scan-stitch artefact, not a property of any
+        one design.
+        """
+        if inst is None or not inst.pins:
+            return None
+        roles = {scan_pin_role(pin.name) for pin in inst.pins}
+        if not ("scan_in" in roles and "shift_enable" in roles):
+            return None
+        for pin in inst.pins:
+            role = scan_pin_role(pin.name)
+            if role not in ("scan_in", "scan_out"):
+                continue
+            if is_unconnected_net(pin.net):
+                return pin.name, (pin.net or "(nothing)")
+        return None
 
     @staticmethod
     def _is_scan_cell(inst: Instance) -> Optional[bool]:
@@ -392,7 +444,23 @@ class RootCauseEngine:
             )
             return RootCause.CONSTRAINT_CONTROLLABILITY
 
-        # 3. Scan/non-scan boundary effects.
+        # 3. Scannable but never stitched into a chain. Checked BEFORE the
+        # boundary rules: the cell has the scan pins, so a boundary story
+        # would be wrong, and the fix is to re-stitch rather than to add a
+        # wrapper or a test point.
+        dangling = self._chain_connection(inst)
+        if dangling is not None:
+            pin_name, net_name = dangling
+            result.inferred_conclusions.append(
+                f"The cell has a scan-data input and a shift-enable, so it is "
+                f"scannable, but its '{pin_name}' pin binds to "
+                f"'{net_name}', which matches the configured unconnected-net "
+                f"convention. It is scan-capable and not chain-connected: "
+                f"ATPG can neither load nor unload it."
+            )
+            return RootCause.SCAN_NOT_CHAIN_CONNECTED
+
+        # 4. Scan/non-scan boundary effects (sequential neighbours only).
         if scan_boundary:
             if fault.fault_class is FaultClass.UO:
                 result.inferred_conclusions.append(
@@ -405,7 +473,7 @@ class RootCauseEngine:
             )
             return RootCause.SCAN_TO_NON_SCAN
 
-        # 4. Clock/reset/test-enable cell by naming.
+        # 5. Clock/reset/test-enable cell by naming.
         if inst is not None and (_CLOCK_NAME.search(inst.name)
                                  or _RESET_NAME.search(inst.name)
                                  or _TEST_EN_NAME.search(inst.name)):
@@ -414,7 +482,7 @@ class RootCauseEngine:
             )
             return RootCause.CLOCK_RESET_TE_BLOCKING
 
-        # 5. Reconvergence / masking heuristic: many fan-ins converging.
+        # 6. Reconvergence / masking heuristic: many fan-ins converging.
         if len(result.fan_in) >= 3 and len(result.fan_out) <= 1:
             result.inferred_conclusions.append(
                 "High fan-in with low fan-out suggests structural masking or "
@@ -449,6 +517,10 @@ class RootCauseEngine:
             RootCause.CONSTRAINT_OBSERVABILITY:
                 "Check whether the constraint blocks the observe path; add an "
                 "observe point or relax the constraint.",
+            RootCause.SCAN_NOT_CHAIN_CONNECTED:
+                "The cell is scannable but its scan-in/scan-out is dangling. "
+                "Check the scan-stitch report for this instance and re-stitch "
+                "it into a chain; no wrapper or test point is needed.",
             RootCause.SCAN_TO_NON_SCAN:
                 "Inspect the scan/non-scan boundary; consider making the "
                 "neighbouring flop scannable or adding test points.",

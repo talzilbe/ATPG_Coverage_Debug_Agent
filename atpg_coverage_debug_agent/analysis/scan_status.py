@@ -88,6 +88,8 @@ class ScanStatus:
         """The sentence the agent is required to emit for this verdict."""
         if self.verdict == UNRESOLVED:
             return UNRESOLVED_ANSWER
+        where = (f"line {self.line_number}" if self.line_number is not None
+                 else "the recorded instantiation")
         if self.verdict == SCAN:
             pins = ", ".join(
                 f".{p}" for p, _ in
@@ -96,9 +98,9 @@ class ScanStatus:
             )
             tail = ("" if self.chain_connected is not False else
                     " (scan-capable but NOT chain-connected: scan-in is tied)")
-            return (f"SCAN - instantiation at line {self.line_number} shows "
+            return (f"SCAN - instantiation at {where} shows "
                     f"{pins}{tail}.")
-        return (f"NON-SCAN - instantiation at line {self.line_number} has no "
+        return (f"NON-SCAN - instantiation at {where} has no "
                 f"scan-data input and no shift-enable pin.")
 
     def as_dict(self) -> Dict[str, Any]:
@@ -214,6 +216,69 @@ def classify_instance(inst: Instance, module: str,
         f"against the library model before claiming a scan status."
     )
     status.evidence.append(UNRESOLVED_ANSWER)
+    return status
+
+
+def classify_instantiation_text(target: str, instantiation: str,
+                                instance: Optional[str] = None,
+                                cell_type: Optional[str] = None,
+                                line_number: Optional[int] = None,
+                                origin: str = "exported pin evidence"
+                                ) -> ScanStatus:
+    """Classify from a verbatim instantiation when no netlist object is held.
+
+    The rule this module enforces is that scan status may only come from a
+    pin list that was literally read. It does not say the *reader* must be
+    the process that parsed the netlist. When the analysis pass recorded the
+    instantiation for a fault site, that text is the same evidence, and
+    refusing to use it produced a worse failure than using it would have: two
+    tools in one session disagreeing about whether a design was loaded, one
+    of them quoting the very instantiation the other said did not exist.
+
+    Args:
+        target: The object asked about, verbatim.
+        instantiation: The recorded instantiation text.
+        instance / cell_type / line_number: What the analysis recorded, used
+            when the text itself does not carry them.
+        origin: Where the text came from, reported in the evidence trail.
+
+    Returns:
+        A :class:`ScanStatus`. Unresolved when there is no usable text --
+        never ``non_scan`` by default. Corroboration is reported as not run,
+        because no connectivity model exists here to run it with.
+    """
+    from ..parser.verilog_parser import parse_instantiation
+
+    text = (instantiation or "").strip()
+    if not text:
+        return unresolved(
+            target,
+            "No instantiation was recorded for this object, so there is no "
+            "pin evidence to read.",
+        )
+
+    inst = parse_instantiation(text)
+    if inst is None:
+        return unresolved(
+            target,
+            f"The recorded text for '{target}' could not be parsed as an "
+            f"instantiation, so its pin list cannot be read: {text[:200]}",
+        )
+    if instance:
+        inst.name = instance
+    if cell_type:
+        inst.cell_type = cell_type
+    inst.line_number = line_number
+
+    status = classify_instance(inst, f"({origin})", conn=None)
+    status.target = target
+    status.corroboration["note"] = (
+        "not run - this answer was read from the instantiation recorded "
+        "during the analysis pass, so no live connectivity model is "
+        "available to trace shift-enable, scan-out or scan-in drivers.")
+    status.evidence.insert(
+        0, f"Pin evidence source: {origin} (recorded during the analysis "
+           f"pass from the parsed netlist).")
     return status
 
 

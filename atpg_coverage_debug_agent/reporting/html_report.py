@@ -21,6 +21,7 @@ from collections import Counter, OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..analysis.census import build_census
 from ..models import (
     AnalysisReport,
     FaultAnalysisResult,
@@ -438,6 +439,11 @@ def _section_fault_stats(report: AnalysisReport) -> str:
         f'<td class="num" style="padding:8px 16px; font-size:13pt; color:#1a7f37;">'
         f"<b>~{cov:.1f}%</b></td></tr>"
         "</table>"
+        '<p class="note">The three rows above are SUBSETS of the fault list: '
+        'the estimated figure is detected / (detected + loss) and leaves out '
+        'the possibly-detected and undetectable classes entirely, so they do '
+        'not sum to the total. Use the Tessent metrics in 2.1 for a coverage '
+        'number and the complete census in 2.2 for the population.</p>'
     )
 
     callout = ""
@@ -452,7 +458,174 @@ def _section_fault_stats(report: AnalysisReport) -> str:
         )
 
     return (
-        "<h2>2. Fault Statistics Summary</h2>" + stats_table + metric_table + callout
+        "<h2>2. Fault Statistics Summary</h2>" + stats_table + metric_table
+        + _tessent_metrics_html(report) + _full_census_html(report) + callout
+    )
+
+
+def _tessent_metrics_html(report: AnalysisReport) -> str:
+    """The three real coverage metrics, with the counts they derive from.
+
+    The "estimated structural coverage" figure above it is a plain ratio over
+    the fault list and is kept for continuity. These are the metrics the ATPG
+    tool itself reports: undetectable faults leave the test-coverage
+    denominator and possibly-detected faults carry partial credit.
+    """
+    stats = getattr(report, "statistics", None)
+    if stats is None or not hasattr(stats, "metrics"):
+        return ""
+    m = stats.metrics()
+    roles = m["roles"]
+
+    def _val(key: str) -> str:
+        value = m[key]
+        return "n/a" if value is None else f"{value:.4f}%"
+
+    role_rows = "".join(
+        f'<tr><td style="padding:4px 16px;">{role}</td>'
+        f'<td style="padding:4px 16px;">{_esc(meaning)}</td>'
+        f'<td class="num" style="padding:4px 16px;">{_fmt(roles.get(role, 0))}</td></tr>'
+        for role, meaning in (
+            ("DT", "detected"),
+            ("PD", "possibly detected (partial credit)"),
+            ("UD", "undetectable - removed from the test-coverage denominator"),
+            ("AU", "ATPG untestable - stays in the denominator"),
+            ("ND", "not detected - coverage loss"),
+        )
+    )
+    unrecognised_row = ""
+    if m["unrecognised"]:
+        unrecognised_row = (
+            '<tr style="background:#fff4e5;"><td style="padding:4px 16px;">'
+            "(unrecognised)</td><td style=\"padding:4px 16px;\">class not in "
+            "the configured role map - excluded from every metric</td>"
+            f'<td class="num" style="padding:4px 16px;">'
+            f'{_fmt(m["unrecognised"])}</td></tr>'
+        )
+
+    header = getattr(report, "fault_list_header", None)
+    collapsing = ""
+    if header is not None:
+        collapsing = (
+            f' The fault population is <b>{_esc(header.collapsing_label)}</b>'
+            f' (model(s): {_esc(", ".join(header.fault_models) or "n/a")});'
+            f' a collapsed and an uncollapsed census are not comparable.'
+        )
+
+    warning = ""
+    if not m["census_balances"]:
+        warning = _callout(
+            "error",
+            "<b>The role census does not reconcile with the parsed record "
+            "count.</b> Every figure in this section is unusable until the "
+            "class map is corrected.")
+
+    formulas = m.get("formulas", {})
+    metric_rows = "".join(
+        f'<tr><td style="padding:6px 16px;">{label}</td>'
+        f'<td class="num" style="padding:6px 16px;">{_val(key)}</td>'
+        f'<td style="padding:6px 16px;"><code>'
+        f'{_esc(formulas.get(key, {}).get("formula", ""))}</code></td>'
+        f'<td style="padding:6px 16px;"><code>'
+        f'{_esc(formulas.get(key, {}).get("substitution", ""))}</code></td></tr>'
+        for key, label in (("test_coverage", "<b>Test coverage</b>"),
+                           ("fault_coverage", "Fault coverage"),
+                           ("atpg_effectiveness", "ATPG effectiveness"))
+    )
+
+    return (
+        "<h3>2.1 Tessent coverage metrics</h3>"
+        f'<p class="note">Possibly-detected credit '
+        f'(<code>posdet_credit</code>) = <b>{m["posdet_credit"]}</b>; the '
+        f'numerator is <code>DT + posdet_credit x PD</code> = '
+        f'{m["detected_credit"]}.{collapsing}</p>'
+        '<table style="width:auto;">'
+        "<tr><th>Metric</th><th>Value</th><th>Formula</th>"
+        "<th>Numeric substitution</th></tr>"
+        + metric_rows + "</table>"
+        f'<p class="note">{_esc(m.get("ud_definition", ""))} '
+        f'{_esc(m.get("basis", ""))}</p>'
+        '<table style="width:auto; margin-top:10px;">'
+        "<tr><th>Role</th><th>Meaning</th><th>Faults</th></tr>"
+        + role_rows + unrecognised_row
+        + f'<tr><td style="padding:4px 16px;"><b>FU</b></td>'
+          f'<td style="padding:4px 16px;">total fault population</td>'
+          f'<td class="num" style="padding:4px 16px;"><b>{_fmt(m["total_faults"])}'
+          f"</b></td></tr></table>"
+        + warning
+    )
+
+
+def _full_census_html(report: AnalysisReport) -> str:
+    """Section 2.2 (S2b): every fault class, grouped by coverage role.
+
+    Always emitted, and deliberately unfiltered. Every other class listing in
+    this report is a coverage-loss view; this one is the population of record,
+    and it ends with the sum check so no reader has to reverse-engineer
+    whether what they are looking at is complete.
+    """
+    census = build_census(report)
+    if not census.entries:
+        return ("<h3>2.2 Complete fault census (S2b)</h3>"
+                + _callout("info", "No faults were parsed, so there is no "
+                                   "census to report."))
+
+    blocks = []
+    for role in census.roles:
+        rows = "".join(
+            f"<tr><td>{_esc(family.family)}</td>"
+            f'<td class="{_CLASS_CSS.get(entry.family.upper(), "bb")}">'
+            f"{_esc(entry.subclass)}</td>"
+            f'<td class="num">{_fmt(entry.count)}</td>'
+            f'<td class="num">{_pct(entry.count, census.total_faults)}</td>'
+            f'<td class="num">{_fmt(entry.sa0)}</td>'
+            f'<td class="num">{_fmt(entry.sa1)}</td></tr>'
+            for family in role.families for entry in family.entries
+        )
+        blocks.append(
+            f"<h4>{_esc(role.role)} &mdash; {_esc(role.label)} "
+            f"({_fmt(role.count)} faults, "
+            f"{_pct(role.count, census.total_faults)})</h4>"
+            f'<p class="note">{_esc(role.scope)}</p>'
+            "<table><tr><th>Family</th><th>Subclass</th><th>Count</th>"
+            "<th>% of Total</th><th>sa0</th><th>sa1</th></tr>"
+            + rows + "</table>"
+        )
+
+    rec = census.reconciliation()
+    if rec["reconciles"]:
+        check = _callout(
+            "ok",
+            f"<b>Census self-check passed.</b> The {rec['classes']} class "
+            f"counts sum to {_fmt(rec['sum_of_class_counts'])}, which equals "
+            f"the {_fmt(rec['total_faults'])} fault(s) analysed. Delta 0.")
+    else:
+        check = _callout(
+            "error",
+            f"<b>Census self-check FAILED.</b> The {rec['classes']} class "
+            f"counts sum to {_fmt(rec['sum_of_class_counts'])} but "
+            f"{_fmt(rec['total_faults'])} fault(s) were analysed: a delta of "
+            f"{_fmt(rec['delta'])}. This is a defect in the analyser. Do not "
+            f"assign the delta to a fault category &mdash; it does not have "
+            f"one, and no figure derived from this census is trustworthy.")
+    if rec["unclassified_tokens"]:
+        check += _callout(
+            "warn",
+            "<b>Unclassified fault class(es):</b> <code>"
+            + _esc(", ".join(rec["unclassified_tokens"]))
+            + "</code>. These are not in the configured class-role map, so "
+              "they contribute to no coverage metric and the test-coverage "
+              "denominator is understated. Map them via "
+              "<code>class_roles</code> in the analysis configuration.")
+
+    return (
+        "<h3>2.2 Complete fault census (S2b)</h3>"
+        f'<p class="note">All {census.class_count} fault class(es) present in '
+        f"the fault list, grouped by the coverage role each was counted "
+        f"under. Nothing is filtered out, including classes that are not "
+        f"debug targets. Every other class listing in this report is a "
+        f"subset and says so.</p>"
+        + "".join(blocks) + check
     )
 
 
@@ -556,7 +729,119 @@ def _section_evidence(report: AnalysisReport) -> str:
 
     ties = _tie_driver_table(report)
 
-    return heading + basis + scan_table + cause_html + ties + "".join(notes)
+    return (heading + basis + scan_table + cause_html + ties
+            + "".join(notes) + _input_quality_html(report))
+
+
+def _input_quality_html(report: AnalysisReport) -> str:
+    """How completely the inputs were understood, as a &sect;3 subsection.
+
+    Deliberately not a numbered section of its own: it belongs with the other
+    evidence-quality material. Its job is to keep "the design has no
+    constraints" separate from "the constraint file was only partly parsed",
+    and to make classes the tool does not know visible and inspectable rather
+    than silently absent.
+    """
+    header = getattr(report, "fault_list_header", None)
+    diagnostics = getattr(report, "class_diagnostics", None)
+    constraint_status = getattr(report, "constraint_diagnostics", None)
+    if header is None and diagnostics is None and not constraint_status:
+        return ""
+
+    out = ["<h3>3.1 Input quality</h3>"]
+
+    if header is not None:
+        models = ", ".join(header.fault_models) or "not declared"
+        columns = ", ".join(header.format_fields) or "not declared"
+        out.append(
+            '<table style="width:auto;">'
+            "<tr><th colspan=\"2\">Fault list, as the file declared itself"
+            "</th></tr>"
+            f'<tr><td style="padding:4px 16px;">Format</td>'
+            f'<td style="padding:4px 16px;">{_esc(header.file_format)}</td></tr>'
+            f'<tr><td style="padding:4px 16px;">Compression (magic bytes)</td>'
+            f'<td style="padding:4px 16px;">{_esc(header.compression)}</td></tr>'
+            f'<tr><td style="padding:4px 16px;">Declared version</td>'
+            f'<td style="padding:4px 16px;">'
+            f'{_esc(header.version or "not declared")}</td></tr>'
+            f'<tr><td style="padding:4px 16px;">Fault collapsing</td>'
+            f'<td style="padding:4px 16px;"><b>'
+            f'{_esc(header.collapsing_label)}</b></td></tr>'
+            f'<tr><td style="padding:4px 16px;">Fault model(s)</td>'
+            f'<td style="padding:4px 16px;">{_esc(models)}</td></tr>'
+            f'<tr><td style="padding:4px 16px;">Declared column order</td>'
+            f'<td style="padding:4px 16px;"><code>{_esc(columns)}</code>'
+            f"</td></tr></table>"
+        )
+        if len(header.per_model_counts) > 1:
+            rows = "".join(
+                f"<tr><td>{_esc(model)}</td>"
+                f'<td class="num">{_fmt(sum(counts.values()))}</td>'
+                f'<td class="num">{_fmt(len(counts))}</td></tr>'
+                for model, counts in header.per_model_counts.items()
+            )
+            out.append(
+                '<table style="margin-top:12px; width:auto;">'
+                '<tr><th colspan="3">Census per fault model</th></tr>'
+                "<tr><th>Model</th><th>Faults</th><th>Classes</th></tr>"
+                + rows + "</table>"
+            )
+
+    if diagnostics is not None and getattr(diagnostics, "tokens", None):
+        rows = "".join(
+            f"<tr><td><code>{_esc(tok.token)}</code></td>"
+            f'<td class="num">{_fmt(tok.count)}</td>'
+            f'<td class="num">{tok.first_line or _DASH}</td>'
+            f"<td><code>{_esc(tok.samples[0] if tok.samples else '')}</code>"
+            f"</td></tr>"
+            for tok in diagnostics.tokens
+        )
+        out.append(
+            '<table style="margin-top:12px;">'
+            '<tr><th colspan="4">Fault classes the configuration does not '
+            "describe</th></tr>"
+            "<tr><th>Class token</th><th>Records</th><th>First line</th>"
+            "<th>Sample record</th></tr>" + rows + "</table>"
+        )
+        out.append(_callout(
+            "warn",
+            f"<b>{_fmt(diagnostics.count)} of {_fmt(diagnostics.total)} "
+            f"record(s) ({diagnostics.pct:.4f}%)</b> carried an unrecognised "
+            f"fault class. They are excluded from every coverage metric. Add "
+            f"the class to <code>class_roles</code> in the analysis "
+            f"configuration to bring them in."))
+
+    if constraint_status:
+        total = constraint_status.get("directives", 0)
+        unresolved = constraint_status.get("unresolved", 0)
+        out.append(
+            '<table style="margin-top:12px; width:auto;">'
+            '<tr><th colspan="2">Constraint file parsing</th></tr>'
+            f'<tr><td style="padding:4px 16px;">Files read (includes followed)'
+            f'</td><td class="num" style="padding:4px 16px;">'
+            f'{_fmt(len(constraint_status.get("files") or []))}</td></tr>'
+            f'<tr><td style="padding:4px 16px;">Directives evaluated</td>'
+            f'<td class="num" style="padding:4px 16px;">'
+            f'{_fmt(constraint_status.get("resolved", 0))} of {_fmt(total)}'
+            f"</td></tr>"
+            f'<tr><td style="padding:4px 16px;">Directives NOT evaluated</td>'
+            f'<td class="num" style="padding:4px 16px;">{_fmt(unresolved)}'
+            f"</td></tr>"
+            f'<tr><td style="padding:4px 16px;">Objects resolved from '
+            f'collections</td><td class="num" style="padding:4px 16px;">'
+            f'{_fmt(constraint_status.get("expanded_objects", 0))}</td></tr>'
+            "</table>"
+        )
+        if unresolved:
+            out.append(_callout(
+                "warn",
+                f"<b>{_fmt(unresolved)} constraint directive(s) were "
+                f"recognised but could not be evaluated.</b> While that count "
+                f"is non-zero, a fault reported with no constraint hit is "
+                f"<b>not</b> proven unconstrained &mdash; the constraint file "
+                f"was only partly understood."))
+
+    return "".join(out)
 
 
 #: Human labels for the tri-state scan verdict.
