@@ -78,6 +78,51 @@ same deterministic tools.
 - CLI with console triage and fix plan, plus Markdown / CSV / HTML export.
 - An **AI Debug Agent** that investigates through deterministic tools, over a
   local MCP server or an OpenAI-compatible endpoint.
+- One-click **Tessent Visualizer launch**: opens the vendor viewer on the same
+  design, so a structural conclusion can be confirmed in the tool that owns
+  the authoritative answer.
+
+### Opening the design in Tessent Visualizer
+
+Everything this tool concludes is structural. The **Tessent Visualizer** tab
+builds the whole chain &mdash; project setup, licence environment, tool shell,
+`read_icl` / `read_flat_model` / `read_faults`, `open_visualizer` &mdash; and
+runs it in its own terminal. The session is detached, so it outlives the
+application and the tool prompt stays usable after the viewer appears.
+
+Projects are **data**: one JSON file per project in `profiles/`, so adding a
+project needs no code change. Point `$ATPG_TOOL_PROFILES` at your own directory
+to add or shadow one. See [profiles/README.md](profiles/README.md) for the
+schema.
+
+The exact dofile is shown before it runs and can be edited; **Copy commands**
+puts the whole chain on the clipboard for hosts where the launch is not
+available. Right-click any row in the Coverage Loss Table &rarr; *Inspect in
+Tessent Visualizer* to open the session already looking at that fault.
+
+### Opening a signal in a session that is already running
+
+The generated dofile also opens a small control channel inside the tool, so a
+signal can be sent to a session that is **already open** &mdash; no relaunch.
+Right-click a signal and choose *Open signal in Tessent Visualizer*, from the
+*Where the loss is* tree, the blocking signals of a category, a fix proposal's
+hotspot, or the Coverage Loss Table.
+
+On a *cluster prefix* the entry is greyed out on purpose: a prefix is a string
+the triage computed to show where faults concentrate, not an object the tool
+can resolve.
+
+The channel is deliberately narrow. It listens on loopback only, on an
+OS-assigned port; every request carries a per-session token; **no command text
+is transmitted** &mdash; a verb, one object and option pairs are sent
+separately and the command is rebuilt inside the tool, so a bracket or `$` in
+an object name stays data; and the verb must appear in the profile's
+`control.allowed_commands`, which the shipped profile limits to viewing
+commands. Set `control.enabled` to `false` to switch it off entirely.
+
+From the CLI, `--list-vis-profiles` lists the profiles and
+`--emit-visualizer-script DIR` writes the launch scripts and prints the chain
+without running anything.
 - `pytest` suite (250+ tests) and synthetic sample inputs.
 
 ---
@@ -110,7 +155,7 @@ the class label — drives the numbers:
 | Role | Meaning | Default classes | Effect |
 | --- | --- | --- | --- |
 | `DT` | detected | `DS`, `DI.*` | numerator, full credit |
-| `PD` | possibly detected | `PT`, `PU` | numerator, `posdet_credit` |
+| `PD` | possibly detected | `PT`, `PU` | numerator, `posdet_credit` (default `0`) |
 | `UD` | undetectable | `UU`, `TI`, `BL`, `RE` | removed from the test-coverage denominator |
 | `AU` | ATPG untestable | `AU.*` | stays in the denominator |
 | `ND` | not detected | `UO.*`, `UC.*` | coverage loss |
@@ -118,8 +163,35 @@ the class label — drives the numbers:
 ```
 test_coverage      = (DT + posdet_credit*PD) / (FU - UD)
 fault_coverage     = (DT + posdet_credit*PD) / FU
-atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU
+atpg_effectiveness = (DT + PU + UD + AU) / FU
 ```
+
+`posdet_credit` defaults to **0**, matching the ATPG tool: a possibly-detected
+fault earns no test- or fault-coverage credit. ATPG effectiveness follows a
+separate rule — it credits `PU` (possibly detected, *untestable*) and **not**
+`PT`, because a posdet-untestable fault is as resolved as ATPG can make it.
+Both are configurable (`posdet_credit`, `effectiveness_posdet_families`) and
+both are printed in the report header.
+
+### Two populations: total and total relevant
+
+A run that performs a **fault disposition** reclassifies a block of faults into
+a waiver subclass and excludes it from the relevant coverage column
+(`set_relevant_coverage -exclude <subclass>`). The report reproduces both
+columns. ATPG effectiveness is reported over the *total* population in both,
+since the waived faults were resolved by ATPG — re-basing it would understate
+how much of the design ATPG settled. This is configurable via
+`effectiveness_basis`.
+
+The disposition step also **rewrites the ATPG-untestable subclass
+distribution**, which is what the category ranking and fix plan are built from.
+The report therefore names the fault list it parsed and states whether it is
+`pre-disposition`, `post-disposition` or `undetermined`. The verdict comes from
+the file's *contents* — is the waiver subclass present? — with the phase tag in
+the file name only breaking ties. Point `--faults` at a **directory** and the
+best candidate is selected by pattern; name a file explicitly and it is always
+honoured, with any better-looking sibling reported rather than silently
+substituted.
 
 Every percentage is printed next to the counts it came from, and a metric that
 is undefined for the population (no faults, or every fault undetectable) is
@@ -591,15 +663,21 @@ atpg_coverage_debug_agent/
     html_report.py     # print-style document, also shown in the GUI
     session_report.py  # save / load a full analysis as JSON
   skills/              # deterministic and on-demand analysis skills
+  launcher/
+    profiles.py        # launch profiles, loaded from profiles/*.json
+    visualizer.py      # builds the viewer launch chain (runs nothing itself)
+    terminals.py       # terminal-emulator discovery
   agent/
     debug_agent.py     # LLM backends (Copilot CLI / OpenAI-compatible)
   gui/
     main_window.py     # PySide6 main window
     triage_panel.py    # Triage & Fix Plan tab
     agent_panel.py     # AI Debug Agent tab
+    visualizer_panel.py # Tessent Visualizer tab
     workers.py         # QThread analysis worker
     details_panel.py   # per-fault evidence panel
 tests/                 # pytest suite
+profiles/              # one JSON launch profile per project (data, not code)
 sample_data/           # demo and minimal netlist / faults / constraints
 requirements.txt
 README.md
@@ -634,6 +712,9 @@ README.md
 - **Scan detection heuristics.** Scan vs non-scan is detected from cell-type and
   signal naming conventions unless scan cells are explicitly identifiable.
 - **Constraint mapping** depends on signal names lining up with netlist nets.
+- **The viewer launch needs a terminal emulator and an X display.** It is
+  built for a Linux workstation with `xterm`, `gnome-terminal` or
+  `xfce4-terminal`; elsewhere, use *Copy commands* and run the chain by hand.
 
 ---
 

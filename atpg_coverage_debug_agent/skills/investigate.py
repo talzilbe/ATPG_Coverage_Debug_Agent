@@ -494,6 +494,21 @@ class ReportContextSkill(_InvestigativeSkill):
 
 
 @register
+class VisualizerCommandsSkill(_InvestigativeSkill):
+    skill_id = "visualizer_commands"
+    tool_name = "visualizer_commands"
+    display_name = "Visualizer Commands (query)"
+    description = investigate.TOOL_SPECS["visualizer_commands"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return "visualizer_commands: no viewer session is configured."
+        steps = data.get("steps") or []
+        return (f"visualizer_commands: {len(steps)} command(s) to reopen this "
+                f"design in the viewer.")
+
+
+@register
 class ReportInsufficientEvidenceSkill(_InvestigativeSkill):
     skill_id = "report_insufficient_evidence"
     tool_name = "report_insufficient_evidence"

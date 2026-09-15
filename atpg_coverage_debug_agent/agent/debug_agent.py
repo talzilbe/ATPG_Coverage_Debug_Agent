@@ -140,6 +140,17 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
     (DT + c*PD) / (FU - UD) is the WHOLE undetectable population as the class
     map defines it, not a single class. Prefer the metrics the deterministic
     pass already printed, each of which carries its own substitution.
+  - SAY WHICH POPULATION A COVERAGE FIGURE DESCRIBES. A run that performs a
+    fault disposition reports two columns: "total" over the full population
+    and "total relevant" with the waived subclass excluded. They are both
+    correct and they differ by several points. A percentage quoted without
+    naming its column cannot be reconciled against the tool's own report.
+  - CHECK THE SNAPSHOT BEFORE RANKING ROOT CAUSES. report_context's snapshot
+    section says whether the fault list analysed is pre- or post-disposition.
+    The disposition step REWRITES the ATPG-untestable subclass distribution,
+    so a ranking built from a pre-disposition snapshot can put the wrong
+    category first. If the snapshot is pre-disposition or undetermined, say
+    so in the same paragraph as the ranking -- do not bury it in a caveat.
   - A TRUNCATED RESULT IS NOT A READ RESULT. If a tool response is marked
     truncated or names a spill file, retrieve the complete payload before
     concluding anything from it. Counts are never truncated; a shortened list
@@ -687,20 +698,48 @@ def _metrics_lines(report: Any) -> List[str]:
     stats = getattr(report, "statistics", None)
     if stats is None or not hasattr(stats, "metrics"):
         return []
-    m = stats.metrics()
-    lines = [f"- Coverage metrics (computed from the COMPLETE census above; "
-             f"posdet_credit={m['posdet_credit']}):"]
-    for key, label in (("test_coverage", "test coverage"),
-                       ("fault_coverage", "fault coverage"),
-                       ("atpg_effectiveness", "atpg effectiveness")):
-        spec = m.get("formulas", {}).get(key, {})
-        value = m[key]
-        shown = "n/a" if value is None else f"{value:.4f}%"
-        lines.append(f"    {label}: {shown}  [{spec.get('formula', '')}]  "
-                     f"{spec.get('substitution', '')}")
-    lines.append(f"    roles: " + ", ".join(
-        f"{r}={m['roles'].get(r, 0)}" for r in ("DT", "PD", "UD", "AU", "ND"))
-        + f", FU={m['total_faults']}")
+    relevant = getattr(report, "relevant_statistics", None)
+    columns = [("total", stats)]
+    if relevant is not None:
+        columns.append(("total relevant", relevant))
+
+    state = getattr(report, "disposition", None)
+    lines = []
+    if state is not None:
+        lines.append(
+            f"- Snapshot analysed: {state.resolved_path or 'n/a'} "
+            f"[{state.label}]"
+            + (f", waiver subclass {state.waiver_subclass} "
+               f"({state.waiver_count} fault(s))"
+               if state.waiver_subclass else ""))
+        if state.is_pre:
+            lines.append(
+                "    WARNING: pre-disposition snapshot. The disposition step "
+                "rewrites the AU subclass distribution, so the category "
+                "ranking below may not reflect the final design state. Say "
+                "so in any answer that ranks root causes.")
+
+    m = stats.metrics(stats)
+    credited = ", ".join(m["credited_posdet_families"]) or "none"
+    lines.append(
+        f"- Coverage metrics (computed from the COMPLETE census above; "
+        f"posdet_credit={m['posdet_credit']} for test/fault coverage; "
+        f"effectiveness credits {credited} at full weight):")
+    for label, pop in columns:
+        payload = pop.metrics(stats)
+        lines.append(f"    [{label}] FU={payload['total_faults']}")
+        for key, name in (("test_coverage", "test coverage"),
+                          ("fault_coverage", "fault coverage"),
+                          ("atpg_effectiveness", "atpg effectiveness")):
+            spec = payload.get("formulas", {}).get(key, {})
+            value = payload[key]
+            shown = "n/a" if value is None else f"{value:.4f}%"
+            lines.append(f"      {name}: {shown}  "
+                         f"[{spec.get('formula', '')}]  "
+                         f"{spec.get('substitution', '')}")
+        lines.append("      roles: " + ", ".join(
+            f"{r}={payload['roles'].get(r, 0)}"
+            for r in ("DT", "PD", "UD", "AU", "ND")))
     lines.append(f"    {m.get('ud_definition', '')}")
     lines.append(f"    {m.get('basis', '')}")
     return lines

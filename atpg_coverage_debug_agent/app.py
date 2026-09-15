@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from .analysis.disposition import select_fault_list
 from .analysis.summarizer import build_report
 from .config.analysis_config import AnalysisConfig, resolve
 from .models import AnalysisReport
@@ -36,7 +37,6 @@ def _validate(path: str, label: str) -> None:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"{label} file not found: {path}")
 
-
 def _design_name(netlist_path: Optional[str]) -> Optional[str]:
     """Derive a design name from a netlist file path (strip common suffixes)."""
     if not netlist_path:
@@ -49,12 +49,13 @@ def _design_name(netlist_path: Optional[str]) -> Optional[str]:
     return base or None
 
 
-def _source_metadata(inputs: "AnalysisInputs") -> dict:
+def _source_metadata(inputs: "AnalysisInputs",
+                     faults_path: Optional[str] = None) -> dict:
     """Source paths + design name recorded on the report for the cover header."""
     return {
         "design": _design_name(inputs.netlist_path),
         "netlist": inputs.netlist_path,
-        "faults": inputs.faults_path,
+        "faults": faults_path or inputs.faults_path,
         "constraints": inputs.constraints_path,
     }
 
@@ -86,10 +87,17 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
             coverage numbers that look plausible and are wrong.
     """
     _validate(inputs.netlist_path, "Netlist")
-    _validate(inputs.faults_path, "Fault list")
 
     config = resolve(config)
     warnings: List[str] = []
+
+    # A directory resolves to its best candidate; an explicitly named file is
+    # always honoured, with a better-looking sibling reported rather than
+    # silently substituted.
+    faults_path, candidates, select_warnings = select_fault_list(
+        inputs.faults_path, config)
+    warnings.extend(select_warnings)
+    _validate(faults_path, "Fault list")
 
     if progress:
         progress(0, 5, "Parsing netlist")
@@ -97,7 +105,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 
     if progress:
         progress(1, 5, "Parsing fault list")
-    fault_parse = parse_fault_list_file_ex(inputs.faults_path, config=config)
+    fault_parse = parse_fault_list_file_ex(faults_path, config=config)
     faults = fault_parse.records
     warnings.extend(fault_parse.warnings)
 
@@ -122,14 +130,16 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     if progress:
         progress(3, 5, "Running analysis")
     report = build_report(netlist, faults, constraints, warnings,
-                          progress=progress, config=config)
+                          progress=progress, config=config,
+                          faults_path=faults_path,
+                          fault_list_candidates=candidates)
 
     # Retain the parsed artefacts so the agentic AI layer can build a live
     # AnalysisContext and invoke skills as tools on demand.
     report.netlist = netlist
     report.faults = faults
     report.constraints = constraints
-    report.sources = _source_metadata(inputs)
+    report.sources = _source_metadata(inputs, faults_path)
     report.fault_list_header = fault_parse.header
     report.class_diagnostics = fault_parse.unrecognised
     report.constraint_diagnostics = (constraint_parse.summary()

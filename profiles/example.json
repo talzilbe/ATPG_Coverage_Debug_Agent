@@ -1,0 +1,91 @@
+{
+  "name": "example",
+  "display_name": "Example Project",
+  "description": "Template launch profile. Copy this file, rename it, and fill in your site's setup wrapper, licence server and tool paths. Profiles are data: adding a project is adding a file here, never a code change. Point $ATPG_TOOL_PROFILES at your own directory to keep site-specific profiles outside this repository.",
+  "shell": "/bin/tcsh",
+  "psetup": {
+    "executable": "/path/to/your/project/setup/wrapper",
+    "proj": "yourproject/RELEASE",
+    "cfg": "yourconfig.cth",
+    "proj_flag": "-proj",
+    "cfg_flag": "-cfg",
+    "ward_flag": "-ward",
+    "command_flag": "-x",
+    "extra_args": []
+  },
+  "environment": {
+    "SALT_LICENSE_SERVER": "PORT@your.licence.server"
+  },
+  "tool": {
+    "executable": "/path/to/tessent",
+    "shell_flag": "-shell",
+    "dofile_flag": "-dofile",
+    "logfile_flag": "-logfile",
+    "replace_flag": "-replace",
+    "extra_args": []
+  },
+  "commands": {
+    "context": "set_context pattern -scan",
+    "load": [
+      {
+        "key": "icl",
+        "command": "read_icl",
+        "label": "ICL file",
+        "switches": [],
+        "required": true,
+        "run_dir_glob": "tsdb_outdir/dft_inserted_designs/*.dft_inserted_design/*.icl"
+      },
+      {
+        "key": "flat_model",
+        "command": "read_flat_model",
+        "label": "Flat model",
+        "switches": ["-en", "on"],
+        "required": true,
+        "run_dir_glob": "tsdb_outdir/logic_test_cores/*.logic_test_core/*.atpg_mode_internal/*_internal.flat.gz"
+      },
+      {
+        "key": "faults",
+        "command": "read_faults",
+        "label": "Fault list",
+        "switches": ["-retain"],
+        "required": true,
+        "run_dir_glob": "faultlist/*.faults.gz"
+      }
+    ],
+    "open": "open_visualizer",
+    "fault_inspect": [
+      "analyze_fault {fault} -stuck_at {stuck}"
+    ],
+    "signal_inspect": [
+      {
+        "verb": "add_schematic_objects",
+        "label": "Show in the flat schematic",
+        "options": {"-display": "flat_schematic", "-highlight": "red"}
+      },
+      {
+        "verb": "add_schematic_objects",
+        "label": "Show in the hierarchical schematic",
+        "options": {"-display": "hierarchical_schematic", "-highlight": "red"}
+      }
+    ]
+  },
+  "control": {
+    "enabled": true,
+    "allowed_commands": [
+      "add_schematic_objects",
+      "add_schematic_path",
+      "add_schematic_connections",
+      "add_schematic_callout",
+      "delete_schematic_objects",
+      "open_visualizer"
+    ],
+    "allowed_options": [
+      "-display",
+      "-highlight",
+      "-direction",
+      "-distance_limit",
+      "-connections_limit"
+    ]
+  },
+  "terminal_preference": ["xterm", "gnome-terminal", "xfce4-terminal"]
+}

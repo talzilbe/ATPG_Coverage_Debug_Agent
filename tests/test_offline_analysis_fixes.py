@@ -701,6 +701,8 @@ def test_partition_census_and_metrics_match_the_fixture(partition):
     assert stats.census_balances
     assert m["posdet_credit"] == expected["posdet_credit"]
     assert m["detected_credit"] == pytest.approx(expected["detected_credit"])
+    assert m["effectiveness_posdet_count"] == \
+        expected["effectiveness_posdet_count"]
     for key in ("test_coverage", "fault_coverage", "atpg_effectiveness"):
         assert m[key] == pytest.approx(expected[key], abs=1e-3), key
 
@@ -773,14 +775,48 @@ def test_adding_a_partition_is_data_only(tmp_path):
 # ---------------------------------------------------------------------------
 # Generality guards
 # ---------------------------------------------------------------------------
+def _profile_tokens():
+    """Every identifying value in the launch profiles present on this machine.
+
+    Derived rather than listed, for two reasons: a new profile is covered with
+    no test edit, and a site's real tool paths, project names and licence
+    servers never have to be written into a committed source file to be
+    guarded against.
+
+    Only the value fields are collected. The flag fields (``-proj``, ``-cfg``,
+    ``-ward`` ...) are the vocabulary the package is supposed to contain, and
+    the sanitised ``example`` template is skipped because its placeholders are
+    deliberately ordinary words.
+    """
+    value_keys = {"executable", "proj", "cfg"}
+    tokens = set()
+    for path in sorted((Path(__file__).parent.parent / "profiles").glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        name = str(data.get("name") or "").strip().lower()
+        if name == "example":
+            continue
+        for section in ("psetup", "tool"):
+            for key, value in dict(data.get(section) or {}).items():
+                if key in value_keys and isinstance(value, str):
+                    tokens.add(value.strip().lower())
+        for value in dict(data.get("environment") or {}).values():
+            if isinstance(value, str):
+                tokens.add(value.strip().lower())
+        if len(name) > 3:
+            tokens.add(name)
+    return {t for t in tokens if len(t) > 3 and not t.startswith("-")}
+
+
 def test_no_partition_specific_identifier_is_hard_coded_in_the_package():
     """The bug report's partition is a fixture, never a value in the source.
 
     Nothing about the design that exposed the defect may leak into the tool:
-    not its name, not its cell library prefixes, not its fault counts.
+    not its name, not its cell library prefixes, not its fault counts.  The
+    same rule covers launch profiles: a project name, a site tool path or a
+    licence server belongs in ``profiles/*.json``, never in the package.
     """
     package = Path(__file__).parent.parent / "atpg_coverage_debug_agent"
-    forbidden = (
+    forbidden = set((
         "punit", "par_base_punit",
         "g1mtihi", "g1mtilo", "g1mfuz",
         "6340699", "6,340,699", "133402", "133,402",
@@ -788,7 +824,18 @@ def test_no_partition_specific_identifier_is_hard_coded_in_the_package():
         "89104", "89,104", "29076", "29,076",
         "42731", "42,731", "83450", "83,450",
         "15409", "15,409", "srmsff", "sroutxnnnh",
-    )
+        # The coverage-metric fixture run: design name, counts and the
+        # percentages it pins. These belong in tests/test_coverage_metrics.py.
+        "par_fuse", "stuckat_edt_min",
+        "767594", "767,594", "860480", "860,480",
+        "818619", "818,619", "41861", "41,861",
+        "84652", "84,652", "42791", "42,791",
+        "691617", "691,617", "75977", "75,977",
+        "90.28", "94.51", "89.87", "89.21", "93.77", "99.88", "99.81",
+        # Launch-profile values are data, not code, and are read from whatever
+        # profiles this machine has rather than named here.
+        "cth_psetup",
+    )) | _profile_tokens()
     offenders = []
     for path in package.rglob("*.py"):
         text = path.read_text(encoding="utf-8", errors="replace").lower()
@@ -807,7 +854,11 @@ def test_every_configurable_convention_is_documented_with_its_default():
                 "scan_out_pins", "shift_enable_pins", "clock_pins",
                 "unconnected_net_patterns", "tie_high_patterns",
                 "tie_low_patterns", "constraint_directives",
-                "unknown_class_threshold_pct", "sample_limit"):
+                "unknown_class_threshold_pct", "sample_limit",
+                "effectiveness_posdet_families", "effectiveness_basis",
+                "waiver_subclass_patterns", "fault_list_file_patterns",
+                "partial_fault_file_patterns",
+                "disposition_file_patterns", "phase_file_patterns"):
         assert key in documented, key
     assert documented["source"]
 

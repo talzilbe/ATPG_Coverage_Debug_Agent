@@ -277,7 +277,19 @@ def test_help_documents_the_coverage_metric_formulas():
 
     assert "test_coverage      = (DT + posdet_credit*PD) / (FU - UD)" in _HELP_HTML
     assert "fault_coverage     = (DT + posdet_credit*PD) / FU" in _HELP_HTML
-    assert "atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU" in _HELP_HTML
+    # Effectiveness credits PU and not PT, and posdet_credit defaults to 0.
+    assert "atpg_effectiveness = (DT + PU + UD + AU) / FU" in _HELP_HTML
+    assert "posdet_credit</code> defaults to <b>0</b>" in _HELP_HTML
+
+
+def test_help_explains_the_pre_and_post_disposition_snapshot():
+    """The snapshot decides whether the ranking describes the final design."""
+    from atpg_coverage_debug_agent.gui.main_window import _HELP_HTML
+
+    assert "fault-disposition" in _HELP_HTML
+    assert "set_relevant_coverage -exclude" in _HELP_HTML
+    assert "total relevant" in _HELP_HTML
+    assert "pre-disposition" in _HELP_HTML
 
 
 def test_help_documents_how_to_onboard_a_new_partition():

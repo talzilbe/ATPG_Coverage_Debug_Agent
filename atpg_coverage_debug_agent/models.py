@@ -479,8 +479,17 @@ class AnalysisReport:
     #: note (set by the Edit Report action). ``None`` when unedited.
     edits: Any = None
     #: Fault-class breakdown derived from the fault list alone
-    #: (``analysis.statistics.DerivedStatistics``).
+    #: (``analysis.statistics.DerivedStatistics``). Always the TOTAL
+    #: population, so the census reconciles against it.
     statistics: Any = None
+    #: The same breakdown with the fault-disposition waiver subclass removed,
+    #: i.e. the ATPG tool's "total relevant" column
+    #: (``analysis.statistics.DerivedStatistics``). ``None`` when the fault
+    #: list holds no waiver subclass, in which case there is one population.
+    relevant_statistics: Any = None
+    #: Which snapshot of the fault population was analysed and how we know
+    #: (``analysis.disposition.DispositionState``). ``None`` for older reports.
+    disposition: Any = None
     #: What the fault list declared about itself: format, compression,
     #: version, fault models and whether the faults are collapsed
     #: (``parser.fault_parser.FaultListHeader``). ``None`` for older reports.
@@ -512,3 +521,7 @@ class AnalysisReport:
     #: relative to the file they were written beside, so they only resolve
     #: from that location.
     category_dumps: Any = None
+    #: How to reopen this design in the vendor viewer: the launch profile and
+    #: the design paths the user supplied (``dict``). ``None`` when no viewer
+    #: session has been configured.
+    visualizer_config: Any = None

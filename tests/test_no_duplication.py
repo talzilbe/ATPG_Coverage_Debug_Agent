@@ -60,8 +60,14 @@ def test_sections_are_numbered_without_gaps_including_subheadings(demo_html):
 
 
 def test_detected_loss_headline_appears_once(demo_html):
-    """The coverage metric lives in section 2 and is not repeated in the triage."""
-    assert demo_html.count("Estimated structural coverage") == 1
+    """Coverage percentages live in section 2.1 only, each with a substitution.
+
+    The old "Estimated structural coverage" figure was ``detected / (detected +
+    loss)``, which omits the possibly-detected and undetectable classes
+    entirely and so matches no figure the ATPG tool produces. It was deleted
+    rather than re-derived; this asserts it stays deleted.
+    """
+    assert "Estimated structural coverage" not in demo_html
     assert "<b>Detected:</b>" not in demo_html
     # The caveat about what the figure is not must survive the deduplication.
     assert "not</b> the ATPG tool's test-coverage figure" in demo_html

@@ -27,11 +27,13 @@ from ..parser.verilog_parser import VerilogNetlist
 from .attribution import attribute_categories
 from .census import build_census, census_warnings
 from .connectivity import ConnectivityModel
+from .disposition import classify_snapshot
 from .mapper import FaultMapper
 from .reachability import profile_categories
 from .recommend import build_recommendations
 from .root_cause import RootCauseEngine
-from .statistics import compute_statistics, enrich_categories, select_categories
+from .statistics import (compute_statistics, enrich_categories,
+                         exclude_subclass, select_categories)
 from .unresolved import diagnose_unresolved
 
 logger = logging.getLogger(__name__)
@@ -175,7 +177,9 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
                  constraints: List[ConstraintRecord],
                  parser_warnings: Optional[List[str]] = None,
                  progress=None,
-                 config: Optional[AnalysisConfig] = None) -> AnalysisReport:
+                 config: Optional[AnalysisConfig] = None,
+                 faults_path: str = "",
+                 fault_list_candidates=None) -> AnalysisReport:
     """Run the full analysis pipeline and return an :class:`AnalysisReport`.
 
     Args:
@@ -186,6 +190,9 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         progress: Optional ``callable(done:int, total:int, msg:str)`` for UI
             progress reporting.
         config: Analysis configuration; the active one is used when omitted.
+        faults_path: Path the fault list was read from, used only to place the
+            snapshot relative to the run's fault-disposition step.
+        fault_list_candidates: Sibling fault lists found beside it.
 
     Returns:
         A populated :class:`AnalysisReport`.
@@ -248,10 +255,28 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
     patterns = summarizer.patterns()
 
     statistics = compute_statistics(faults, config=config)
-    selected = enrich_categories(select_categories(statistics), faults)
+
+    # A fault-disposition step reclassifies a block of faults into a waiver
+    # subclass and excludes it from the relevant coverage column. That step
+    # rewrites the AU subclass distribution, so the triage is built from the
+    # RELEVANT population -- the one the ATPG tool itself debugs against --
+    # while the census below still reconciles against the full population.
+    disposition = classify_snapshot(faults_path, statistics,
+                                    fault_list_candidates, config)
+    relevant = None
+    triage_stats = statistics
+    triage_faults = faults
+    if disposition.has_relevant_population:
+        relevant = exclude_subclass(statistics, disposition.waiver_subclass)
+        waived = disposition.waiver_subclass.upper()
+        triage_stats = relevant
+        triage_faults = [f for f in faults
+                         if (f.dotted_class or "").upper() != waived]
+
+    selected = enrich_categories(select_categories(triage_stats), triage_faults)
     attribute_categories(selected, results, connectivity, constraints)
     profile_categories(selected, results, connectivity, constraints)
-    recommendations = build_recommendations(statistics, selected)
+    recommendations = build_recommendations(triage_stats, selected)
 
     logger.info(
         "Analysis complete: %d total faults, %d coverage-loss faults, "
@@ -264,10 +289,15 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         pattern_groups=patterns,
         warnings=warnings,
         statistics=statistics,
+        relevant_statistics=relevant,
+        disposition=disposition,
         selected_categories=selected,
         recommendations=recommendations,
         unresolved_diagnosis=diagnosis,
     )
+    if disposition.warnings:
+        report.warnings.extend(disposition.warnings)
+        report.summary.warnings = list(report.warnings)
 
     # Hard self-check, on every run rather than only under test: the fault
     # classes must sum to the population the report puts on its cover. A

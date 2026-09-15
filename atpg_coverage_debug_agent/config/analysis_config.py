@@ -41,9 +41,11 @@ instead.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -174,11 +176,80 @@ DEFAULT_CONSTRAINT_VALUE_CODES: Dict[str, str] = {
     "0": "0", "1": "1", "x": "X",
 }
 
+# ---------------------------------------------------------------------------
+# Coverage metric rules
+# ---------------------------------------------------------------------------
+#: Possibly-detected families credited in ``atpg_effectiveness``, at full
+#: weight. Tessent credits ``PU`` and not ``PT``: a possibly-detected-untestable
+#: fault has been resolved as far as ATPG can resolve it, whereas a
+#: possibly-detected-testable one has not. This is deliberately independent of
+#: :attr:`AnalysisConfig.posdet_credit`, which governs test/fault coverage --
+#: one shared knob would double-count a PD fault once the credit is non-zero.
+DEFAULT_EFFECTIVENESS_POSDET_FAMILIES = ["PU"]
+
+#: Which population ``atpg_effectiveness`` is computed over when a relevant
+#: (waiver-excluded) population also exists.
+#:
+#: ``"total"`` reproduces the tool: it prints ONE effectiveness figure, derived
+#: from the full population, in both the total and the relevant column. The
+#: waived block was resolved by ATPG, so removing it from the denominator would
+#: understate how much of the design ATPG actually settled. ``"population"``
+#: re-bases the figure on whichever population is being reported.
+DEFAULT_EFFECTIVENESS_BASIS = "total"
+
+# ---------------------------------------------------------------------------
+# Fault-disposition vocabulary
+# ---------------------------------------------------------------------------
+# A Tessent flow commonly runs a fault-disposition step after the last ATPG
+# phase: it reclassifies a block of faults into a waiver subclass and excludes
+# that subclass from the "total relevant" coverage column. A per-phase snapshot
+# therefore describes a DIFFERENT population from the tool's final report, and
+# the AU subclass distribution a fix plan is ranked from is rewritten by it.
+#
+# Everything below is a naming hint used to RANK candidate files and to explain
+# a verdict. The pre/post determination itself is made from file CONTENTS --
+# whether the waiver subclass is present -- never from a name alone.
+
+#: Subclass tokens that name a disposition waiver bucket. Case-insensitive
+#: globs matched against the dotted subclass (e.g. ``AU.DISPOSITION``).
+DEFAULT_WAIVER_SUBCLASS_PATTERNS = ["*.DISPOSITION", "*.DISPOSED", "*.DISP",
+                                    "*DISPOSITION*", "*.WAIVED", "*.WAIVER"]
+
+#: Files that look like a complete fault list.
+DEFAULT_FAULT_LIST_FILE_PATTERNS = ["*.mtfi", "*.mtfi.*", "*faults*",
+                                    "*.flt", "*.flt.*", "*.fault", "*.fault.*"]
+
+#: Files that hold only the waived block or another partial slice, never the
+#: whole population. Excluded from candidacy so a 40 KB waiver list is never
+#: mistaken for the fault list of the design.
+DEFAULT_PARTIAL_FAULT_FILE_PATTERNS = ["*disp_faults*", "*_disp_*",
+                                       "*.disposition.*", "*_orig.*",
+                                       "*.detected.*", "*.del.*", "*.dt.*"]
+
+#: Names suggesting the final, post-disposition list. ``fd`` is the fault
+#: disposition tag; the rest are the usual final/full spellings.
+DEFAULT_DISPOSITION_FILE_PATTERNS = ["*.fd", "*.fd.*", "*fault*.fd*",
+                                     "*final*", "*post_disp*", "*postdisp*"]
+
+#: Names carrying a per-phase tag. The capture group is the phase number, used
+#: to prefer the LAST phase when several snapshots are present.
+DEFAULT_PHASE_FILE_PATTERNS = [r"(?:^|[._-])(?:ph|phase|pass)[._-]?(\d+)"]
+
 
 def _lower_list(values: Any, default: List[str]) -> List[str]:
     if not values:
         return list(default)
     return [str(v).strip().lower() for v in values if str(v).strip()]
+
+
+def _matches_any(value: str, patterns: List[str]) -> bool:
+    """Case-insensitive glob match of *value* (basename) against *patterns*."""
+    text = os.path.basename(str(value or "").strip())
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(fnmatch.fnmatch(lowered, str(p).strip().lower())
+               for p in patterns if str(p).strip())
 
 
 @dataclass
@@ -188,9 +259,22 @@ class AnalysisConfig:
     Attributes:
         class_roles: Fault-class token -> :class:`CoverageRole` value. Merged
             into :data:`DEFAULT_CLASS_ROLES` unless ``replace_defaults``.
-        posdet_credit: Credit given to a possibly-detected (``PD``) fault when
-            computing coverage. Tessent's default is ``0.5``; it is printed in
-            every report header so a figure can be re-derived.
+        posdet_credit: Credit given to a possibly-detected (``PD``) fault in
+            ``test_coverage`` and ``fault_coverage``. Defaults to ``0.0``,
+            which is what Tessent reports; it is printed in every report
+            header so a figure can be re-derived.
+        effectiveness_posdet_families: Possibly-detected families credited at
+            full weight in ``atpg_effectiveness`` only. Separate from
+            ``posdet_credit`` so the two cannot double-count.
+        effectiveness_basis: ``"total"`` (the tool's behaviour) or
+            ``"population"``. See :data:`DEFAULT_EFFECTIVENESS_BASIS`.
+        waiver_subclass_patterns: Globs naming a fault-disposition waiver
+            subclass, used to discover it from the data.
+        fault_list_file_patterns: Globs naming a complete fault-list file.
+        partial_fault_file_patterns: Globs naming a partial fault file, which
+            is excluded from fault-list candidacy.
+        disposition_file_patterns: Globs suggesting a post-disposition list.
+        phase_file_patterns: Regexes whose first group is a phase number.
         unknown_class_threshold_pct: Share of records that may carry an
             unrecognised fault class before parsing fails outright.
         unknown_class_fatal: Whether breaching that threshold raises.
@@ -220,7 +304,21 @@ class AnalysisConfig:
 
     class_roles: Dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_CLASS_ROLES))
-    posdet_credit: float = 0.5
+    posdet_credit: float = 0.0
+    effectiveness_posdet_families: List[str] = field(
+        default_factory=lambda: list(DEFAULT_EFFECTIVENESS_POSDET_FAMILIES))
+    effectiveness_basis: str = DEFAULT_EFFECTIVENESS_BASIS
+
+    waiver_subclass_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_WAIVER_SUBCLASS_PATTERNS))
+    fault_list_file_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_FAULT_LIST_FILE_PATTERNS))
+    partial_fault_file_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PARTIAL_FAULT_FILE_PATTERNS))
+    disposition_file_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_DISPOSITION_FILE_PATTERNS))
+    phase_file_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PHASE_FILE_PATTERNS))
 
     unknown_class_threshold_pct: float = 0.1
     unknown_class_fatal: bool = True
@@ -293,6 +391,51 @@ class AnalysisConfig:
         """Every class family the role map knows, sorted."""
         return sorted(self.class_roles)
 
+    # -- coverage metric helpers ------------------------------------------
+    def credits_effectiveness(self, class_token: str) -> bool:
+        """True when *class_token* is credited in ``atpg_effectiveness``.
+
+        Only consulted for ``PD`` classes; every other class already carries
+        its own role weight.
+        """
+        family = self.family_of(class_token)
+        return any(family == str(f).strip().upper()
+                   for f in self.effectiveness_posdet_families)
+
+    # -- fault-disposition helpers ----------------------------------------
+    def is_waiver_subclass(self, subclass_id: str) -> bool:
+        """True when *subclass_id* matches a configured waiver-subclass glob."""
+        return _matches_any(subclass_id, self.waiver_subclass_patterns)
+
+    def looks_like_fault_list(self, filename: str) -> bool:
+        """True when *filename* looks like a complete fault list."""
+        return (_matches_any(filename, self.fault_list_file_patterns)
+                and not self.looks_partial(filename))
+
+    def looks_partial(self, filename: str) -> bool:
+        """True when *filename* names only a slice of the fault population."""
+        return _matches_any(filename, self.partial_fault_file_patterns)
+
+    def looks_post_disposition(self, filename: str) -> bool:
+        """True when *filename* is spelled like a final/post-disposition list."""
+        return _matches_any(filename, self.disposition_file_patterns)
+
+    def phase_of(self, filename: str) -> Optional[int]:
+        """Phase number encoded in *filename*, or ``None`` when untagged."""
+        name = os.path.basename(filename or "")
+        for pattern in self.phase_file_patterns:
+            try:
+                match = re.search(pattern, name, re.IGNORECASE)
+            except re.error:
+                logger.warning("Ignoring unusable phase pattern %r", pattern)
+                continue
+            if match and match.groups():
+                try:
+                    return int(match.group(1))
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     # -- pin helpers ------------------------------------------------------
     def scan_pin_role(self, pin_name: str) -> Optional[str]:
         """``'scan_in'`` / ``'scan_out'`` / ``'shift_enable'`` or ``None``."""
@@ -320,6 +463,15 @@ class AnalysisConfig:
             "source": self.source,
             "class_roles": dict(self.class_roles),
             "posdet_credit": self.posdet_credit,
+            "effectiveness_posdet_families":
+                list(self.effectiveness_posdet_families),
+            "effectiveness_basis": self.effectiveness_basis,
+            "waiver_subclass_patterns": list(self.waiver_subclass_patterns),
+            "fault_list_file_patterns": list(self.fault_list_file_patterns),
+            "partial_fault_file_patterns":
+                list(self.partial_fault_file_patterns),
+            "disposition_file_patterns": list(self.disposition_file_patterns),
+            "phase_file_patterns": list(self.phase_file_patterns),
             "unknown_class_threshold_pct": self.unknown_class_threshold_pct,
             "unresolved_constraint_threshold_pct":
                 self.unresolved_constraint_threshold_pct,
@@ -378,7 +530,10 @@ class AnalysisConfig:
                 setattr(cfg, name, base)
 
         for name in ("unconnected_net_patterns", "tie_high_patterns",
-                     "tie_low_patterns"):
+                     "tie_low_patterns", "effectiveness_posdet_families",
+                     "waiver_subclass_patterns", "fault_list_file_patterns",
+                     "partial_fault_file_patterns",
+                     "disposition_file_patterns", "phase_file_patterns"):
             if name in data:
                 incoming = [str(v) for v in data[name] if str(v).strip()]
                 base = [] if replace else list(getattr(cfg, name))
@@ -389,6 +544,7 @@ class AnalysisConfig:
 
         for name, caster in (
             ("posdet_credit", float),
+            ("effectiveness_basis", str),
             ("unknown_class_threshold_pct", float),
             ("unresolved_constraint_threshold_pct", float),
             ("unmapped_object_threshold_pct", float),

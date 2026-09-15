@@ -938,7 +938,24 @@ def serialize_context(report: Any) -> Dict[str, Any]:
 
     statistics = getattr(report, "statistics", None)
     if statistics is not None and hasattr(statistics, "metrics"):
-        payload["coverage_metrics"] = statistics.metrics()
+        relevant = getattr(report, "relevant_statistics", None)
+        payload["coverage_metrics"] = statistics.metrics(statistics)
+        if relevant is not None:
+            # Both columns, exactly as the ATPG tool reports them. Quoting one
+            # without saying which population it describes is how a figure
+            # stops reconciling against the tool's own report.
+            payload["coverage_metrics"]["relevant"] = relevant.metrics(
+                statistics)
+
+    state = getattr(report, "disposition", None)
+    if state is not None:
+        payload["snapshot"] = state.as_dict()
+        payload["snapshot"]["note"] = (
+            "Which snapshot of the fault population this is. A "
+            "pre-disposition list predates the run's fault-disposition step, "
+            "which rewrites the ATPG-untestable subclass distribution; say so "
+            "before ranking root causes from it."
+        )
 
     config_used = getattr(report, "analysis_config", None)
     if config_used:
@@ -955,16 +972,92 @@ def serialize_context(report: Any) -> Dict[str, Any]:
             "caveat": ("An analyst removed these faults from the totals. "
                        "Every count in this session is AFTER that removal."),
         }
+
+    viewer = serialize_visualizer(getattr(report, "visualizer_config", None))
+    if viewer:
+        payload["visualizer"] = viewer
     return payload
+
+
+def serialize_visualizer(config: Any) -> Dict[str, Any]:
+    """Render the vendor-viewer launch chain recorded on a report.
+
+    The commands are for a human to run; nothing here executes anything. A
+    profile that no longer loads is reported as such rather than guessed at,
+    because a half-right command chain is worse than none.
+    """
+    if not config:
+        return {}
+    config = dict(config)
+    payload: Dict[str, Any] = {
+        "profile": config.get("profile", ""),
+        "project": config.get("proj", ""),
+        "config_file": config.get("cfg", ""),
+        "design_paths": dict(config.get("paths") or {}),
+        "note": ("These commands open the vendor viewer on this same design. "
+                 "This tool does not run them; quote them for the user to run."),
+    }
+    try:
+        from ..launcher import get_profile
+        from ..launcher.visualizer import VisualizerInputs, describe_chain
+
+        profile = get_profile(str(config.get("profile", "")))
+        inputs = VisualizerInputs.from_dict(config)
+        payload["steps"] = describe_chain(profile, inputs)
+        payload["fault_inspect_templates"] = list(
+            profile.commands.fault_inspect)
+    except Exception as exc:  # profile missing, renamed, or inputs incomplete
+        payload["steps"] = []
+        payload["unavailable"] = (
+            f"The launch chain could not be rendered: {exc}")
+    return payload
+
+
+def visualizer_commands(context: Optional[Dict[str, Any]],
+                        fault: str = "", stuck: str = "") -> Dict[str, Any]:
+    """Return the commands that reopen this design in the vendor viewer.
+
+    Args:
+        context: The serialised report context.
+        fault: Optional fault location to add inspection commands for.
+        stuck: The fault's stuck-at value, needed by most inspect commands.
+    """
+    viewer = dict((context or {}).get("visualizer") or {})
+    if not viewer:
+        return {"error": ("No viewer session has been configured for this "
+                          "report. Ask the user to fill in the Tessent "
+                          "Visualizer tab, or state that you cannot supply "
+                          "the commands.")}
+    fault = (fault or "").strip()
+    if not fault:
+        return viewer
+    out = dict(viewer)
+    try:
+        from ..launcher import get_profile
+        from ..launcher.visualizer import fault_inspect_commands
+
+        profile = get_profile(str(viewer.get("profile", "")))
+        extra = fault_inspect_commands(profile, fault, stuck)
+    except Exception as exc:
+        out["fault_commands"] = []
+        out["fault_note"] = f"No inspection command could be built: {exc}"
+        return out
+    out["fault_commands"] = extra
+    if not extra:
+        out["fault_note"] = (
+            "Every inspection command in this profile needs a stuck-at value "
+            "and none was given.")
+    return out
 
 
 #: Sections :func:`report_context` can return, in the order it returns them.
 #: ``census`` is first and is returned unconditionally: it is the one thing
 #: that makes an unexplained residual impossible, and a caller must not be
 #: able to filter it away by asking for something else.
-CONTEXT_SECTIONS = ("census", "evidence", "coverage_metrics", "fault_list",
-                    "unrecognised_fault_classes", "constraint_parsing",
-                    "analysis_config", "patterns", "warnings", "waivers")
+CONTEXT_SECTIONS = ("census", "snapshot", "evidence", "coverage_metrics",
+                    "fault_list", "unrecognised_fault_classes",
+                    "constraint_parsing", "analysis_config", "patterns",
+                    "warnings", "waivers", "visualizer")
 
 
 def report_context(context: Optional[Dict[str, Any]],
@@ -1671,14 +1764,16 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "done -- plus the state of the evidence itself: how many faults "
             "mapped onto the netlist and how many did not (and why), the "
             "scan-status split, how much of the loss sits on hard constants, "
-            "the coverage metrics with their formulas, the repeated "
-            "structural patterns, the parser warnings, and any analyst "
-            "waivers in force. The census is always included and is never "
-            "abridged, so no class listing anywhere else can leave you with "
-            "an unexplained residual. Check this BEFORE trusting a count."),
+            "the coverage metrics with their formulas, WHICH SNAPSHOT of the "
+            "fault population was analysed (pre- or post-disposition), the "
+            "repeated structural patterns, the parser warnings, and any "
+            "analyst waivers in force. The census is always included and is "
+            "never abridged, so no class listing anywhere else can leave you "
+            "with an unexplained residual. Check this BEFORE trusting a "
+            "count."),
         "params": {
             "section": {"type": "str", "default": "",
-                        "description": ("census | evidence | "
+                        "description": ("census | snapshot | evidence | "
                                         "coverage_metrics | fault_list | "
                                         "unrecognised_fault_classes | "
                                         "constraint_parsing | "
@@ -1687,6 +1782,23 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                                         "The census is returned either way")},
             "limit": {"type": "int", "default": 20,
                       "description": "max rows per list (never the census)"},
+        },
+    },
+    "visualizer_commands": {
+        "description": (
+            "Return the exact commands that reopen THIS design in the vendor "
+            "viewer, optionally with the inspection commands for one fault. "
+            "Use it when the user asks how to see something for themselves, "
+            "or when a structural finding needs confirming in the tool that "
+            "owns the authoritative answer. This tool RUNS NOTHING: quote the "
+            "commands for the user. If no viewer session has been configured "
+            "it says so -- do not invent paths or a project name."),
+        "params": {
+            "fault": {"type": "str", "default": "",
+                      "description": ("optional fault location to add "
+                                      "inspection commands for")},
+            "stuck": {"type": "str", "default": "",
+                      "description": "that fault's stuck-at value, 0 or 1"},
         },
     },
     "report_handoff_gap": {
@@ -1790,6 +1902,11 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
             context,
             section=str(args.get("section", "") or "") or None,
             limit=int(args.get("limit", 20) or 20))
+    if name == "visualizer_commands":
+        return visualizer_commands(
+            context,
+            fault=str(args.get("fault", "") or ""),
+            stuck=str(args.get("stuck", "") or ""))
     if name == "scan_status":
         return scan_status(netlist, str(args.get("target", "")),
                            fault_results=fault_results, design=design)

@@ -16,10 +16,12 @@ import logging
 from typing import Any, Dict, List
 
 from ..analysis import investigate
+from ..analysis.disposition import DispositionState
 from ..analysis.recommend import build_recommendations
 from ..analysis.statistics import (
     DerivedStatistics,
     enrich_categories,
+    exclude_subclass,
     select_categories,
 )
 from ..models import (
@@ -154,12 +156,19 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         # fix proposals are derived from it deterministically on load.
         "statistics": (report.statistics.as_dict()
                        if getattr(report, "statistics", None) else None),
+        "disposition": (report.disposition.as_dict()
+                        if getattr(report, "disposition", None) else None),
         # A manifest of the per-category fault files written beside this
         # session. The names are relative to the session file, so they only
         # resolve from the folder it was saved in.
         "category_dumps": [d.as_dict()
                            for d in (getattr(report, "category_dumps", None)
                                      or [])],
+        # How to reopen this design in the vendor viewer. Only the form the
+        # user filled in; the generated scripts are scratch and regenerate.
+        "visualizer_config": (dict(report.visualizer_config)
+                              if getattr(report, "visualizer_config", None)
+                              else None),
         # What the inputs declared and how well they were understood. These
         # travel with the session because a reloaded report must be able to
         # say whether its census is collapsed, which classes it could not
@@ -345,13 +354,31 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     if stats_payload:
         statistics = DerivedStatistics.from_dict(stats_payload)
         report.statistics = statistics
+        report.disposition = DispositionState.from_dict(
+            data.get("disposition"))
+
+        # The relevant population is derived, not stored: it is the total
+        # minus one subclass, so recomputing it cannot disagree with the
+        # census the way a second saved copy could drift from it.
+        triage_stats = statistics
+        triage_faults = report.faults or []
+        if report.disposition is not None \
+                and report.disposition.has_relevant_population:
+            report.relevant_statistics = exclude_subclass(
+                statistics, report.disposition.waiver_subclass)
+            waived = report.disposition.waiver_subclass.upper()
+            triage_stats = report.relevant_statistics
+            triage_faults = [f for f in triage_faults
+                             if (getattr(f, "dotted_class", "") or "").upper()
+                             != waived]
+
         # Clustering is rebuilt from the coverage-loss faults that were saved.
         # Detected faults are not persisted, so clusters cover the loss
         # population only — which is all the triage looks at anyway.
         report.selected_categories = enrich_categories(
-            select_categories(statistics), report.faults or [])
+            select_categories(triage_stats), triage_faults)
         report.recommendations = build_recommendations(
-            statistics, report.selected_categories)
+            triage_stats, report.selected_categories)
 
     dumps_payload = data.get("category_dumps") or []
     if dumps_payload:
@@ -359,6 +386,10 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
 
         report.category_dumps = [CategoryDump.from_dict(d)
                                  for d in dumps_payload]
+
+    viewer = data.get("visualizer_config")
+    if viewer:
+        report.visualizer_config = dict(viewer)
     return report
 
 

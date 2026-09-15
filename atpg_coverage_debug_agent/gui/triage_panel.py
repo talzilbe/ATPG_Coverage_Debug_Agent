@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -82,6 +83,8 @@ class TriagePanel(QWidget):
 
     fault_referenced = Signal(str)
     export_categories_requested = Signal()
+    #: A design object the user asked to see in the vendor viewer.
+    signal_inspect_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -120,6 +123,9 @@ class TriagePanel(QWidget):
             QHeaderView.ResizeToContents)
         self.category_table.itemSelectionChanged.connect(
             self._on_category_selected)
+        self.category_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.category_table.customContextMenuRequested.connect(
+            self._on_category_menu)
         splitter.addWidget(self.category_table)
 
         self.category_detail = QTextBrowser()
@@ -160,6 +166,9 @@ class TriagePanel(QWidget):
             ["Hierarchy prefix", "Faults", "%", "sa0", "sa1"])
         self.cluster_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cluster_tree.itemDoubleClicked.connect(self._on_cluster_activated)
+        self.cluster_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.cluster_tree.customContextMenuRequested.connect(
+            self._on_cluster_menu)
         self.cluster_tree.header().setSectionResizeMode(
             0, QHeaderView.ResizeToContents)
         layout.addWidget(self.cluster_tree, 1)
@@ -189,6 +198,8 @@ class TriagePanel(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         self.fix_list = QListWidget()
         self.fix_list.currentRowChanged.connect(self._on_fix_selected)
+        self.fix_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.fix_list.customContextMenuRequested.connect(self._on_fix_menu)
         splitter.addWidget(self.fix_list)
 
         right = QWidget()
@@ -406,6 +417,114 @@ class TriagePanel(QWidget):
         path = item.data(0, Qt.UserRole)
         if path:
             self.fault_referenced.emit(str(path))
+
+    def _cluster_menu_model(self, item: QTreeWidgetItem):
+        """(path, rows) for the cluster-tree menu; a row is (label, on, id).
+
+        A cluster prefix is a string the triage computed, not an object in the
+        design, so the viewer entry is present but disabled on those rows --
+        sending one to the tool would simply not resolve.
+        """
+        is_fault = item.data(1, Qt.UserRole) == "fault"
+        path = str(item.data(0, Qt.UserRole) or item.text(0))
+        rows = [("Open signal in Tessent Visualizer", is_fault, "show")]
+        if is_fault:
+            rows.append(("Focus in the coverage-loss table", True, "focus"))
+        rows.append(("Copy path", True, "copy"))
+        return path, rows
+
+    def _run_menu_action(self, action_id: str, path: str) -> None:
+        if action_id.startswith("show:"):
+            self.signal_inspect_requested.emit(action_id[len("show:"):])
+        elif action_id == "show":
+            self.signal_inspect_requested.emit(path)
+        elif action_id == "focus":
+            self.fault_referenced.emit(path)
+        elif action_id == "copy":
+            QApplication.clipboard().setText(path)
+
+    def _exec_menu(self, widget, pos, rows, path) -> None:
+        menu = QMenu(self)
+        mapping = {}
+        for label, enabled, action_id in rows:
+            act = menu.addAction(label)
+            act.setEnabled(enabled)
+            if not enabled:
+                act.setToolTip(
+                    "Only a real object can be opened; this row is a value "
+                    "the triage derived.")
+            mapping[act] = action_id
+        chosen = menu.exec(widget.viewport().mapToGlobal(pos))
+        if chosen in mapping:
+            self._run_menu_action(mapping[chosen], path)
+
+    def _on_cluster_menu(self, pos) -> None:
+        item = self.cluster_tree.itemAt(pos)
+        if item is None:
+            return
+        path, rows = self._cluster_menu_model(item)
+        self._exec_menu(self.cluster_tree, pos, rows, path)
+
+    def _blocking_signals(self, category) -> List[str]:
+        """Named tie drivers and constrained signals for one category."""
+        found: List[str] = []
+        attribution = getattr(category, "attribution", None)
+        if attribution is None:
+            return found
+        for src in getattr(attribution, "tie_sources", None) or []:
+            if src.driver:
+                found.append(str(src.driver))
+        for src in getattr(attribution, "constraint_sources", None) or []:
+            if src.signal:
+                found.append(str(src.signal))
+        seen = set()
+        unique = []
+        for name in found:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        return unique
+
+    def _category_menu_model(self, category):
+        """(path, rows) for the category menu: its named blocking signals."""
+        signals = self._blocking_signals(category)
+        if not signals:
+            return "", [("No blocking signal was identified", False, "none")]
+        return "", [(f"Open {name} in Tessent Visualizer", True, f"show:{name}")
+                    for name in signals[:10]]
+
+    def _on_category_menu(self, pos) -> None:
+        item = self.category_table.itemAt(pos)
+        if item is None:
+            return
+        id_item = self.category_table.item(item.row(), 0)
+        category = self._category_by_id(
+            id_item.data(Qt.UserRole) if id_item is not None else None)
+        if category is None:
+            return
+        _path, rows = self._category_menu_model(category)
+        self._exec_menu(self.category_table, pos, rows, "")
+
+    def _fix_menu_model(self, row: int):
+        """(hotspot, rows) for the fix-plan menu."""
+        if row < 0 or row >= len(self._recommendations):
+            return "", []
+        hotspot = str(getattr(self._recommendations[row], "hotspot", "") or "")
+        if not hotspot:
+            return "", [("This proposal names no hotspot path", False, "none")]
+        return hotspot, [
+            (f"Open {hotspot} in Tessent Visualizer", True, "show"),
+            ("Copy path", True, "copy"),
+        ]
+
+    def _on_fix_menu(self, pos) -> None:
+        item = self.fix_list.itemAt(pos)
+        if item is None:
+            return
+        hotspot, rows = self._fix_menu_model(self.fix_list.row(item))
+        if not rows:
+            return
+        self._exec_menu(self.fix_list, pos, rows, hotspot)
 
     def _copy_selected_prefix(self) -> None:
         item = self.cluster_tree.currentItem()

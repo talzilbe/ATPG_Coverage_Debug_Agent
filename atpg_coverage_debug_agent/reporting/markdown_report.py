@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..analysis.census import build_census
+from ..analysis.disposition import PRE_DISPOSITION_WARNING, STATE_UNDETERMINED
 from ..models import AnalysisReport, FaultAnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -42,8 +44,56 @@ def _fault_row(r: FaultAnalysisResult) -> str:
         )
 
 
+def _snapshot_section(report: AnalysisReport) -> List[str]:
+    """Name the fault-list snapshot analysed and whether it is the final one."""
+    state = getattr(report, "disposition", None)
+    if state is None:
+        return []
+    sources = getattr(report, "sources", None) or {}
+    header = getattr(report, "fault_list_header", None)
+    models = ", ".join(getattr(header, "fault_models", []) or []) or "n/a"
+
+    lines = ["### Snapshot analysed", ""]
+    lines.append("| Property | Value |")
+    lines.append("| --- | --- |")
+    lines.append(f"| Design | `{sources.get('design') or 'n/a'}` |")
+    lines.append(f"| Fault model(s) | `{models}` |")
+    lines.append(f"| Fault list analysed | "
+                 f"`{state.resolved_path or sources.get('faults') or 'n/a'}` |")
+    lines.append(f"| Phase tag | "
+                 f"`{state.phase if state.phase is not None else 'none'}` |")
+    lines.append(f"| Disposition state | **{state.label}** |")
+    waiver = (f"`{state.waiver_subclass}` ({state.waiver_count} fault(s))"
+              if state.waiver_subclass else "none found")
+    lines.append(f"| Waiver subclass | {waiver} |")
+    lines.append("")
+    for line in state.evidence:
+        lines.append(f"- {line}")
+    if state.is_pre:
+        lines.append("")
+        lines.append(f"> **This is a pre-disposition snapshot.** "
+                     f"{PRE_DISPOSITION_WARNING}")
+        if state.better_candidate:
+            lines.append(f"> A post-disposition list sits beside it: "
+                         f"`{os.path.basename(state.better_candidate)}`.")
+    elif state.state == STATE_UNDETERMINED:
+        lines.append("")
+        lines.append("> **The snapshot could not be placed relative to the "
+                     "fault-disposition step.** Treat the category ranking as "
+                     "provisional.")
+    if state.subclass_delta:
+        lines.append("")
+        lines.append("| Subclass | Delta across disposition |")
+        lines.append("| --- | --- |")
+        for key, change in sorted(state.subclass_delta.items(),
+                                  key=lambda kv: -abs(kv[1])):
+            lines.append(f"| `{key}` | {change:+d} |")
+    lines.append("")
+    return lines
+
+
 def _metrics_section(report: AnalysisReport) -> List[str]:
-    """Render the three Tessent coverage metrics with their inputs.
+    """Render the coverage metrics per population, with their inputs.
 
     Percentages are shown next to the counts they come from so any figure can
     be re-derived by hand, and a metric that is undefined for this population
@@ -52,16 +102,23 @@ def _metrics_section(report: AnalysisReport) -> List[str]:
     stats = getattr(report, "statistics", None)
     if stats is None or not hasattr(stats, "metrics"):
         return []
-    m = stats.metrics()
-    roles = m["roles"]
+    relevant = getattr(report, "relevant_statistics", None)
+    columns = [("total", stats)]
+    if relevant is not None:
+        columns.append(("total relevant", relevant))
+    payloads = [(label, pop, pop.metrics(stats)) for label, pop in columns]
+    m = payloads[0][2]
 
     def _fmt(value: Optional[float]) -> str:
         return "n/a" if value is None else f"{value:.4f}%"
 
     lines = ["### Coverage metrics", ""]
+    credited = ", ".join(m["credited_posdet_families"]) or "none"
     lines.append(f"> Possibly-detected credit (`posdet_credit`) = "
-                 f"**{m['posdet_credit']}**. Numerator is "
-                 f"`DT + posdet_credit x PD` = {m['detected_credit']}.")
+                 f"**{m['posdet_credit']}** in test and fault coverage, so the "
+                 f"numerator is `DT + posdet_credit x PD` = "
+                 f"{m['detected_credit']}. ATPG effectiveness separately "
+                 f"credits **{credited}** at full weight.")
     header = getattr(report, "fault_list_header", None)
     if header is not None:
         lines.append(f"> Fault population is **{header.collapsing_label}** "
@@ -69,35 +126,51 @@ def _metrics_section(report: AnalysisReport) -> List[str]:
                      f"A collapsed and an uncollapsed census are not "
                      f"comparable.")
     lines.append("")
-    lines.append("| Metric | Value | Formula | Numeric substitution |")
-    lines.append("| --- | --- | --- | --- |")
+    value_cols = " | ".join(label for label, _, _ in payloads)
+    lines.append(f"| Metric | {value_cols} | Formula | Numeric substitution |")
+    lines.append("| --- | " + "--- | " * len(payloads) + "--- | --- |")
     # Every figure carries the arithmetic that produced it. UD below is the
     # FULL undetectable population from the role map; reading it as a single
     # class is what once put the headline metric ~2 points out.
-    formulas = m.get("formulas", {})
     for key, label in (("test_coverage", "Test coverage"),
                        ("fault_coverage", "Fault coverage"),
                        ("atpg_effectiveness", "ATPG effectiveness")):
-        spec = formulas.get(key, {})
-        lines.append(f"| {label} | {_fmt(m[key])} | "
-                     f"`{spec.get('formula', '')}` | "
-                     f"`{spec.get('substitution', '')}` |")
+        values = " | ".join(_fmt(p[key]) for _, _, p in payloads)
+        subs = "<br>".join(f"`{p['formulas'][key]['substitution']}`"
+                           for _, _, p in payloads)
+        lines.append(f"| {label} | {values} | "
+                     f"`{m['formulas'][key]['formula']}` | {subs} |")
     lines.append("")
+    if relevant is not None:
+        waived = getattr(getattr(report, "disposition", None),
+                         "waiver_subclass", None)
+        lines.append(
+            f"> The **total relevant** column excludes the fault-disposition "
+            f"waiver subclass `{waived}` "
+            f"({stats.total_faults - relevant.total_faults} fault(s)), which "
+            f"is what the run's `set_relevant_coverage -exclude` does. ATPG "
+            f"effectiveness is reported over the total population in both "
+            f"columns: the waived faults were resolved by ATPG, so dropping "
+            f"them from the denominator would understate it.")
+        lines.append("")
     lines.append(f"> {m.get('ud_definition', '')}")
     lines.append(f"> {m.get('basis', '')}")
     lines.append("")
-    lines.append("| Role | Meaning | Faults |")
-    lines.append("| --- | --- | --- |")
+    lines.append(f"| Role | Meaning | {value_cols} |")
+    lines.append("| --- | --- | " + "--- | " * len(payloads))
     meanings = {
         "DT": "detected",
-        "PD": "possibly detected (partial credit)",
+        "PD": "possibly detected",
         "UD": "undetectable (removed from the test-coverage denominator)",
         "AU": "ATPG untestable (stays in the denominator)",
         "ND": "not detected — coverage loss",
     }
     for role, meaning in meanings.items():
-        lines.append(f"| {role} | {meaning} | {roles.get(role, 0)} |")
-    lines.append(f"| FU | total fault population | {m['total_faults']} |")
+        counts = " | ".join(str(p["roles"].get(role, 0))
+                            for _, _, p in payloads)
+        lines.append(f"| {role} | {meaning} | {counts} |")
+    totals = " | ".join(str(p["total_faults"]) for _, _, p in payloads)
+    lines.append(f"| FU | total fault population | {totals} |")
     if m["unrecognised"]:
         lines.append(f"| (unrecognised) | class not in the configured role "
                      f"map — excluded from every metric | "
@@ -629,6 +702,33 @@ def _triage_section(report: AnalysisReport,
     return lines
 
 
+def _visualizer_section(report: AnalysisReport) -> List[str]:
+    """How to reopen this design in the vendor viewer.
+
+    Emitted only when a viewer session was configured: a half-specified
+    command chain is worse than none, because it looks runnable.
+    """
+    from ..analysis.investigate import serialize_visualizer
+
+    payload = serialize_visualizer(getattr(report, "visualizer_config", None))
+    steps = payload.get("steps") if payload else None
+    if not steps:
+        return []
+    lines = ["## Reproduce in Tessent Visualizer", ""]
+    lines.append("Every conclusion above is structural. To check one against "
+                 "the tool that owns the authoritative answer, run:")
+    lines.append("")
+    lines.append("```")
+    lines.extend(steps)
+    lines.append("```")
+    lines.append("")
+    lines.append(f"Profile `{payload.get('profile', '')}`. The first line "
+                 "starts a new shell; everything from the tool invocation "
+                 "onwards is typed at its prompt.")
+    lines.append("")
+    return lines
+
+
 def render_markdown(report: AnalysisReport,
                     dumps: Optional[Sequence[Any]] = None) -> str:
     """Return a full Markdown document for *report*.
@@ -670,6 +770,7 @@ def render_markdown(report: AnalysisReport,
         lines.append(f"| {cls} | {count} |")
     lines.append("")
 
+    lines.extend(_snapshot_section(report))
     lines.extend(_metrics_section(report))
     lines.extend(_census_section(report))
 
@@ -765,6 +866,8 @@ def render_markdown(report: AnalysisReport,
     else:
         lines.append("_No warnings._")
     lines.append("")
+
+    lines.extend(_visualizer_section(report))
 
     # Skill Results
     if report.skill_results:

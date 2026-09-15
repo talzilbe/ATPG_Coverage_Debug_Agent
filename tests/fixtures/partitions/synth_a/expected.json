@@ -27,12 +27,20 @@
   },
 
   "unrecognised_class_records": 0,
-  "posdet_credit": 0.5,
-  "detected_credit": 16.0,
+  "posdet_credit": 0.0,
+  "detected_credit": 14.0,
 
-  "test_coverage": 50.0,
-  "fault_coverage": 38.0952,
+  "_metric_derivation": [
+    "posdet_credit is 0, matching the ATPG tool: PD gets no credit in test or",
+    "fault coverage. Effectiveness credits PU only (2 of the 4 PD faults).",
+    "test_coverage      = DT / (FU - UD)          = 14 / (42 - 10) = 43.7500%",
+    "fault_coverage     = DT / FU                 = 14 / 42        = 33.3333%",
+    "atpg_effectiveness = (DT + PU + UD + AU) / FU = 34 / 42        = 80.9524%"
+  ],
+  "test_coverage": 43.75,
+  "fault_coverage": 33.3333,
   "atpg_effectiveness": 80.9524,
+  "effectiveness_posdet_count": 2,
 
   "fault_collapsing": false,
   "fault_models": ["Stuck"],

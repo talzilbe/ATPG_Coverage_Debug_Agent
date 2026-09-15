@@ -109,14 +109,14 @@ class DftAtpgDebugSkill(SkillBase):
         counts = dict(getattr(summary, "class_counts", {}) or {})
         detected = sum(counts.get(c, 0) for c in ("DS", "DI"))
         loss = getattr(summary, "coverage_loss_count", 0) or len(results)
-        cov = (100.0 * detected / total) if total else 0.0
 
         result.add_finding(
             title="Fault statistics summary",
             description=(
                 f"{total:,} total faults; {detected:,} detected; "
-                f"{loss:,} coverage-loss (AU/UO/UC). "
-                f"Estimated structural coverage ~{cov:.1f}%."
+                f"{loss:,} coverage-loss (AU/UO/UC). Coverage percentages are "
+                f"reported only from the class census, which states each "
+                f"metric's formula and numeric substitution."
             ),
             evidence=[f"{cls}: {n:,}" for cls, n in
                       Counter(counts).most_common()],
@@ -153,8 +153,8 @@ class DftAtpgDebugSkill(SkillBase):
 
         top_rc, top_count = rc_counter.most_common(1)[0]
         result.summary = (
-            f"~{cov:.1f}% coverage; primary gap: {self._rc_label(top_rc)} "
-            f"({top_count:,} faults)."
+            f"{loss:,} coverage-loss fault(s); primary gap: "
+            f"{self._rc_label(top_rc)} ({top_count:,} faults)."
         )
         return result
 

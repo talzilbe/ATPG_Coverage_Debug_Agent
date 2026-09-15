@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 ELLIPSIS_MARKERS = ("...", "\u2026")
 
 #: A path-like token: at least two components joined by a hierarchy separator.
-_PATH_TOKEN = re.compile(r"[A-Za-z0-9_$\[\].\\]+(?:/[A-Za-z0-9_$\[\]./\\]+)+")
+#: Hyphens are part of a component, not a separator -- splitting on them turned
+#: one real filesystem path into several fragments that were then reported as
+#: invented paths, which is itself a fabrication in the audit output.
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_$\[\].\\-]+(?:/[A-Za-z0-9_$\[\]./\\-]+)+")
 
 #: Claims of a coverage gain that has not been measured by a re-run.
 _CLAIM_PATTERNS = (
@@ -52,6 +55,82 @@ _PLACEHOLDER = re.compile(r"[<>{}]")
 #: split" — which is not a hierarchy path and must not be checked as one.
 _VALUE_CODE = re.compile(r"^[A-Za-z]{0,2}[0-9Xx]$")
 
+# ---------------------------------------------------------------------------
+# Coverage percentages must be derivable
+# ---------------------------------------------------------------------------
+#: A heading that promises a coverage METRIC. A percentage printed under one of
+#: these is a claim about how much of the design is tested, so it has to carry
+#: the arithmetic that produced it -- the defect this guards against was a
+#: headline "~NN.N%" whose denominator appeared nowhere and which matched no
+#: figure the ATPG tool reported.
+#:
+#: Deliberately narrower than "any heading mentioning coverage": a triage or
+#: hotspot section legitimately prints each category's SHARE of the population,
+#: whose denominator is the stated total. Those are not coverage claims.
+_COVERAGE_HEADING = re.compile(
+    r"\b(coverage\s+metric|metrics?\s+.*\bcoverage"
+    r"|test\s+coverage|fault\s+coverage|atpg\s+effectiveness"
+    r"|coverage\s+figure|structural\s+coverage)", re.I)
+
+#: Any percentage, which is what must be justified under such a heading.
+_PERCENTAGE = re.compile(r"[+-]?\d+(?:\.\d+)?\s*%")
+
+#: Evidence that a percentage can be re-derived: an equals sign joining counts,
+#: a division, or an explicit formula/substitution label.
+_SUBSTITUTION = re.compile(
+    r"(/\s*\d)|(=\s*[\d(])|\b(formula|substitution|numerator|denominator)\b",
+    re.I)
+
+#: Percentages that describe the composition of a population rather than
+#: coverage: "19.48% of the fault population", or a count carrying its share
+#: as "84 (71.19%)". The denominator of a share is the stated total.
+_SHARE_CONTEXT = re.compile(
+    r"%\s*(?:of|share)\b|\bshare\b|\bof\s+(?:all|the)\s+\w+"
+    r"|\d[\d,]*\s*\(\s*[+-]?\d+(?:\.\d+)?\s*%\s*\)", re.I)
+
+
+def scan_coverage_percentages(text: str, context: str = "") -> List["Issue"]:
+    """Flag a coverage percentage with no derivable denominator.
+
+    Walks *text* line by line. Once a heading names a coverage metric, every
+    percentage until the next heading must sit on a line that also shows its
+    arithmetic. Anything else is a figure a reader cannot reconcile against the
+    ATPG tool's own report, which is the exact class of defect this exists to
+    make impossible to reintroduce.
+    """
+    issues: List[Issue] = []
+    if not text:
+        return issues
+
+    under_coverage = False
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        is_heading = bool(re.match(r"^\s*(#{1,6}\s|<h[1-6]|\d+(\.\d+)*\s)",
+                                   raw))
+        if is_heading:
+            under_coverage = bool(_COVERAGE_HEADING.search(_strip_markup(line)))
+            continue
+        if not under_coverage:
+            continue
+        plain = _strip_markup(line)
+        if not _PERCENTAGE.search(plain):
+            continue
+        if _SUBSTITUTION.search(plain) or _SHARE_CONTEXT.search(plain):
+            continue
+        issues.append(Issue(
+            kind="underivable_percentage",
+            text=line[:200],
+            context=context,
+        ))
+    return issues
+
+
+def _strip_markup(text: str) -> str:
+    """Drop HTML tags so a rendered and a plain report scan identically."""
+    return re.sub(r"<[^>]+>", " ", text)
+
 
 def _is_value_code_pair(token: str) -> bool:
     """True when every component of *token* is a bare value code."""
@@ -64,7 +143,8 @@ class Issue:
     """One guardrail violation found in generated text.
 
     Attributes:
-        kind: ``elided_path``, ``unknown_path`` or ``unmeasured_claim``.
+        kind: ``elided_path``, ``unknown_path``, ``unmeasured_claim`` or
+            ``underivable_percentage``.
         text: The offending fragment, quoted as found.
         context: Where it was found, for the audit trail.
     """
@@ -170,6 +250,8 @@ class PathRegistry:
 
         Sources are the fault list, the constraint file and the netlist
         instance names — the three artefacts the analysis is allowed to quote.
+        The viewer launch paths join them: the user supplied those too, so an
+        answer may quote them back without being accused of inventing a path.
         """
         registry = cls.from_parts(
             fault_results=getattr(report, "fault_results", None) or (),
@@ -177,9 +259,35 @@ class PathRegistry:
             faults=getattr(report, "faults", None) or (),
             netlist=getattr(report, "netlist", None),
         )
+        viewer = getattr(report, "visualizer_config", None) or {}
+        if viewer:
+            registry.add_all(_viewer_paths(dict(viewer)))
         logger.debug("Path registry built from %d source path(s).",
                      len(registry))
         return registry
+
+
+def _viewer_paths(config: Dict[str, Any]) -> List[str]:
+    """Every path-like value a viewer launch legitimately quotes.
+
+    The user supplied the design paths and the project tokens, and the profile
+    supplied the executables, so an answer may quote any of them back.
+    """
+    found: List[str] = [str(p) for p in (config.get("paths") or {}).values()]
+    for key in ("proj", "cfg", "ward"):
+        value = str(config.get(key, "") or "")
+        if value:
+            found.append(value)
+    try:
+        from ..launcher import get_profile
+
+        profile = get_profile(str(config.get("profile", "")))
+        found.append(profile.psetup.executable)
+        found.append(profile.tool.executable)
+        found.extend(str(v) for v in profile.environment.values())
+    except Exception:  # an absent profile simply registers nothing extra
+        pass
+    return [p for p in found if p]
 
 
 def scan_paths(text: str, registry: PathRegistry,
@@ -246,7 +354,7 @@ def scan_claims(text: str, context: str = "") -> List[Issue]:
 
 def check_text(text: str, registry: Optional[PathRegistry] = None,
                context: str = "") -> List[Issue]:
-    """Run both guardrails over *text*.
+    """Run every guardrail over *text*.
 
     Args:
         text: The content to audit.
@@ -261,6 +369,7 @@ def check_text(text: str, registry: Optional[PathRegistry] = None,
     if registry is not None:
         issues.extend(scan_paths(text, registry, context))
     issues.extend(scan_claims(text, context))
+    issues.extend(scan_coverage_percentages(text, context))
     return issues
 
 
@@ -319,6 +428,13 @@ def issues_as_warnings(issues: Iterable[Issue]) -> List[str]:
                 f"Guardrail: path '{issue.text}' in "
                 f"{issue.context or 'generated output'} does not appear in "
                 f"any source artefact.")
+        elif issue.kind == "underivable_percentage":
+            rendered.append(
+                f"Guardrail: '{issue.text}' in "
+                f"{issue.context or 'generated output'} prints a percentage "
+                f"under a coverage heading without the arithmetic that "
+                f"produced it. Every coverage figure must carry its numeric "
+                f"substitution so a reader can re-derive it.")
         else:
             rendered.append(
                 f"Guardrail: '{issue.text}' in "

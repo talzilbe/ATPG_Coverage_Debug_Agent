@@ -26,6 +26,20 @@ copilot-home/
 # Not ours to publish, and overwritten on every reinstall.
 SageAGENT/
 
+# Site-specific launch profiles. These carry real project names, tool paths and
+# licence servers, so only the sanitised template is published. Copy
+# profiles/example.json to add your own, or point $ATPG_TOOL_PROFILES elsewhere.
+profiles/*.json
+!profiles/example.json
+
+# Scratch workareas left behind by the vendor-tool setup wrapper.
+TTLC_test/
+*_wa/
+.cth_setup_files/
+
+# Stray capture from a mistyped redirect (a multi-megabyte PostScript dump).
+/os
+
 # OS / misc
 .DS_Store
 Thumbs.db

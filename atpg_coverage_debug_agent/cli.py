@@ -45,9 +45,111 @@ def _build_parser() -> argparse.ArgumentParser:
                              "fixes that apply, then exit. Needs no inputs.")
     parser.add_argument("--fix-limit", type=int, default=5,
                         help="How many fix proposals to print (default 5).")
+    parser.add_argument("--list-vis-profiles", action="store_true",
+                        help="List the vendor-viewer launch profiles, then "
+                             "exit. Needs no inputs.")
+    parser.add_argument("--emit-visualizer-script", metavar="DIR", default=None,
+                        help="Write the viewer launch scripts to DIR and "
+                             "print the command chain. Runs nothing.")
+    parser.add_argument("--vis-profile", default=None,
+                        help="Launch profile to use (see --list-vis-profiles).")
+    parser.add_argument("--vis-proj", default=None,
+                        help="Project passed to the setup wrapper's -proj.")
+    parser.add_argument("--vis-cfg", default=None,
+                        help="Config passed to the setup wrapper's -cfg.")
+    parser.add_argument("--vis-ward", default=None,
+                        help="Workarea passed to the setup wrapper's -ward.")
+    parser.add_argument("--vis-licence", default=None,
+                        help="Licence server, as port@host[:port@host…].")
+    parser.add_argument("--vis-run-dir", default=None,
+                        help="ATPG run directory; the design paths are "
+                             "derived from it using the profile's patterns.")
+    parser.add_argument("--vis-path", action="append", metavar="KEY=PATH",
+                        default=[],
+                        help="Set one design path, e.g. --vis-path icl=/p/x.icl. "
+                             "Repeatable; overrides --vis-run-dir.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging.")
     return parser
+
+
+def _print_vis_profiles() -> int:
+    """List the launch profiles. Returns a process exit code."""
+    from .launcher import list_profiles, profile_search_path
+
+    found = list_profiles()
+    if not found:
+        print("No launch profiles found. Searched:", file=sys.stderr)
+        for directory in profile_search_path():
+            print(f"  {directory}", file=sys.stderr)
+        return 2
+    print(f"{len(found)} launch profile(s):")
+    for profile in found:
+        print(f"  {profile.name:<16s} {profile.title}")
+        if profile.description:
+            print(f"  {'':<16s} {profile.description}")
+        print(f"  {'':<16s} defined in {profile.source_path}")
+        print(f"  {'':<16s} needs: "
+              f"{', '.join(profile.load_keys) or 'nothing'}")
+    return 0
+
+
+def _emit_visualizer_script(args, faults_path: Optional[str]) -> int:
+    """Write the viewer launch bundle. Runs nothing. Returns an exit code."""
+    from .launcher import (
+        LaunchInputError, ProfileError, VisualizerInputs, get_profile,
+        write_launch_bundle,
+    )
+    from .launcher.visualizer import derive_paths_from_run_dir, describe_chain
+
+    if not args.vis_profile:
+        print("ERROR: --emit-visualizer-script needs --vis-profile.",
+              file=sys.stderr)
+        return 2
+    try:
+        profile = get_profile(args.vis_profile)
+    except ProfileError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    paths: Dict[str, str] = {}
+    if args.vis_run_dir:
+        paths, warnings = derive_paths_from_run_dir(profile, args.vis_run_dir)
+        for warning in warnings:
+            print(f"  note: {warning}", file=sys.stderr)
+    if faults_path and "faults" in profile.load_keys:
+        paths.setdefault("faults", faults_path)
+    for item in args.vis_path or []:
+        key, _, value = item.partition("=")
+        if not value:
+            print(f"ERROR: --vis-path expects KEY=PATH, got '{item}'.",
+                  file=sys.stderr)
+            return 2
+        paths[key.strip()] = value.strip()
+
+    inputs = VisualizerInputs(
+        proj=args.vis_proj or "", cfg=args.vis_cfg or "",
+        ward=args.vis_ward or "", licence_server=args.vis_licence or "",
+        paths=paths)
+    try:
+        bundle = write_launch_bundle(profile, inputs,
+                                     dest_dir=args.emit_visualizer_script)
+        chain = describe_chain(profile, inputs)
+    except (LaunchInputError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Launch scripts written to {bundle.directory}:")
+    for path in (bundle.psetup_script_path, bundle.tessent_script_path,
+                 bundle.dofile_path):
+        print(f"  {path}")
+    print(f"\nStart it with:\n  {' '.join(bundle.argv)}")
+    print("\nOr run the chain by hand:")
+    for step in chain:
+        print(f"  {step}")
+    for warning in bundle.warnings:
+        print(f"\n  note: {warning}", file=sys.stderr)
+    return 0
 
 
 def _print_explanation(subclass: str) -> int:
@@ -215,36 +317,57 @@ def _print_summary(report: AnalysisReport) -> None:
 
 
 def _print_metrics(report: AnalysisReport) -> None:
-    """Print the three Tessent coverage metrics with their inputs."""
+    """Print the coverage metrics per population, with their inputs."""
     stats = getattr(report, "statistics", None)
     if stats is None or not hasattr(stats, "metrics"):
         return
-    m = stats.metrics()
-    roles = m["roles"]
+    relevant = getattr(report, "relevant_statistics", None)
+    columns = [("total", stats)]
+    if relevant is not None:
+        columns.append(("total relevant", relevant))
+    payloads = [(label, pop, pop.metrics(stats)) for label, pop in columns]
+    m = payloads[0][2]
 
-    def _val(key: str) -> str:
-        value = m[key]
+    def _val(payload, key: str) -> str:
+        value = payload[key]
         return "n/a" if value is None else f"{value:.4f}%"
 
+    state = getattr(report, "disposition", None)
+    if state is not None:
+        print(f"\nSnapshot analysed        : {state.resolved_path or 'n/a'}")
+        print(f"  disposition state      : {state.label}")
+        if state.phase is not None:
+            print(f"  phase tag              : {state.phase}")
+        if state.waiver_subclass:
+            print(f"  waiver subclass        : {state.waiver_subclass} "
+                  f"({state.waiver_count} fault(s))")
+
+    credited = ", ".join(m["credited_posdet_families"]) or "none"
     print("\nCoverage metrics (posdet_credit="
-          f"{m['posdet_credit']}, numerator={m['detected_credit']}):")
-    formulas = m.get("formulas", {})
+          f"{m['posdet_credit']}, numerator={m['detected_credit']}, "
+          f"effectiveness credits {credited}):")
+    header = "  " + " " * 21 + "  ".join(f"{label:>16}"
+                                         for label, _, _ in payloads)
+    print(header)
     for key, label in (("test_coverage", "test coverage      "),
                        ("fault_coverage", "fault coverage     "),
                        ("atpg_effectiveness", "atpg effectiveness ")):
-        spec = formulas.get(key, {})
-        print(f"  {label} : {_val(key)}   {spec.get('formula', '')}")
-        if spec.get("substitution"):
-            print(f"                        {spec['substitution']}")
-    print("  roles               : "
-          + ", ".join(f"{r}={roles.get(r, 0)}" for r in
-                      ("DT", "PD", "UD", "AU", "ND"))
-          + f", FU={m['total_faults']}")
+        values = "  ".join(f"{_val(p, key):>16}" for _, _, p in payloads)
+        print(f"  {label} : {values}   {m['formulas'][key]['formula']}")
+        for col_label, _, payload in payloads:
+            print(f"      [{col_label}] "
+                  f"{payload['formulas'][key]['substitution']}")
+    for col_label, pop, payload in payloads:
+        print(f"  roles [{col_label}]"
+              + " " * max(1, 14 - len(col_label)) + ": "
+              + ", ".join(f"{r}={payload['roles'].get(r, 0)}" for r in
+                          ("DT", "PD", "UD", "AU", "ND"))
+              + f", FU={payload['total_faults']}")
     print(f"  UD is              : {m.get('ud_definition', '')}")
     if m["unrecognised"]:
         print(f"  unrecognised class  : {m['unrecognised']} "
               f"(excluded from every metric)")
-    if not m["census_balances"]:
+    if not all(p["census_balances"] for _, _, p in payloads):
         print("  !! census does not reconcile with the parsed record count; "
               "the figures above are unusable")
 
@@ -330,6 +453,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.explain:
         return _print_explanation(args.explain)
+
+    if args.list_vis_profiles:
+        return _print_vis_profiles()
+
+    if args.emit_visualizer_script:
+        return _emit_visualizer_script(args, args.faults)
 
     missing = [name for name, value in
                (("--netlist", args.netlist), ("--faults", args.faults))

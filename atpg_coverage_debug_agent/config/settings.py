@@ -52,6 +52,8 @@ class AppSettings:
     custom_skills_dir: str = ""
     #: Auto-save the JSON report to the output dir after Analyze.
     auto_save_report: bool = False
+    #: Tessent Visualizer launch form (profile, project, design paths).
+    visualizer: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # persistence

@@ -22,6 +22,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..analysis.census import build_census
+from ..analysis.disposition import PRE_DISPOSITION_WARNING, STATE_UNDETERMINED
+from ..config.analysis_config import CoverageRole
 from ..models import (
     AnalysisReport,
     FaultAnalysisResult,
@@ -29,6 +31,9 @@ from ..models import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Role label -> enum, so the metrics table can read counts off any population.
+_ROLE_ENUM = {r.value: r for r in CoverageRole}
 
 #: Placeholder for an empty cell. Kept as a constant because Python 3.11
 #: forbids backslash escapes inside f-string expressions.
@@ -155,11 +160,13 @@ def _subtype_impact(token: str) -> Tuple[str, str, str]:
     return ("Excluded", "badge-gray", "excluded")
 
 
-def _coverage_buckets(summary) -> Tuple[int, int, int, float]:
-    """Return ``(detected, loss, bb, coverage_pct)`` from the summary.
+def _loss_buckets(summary) -> Tuple[int, int, int]:
+    """Return ``(detected, loss, bb)`` from the summary.
 
-    ``loss`` excludes the ``AU.BB`` black-box boundary, matching the reference
-    coverage definition ``detected / (detected + loss)``.
+    ``loss`` excludes the ``AU.BB`` black-box boundary. These are population
+    counts only -- no coverage percentage is derived here. Every coverage
+    figure comes from the class census via ``DerivedStatistics.metrics()``, so
+    there is exactly one place a percentage can be computed.
     """
     counts = dict(summary.subtype_counts) if summary.subtype_counts \
         else dict(summary.class_counts)
@@ -168,9 +175,7 @@ def _coverage_buckets(summary) -> Tuple[int, int, int, float]:
     loss = sum(n for tok, n in counts.items()
                if _subtype_impact(tok)[2] == "loss")
     bb = counts.get("AU.BB", 0)
-    denom = detected + loss
-    cov = (100.0 * detected / denom) if denom else 0.0
-    return detected, loss, bb, cov
+    return detected, loss, bb
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +421,7 @@ def _section_fault_stats(report: AnalysisReport) -> str:
     )
 
     # Bucket totals from the sub-class breakdown so AU.BB is excluded from loss.
-    detected, loss, bb, cov = _coverage_buckets(s)
+    detected, loss, bb = _loss_buckets(s)
 
     bb_row = (
         f'<tr><td style="padding:6px 16px;">Black-box boundary (AU.BB, excluded)</td>'
@@ -426,7 +431,7 @@ def _section_fault_stats(report: AnalysisReport) -> str:
 
     metric_table = (
         '<table style="width:auto; margin-top:10px;">'
-        '<tr><th colspan="2">Coverage Metric</th></tr>'
+        '<tr><th colspan="2">Fault population</th></tr>'
         f'<tr><td style="padding:6px 16px;"><b>Total faults in list</b></td>'
         f'<td class="num" style="padding:6px 16px;">{_fmt(total)}</td></tr>'
         f'<tr><td style="padding:6px 16px;">Total detected (DS + DI.*)</td>'
@@ -434,16 +439,13 @@ def _section_fault_stats(report: AnalysisReport) -> str:
         f'<tr><td style="padding:6px 16px;">Total coverage-loss (AU* + UO*, excl. AU.BB)</td>'
         f'<td class="num" style="padding:6px 16px; color:#c0392b;">{_fmt(loss)}</td></tr>'
         + bb_row +
-        '<tr style="background:#e8f5e9;">'
-        '<td style="padding:8px 16px;"><b>Estimated structural coverage</b></td>'
-        f'<td class="num" style="padding:8px 16px; font-size:13pt; color:#1a7f37;">'
-        f"<b>~{cov:.1f}%</b></td></tr>"
         "</table>"
-        '<p class="note">The three rows above are SUBSETS of the fault list: '
-        'the estimated figure is detected / (detected + loss) and leaves out '
-        'the possibly-detected and undetectable classes entirely, so they do '
-        'not sum to the total. Use the Tessent metrics in 2.1 for a coverage '
-        'number and the complete census in 2.2 for the population.</p>'
+        '<p class="note">These are population COUNTS, and the detected and '
+        'coverage-loss rows are SUBSETS of the list: they leave out the '
+        'possibly-detected and undetectable classes entirely, so they do not '
+        'sum to the total. Coverage percentages are in 2.1, where each one '
+        'carries its formula and numeric substitution; the complete census is '
+        'in 2.2.</p>'
     )
 
     callout = ""
@@ -458,36 +460,132 @@ def _section_fault_stats(report: AnalysisReport) -> str:
         )
 
     return (
-        "<h2>2. Fault Statistics Summary</h2>" + stats_table + metric_table
+        "<h2>2. Fault Statistics Summary</h2>" + _snapshot_html(report)
+        + stats_table + metric_table
         + _tessent_metrics_html(report) + _full_census_html(report) + callout
     )
 
 
-def _tessent_metrics_html(report: AnalysisReport) -> str:
-    """The three real coverage metrics, with the counts they derive from.
+def _snapshot_html(report: AnalysisReport) -> str:
+    """Which fault-list snapshot was analysed, and whether it is final.
 
-    The "estimated structural coverage" figure above it is a plain ratio over
-    the fault list and is kept for continuity. These are the metrics the ATPG
-    tool itself reports: undetectable faults leave the test-coverage
-    denominator and possibly-detected faults carry partial credit.
+    A per-phase snapshot predates the run's fault-disposition step, which
+    rewrites the ATPG-untestable subclass distribution. Naming the file and the
+    state is the difference between a number the reader can reconcile against
+    the tool's own report and one they cannot.
+    """
+    state = getattr(report, "disposition", None)
+    if state is None:
+        return ""
+
+    sources = getattr(report, "sources", None) or {}
+    header = getattr(report, "fault_list_header", None)
+    models = ", ".join(getattr(header, "fault_models", []) or []) or _DASH
+
+    rows = [
+        ("Design", sources.get("design") or _DASH),
+        ("Fault model(s)", models),
+        ("Fault list analysed", state.resolved_path or sources.get("faults")
+         or _DASH),
+        ("Phase tag", str(state.phase) if state.phase is not None
+         else "none (not a per-phase snapshot)"),
+        ("Disposition state", state.label),
+        ("Waiver subclass", (f"{state.waiver_subclass} "
+                             f"({_fmt(state.waiver_count)} fault(s))")
+         if state.waiver_subclass else "none found"),
+    ]
+    body = "".join(
+        f'<tr><td style="padding:4px 16px;">{_esc(label)}</td>'
+        f'<td style="padding:4px 16px;"><code>{_esc(value)}</code></td></tr>'
+        for label, value in rows
+    )
+    evidence = "".join(f"<li>{_esc(line)}</li>" for line in state.evidence)
+
+    callout = ""
+    if state.is_pre:
+        extra = ""
+        if state.better_candidate:
+            extra = (f" A post-disposition list sits beside it: "
+                     f"<code>{_esc(os.path.basename(state.better_candidate))}"
+                     f"</code>.")
+        callout = _callout(
+            "error",
+            "<b>This is a pre-disposition snapshot.</b> "
+            + _esc(PRE_DISPOSITION_WARNING) + extra)
+    elif state.state == STATE_UNDETERMINED:
+        callout = _callout(
+            "warn",
+            "<b>The snapshot could not be placed relative to the "
+            "fault-disposition step.</b> Treat the category ranking below as "
+            "provisional.")
+
+    return (
+        '<h3>2.0 Snapshot analysed</h3>'
+        '<table style="width:auto;">'
+        "<tr><th>Property</th><th>Value</th></tr>" + body + "</table>"
+        f'<p class="note">How this was established:<ul>{evidence}</ul></p>'
+        + callout
+    )
+
+
+def _disposition_delta_html(report: AnalysisReport) -> str:
+    """Per-subclass change the disposition step made, when it is known."""
+    state = getattr(report, "disposition", None)
+    if state is None or not state.subclass_delta:
+        return ""
+    rows = "".join(
+        f'<tr><td style="padding:4px 16px;"><code>{_esc(key)}</code></td>'
+        f'<td class="num" style="padding:4px 16px;">{change:+,}</td></tr>'
+        for key, change in sorted(state.subclass_delta.items(),
+                                  key=lambda kv: -abs(kv[1]))
+    )
+    return (
+        '<p class="note"><b>What the disposition step changed</b> '
+        "(per-subclass count delta). The ranking below is built from these "
+        "categories, so a large movement here means a pre-disposition ranking "
+        "would have pointed somewhere else.</p>"
+        '<table style="width:auto;"><tr><th>Subclass</th><th>Delta</th></tr>'
+        + rows + "</table>"
+    )
+
+
+def _tessent_metrics_html(report: AnalysisReport) -> str:
+    """The real coverage metrics, per population, with their substitutions.
+
+    Every percentage this section prints carries the formula AND the numeric
+    substitution it came from, so a reader can re-derive it without trusting
+    this code. A coverage figure with no derivable denominator is a defect.
     """
     stats = getattr(report, "statistics", None)
     if stats is None or not hasattr(stats, "metrics"):
         return ""
-    m = stats.metrics()
-    roles = m["roles"]
+    relevant = getattr(report, "relevant_statistics", None)
 
-    def _val(key: str) -> str:
-        value = m[key]
+    # The tool reports two columns once a waiver subclass exists: the full
+    # population and the population it excludes from relevant coverage.
+    columns = [("total", stats)]
+    if relevant is not None:
+        columns.append(("total relevant", relevant))
+    payloads = [(label, pop, pop.metrics(stats)) for label, pop in columns]
+    m = payloads[0][2]
+
+    def _val(value) -> str:
         return "n/a" if value is None else f"{value:.4f}%"
 
+    waived = getattr(getattr(report, "disposition", None),
+                     "waiver_subclass", None)
+    col_head = "".join(
+        f'<th>#faults<br/>({_esc(label)})</th>' for label, _, _ in payloads)
     role_rows = "".join(
         f'<tr><td style="padding:4px 16px;">{role}</td>'
         f'<td style="padding:4px 16px;">{_esc(meaning)}</td>'
-        f'<td class="num" style="padding:4px 16px;">{_fmt(roles.get(role, 0))}</td></tr>'
+        + "".join(f'<td class="num" style="padding:4px 16px;">'
+                  f'{_fmt(pop.role(_ROLE_ENUM[role]))}</td>'
+                  for _, pop, _ in payloads)
+        + "</tr>"
         for role, meaning in (
             ("DT", "detected"),
-            ("PD", "possibly detected (partial credit)"),
+            ("PD", "possibly detected"),
             ("UD", "undetectable - removed from the test-coverage denominator"),
             ("AU", "ATPG untestable - stays in the denominator"),
             ("ND", "not detected - coverage loss"),
@@ -499,9 +597,10 @@ def _tessent_metrics_html(report: AnalysisReport) -> str:
             '<tr style="background:#fff4e5;"><td style="padding:4px 16px;">'
             "(unrecognised)</td><td style=\"padding:4px 16px;\">class not in "
             "the configured role map - excluded from every metric</td>"
-            f'<td class="num" style="padding:4px 16px;">'
-            f'{_fmt(m["unrecognised"])}</td></tr>'
-        )
+            + "".join(f'<td class="num" style="padding:4px 16px;">'
+                      f'{_fmt(p["unrecognised"])}</td>'
+                      for _, _, p in payloads)
+            + "</tr>")
 
     header = getattr(report, "fault_list_header", None)
     collapsing = ""
@@ -513,45 +612,67 @@ def _tessent_metrics_html(report: AnalysisReport) -> str:
         )
 
     warning = ""
-    if not m["census_balances"]:
+    if not all(p["census_balances"] for _, _, p in payloads):
         warning = _callout(
             "error",
             "<b>The role census does not reconcile with the parsed record "
             "count.</b> Every figure in this section is unusable until the "
             "class map is corrected.")
 
-    formulas = m.get("formulas", {})
-    metric_rows = "".join(
-        f'<tr><td style="padding:6px 16px;">{label}</td>'
-        f'<td class="num" style="padding:6px 16px;">{_val(key)}</td>'
-        f'<td style="padding:6px 16px;"><code>'
-        f'{_esc(formulas.get(key, {}).get("formula", ""))}</code></td>'
-        f'<td style="padding:6px 16px;"><code>'
-        f'{_esc(formulas.get(key, {}).get("substitution", ""))}</code></td></tr>'
-        for key, label in (("test_coverage", "<b>Test coverage</b>"),
-                           ("fault_coverage", "Fault coverage"),
-                           ("atpg_effectiveness", "ATPG effectiveness"))
-    )
+    metric_rows = ""
+    for key, label in (("test_coverage", "<b>Test coverage</b>"),
+                       ("fault_coverage", "Fault coverage"),
+                       ("atpg_effectiveness", "ATPG effectiveness")):
+        values = "".join(f'<td class="num" style="padding:6px 16px;">'
+                         f'{_val(p[key])}</td>' for _, _, p in payloads)
+        subs = "<br/>".join(
+            f'<code>{_esc(p["formulas"][key]["substitution"])}</code>'
+            for _, _, p in payloads)
+        metric_rows += (
+            f'<tr><td style="padding:6px 16px;">{label}</td>{values}'
+            f'<td style="padding:6px 16px;"><code>'
+            f'{_esc(m["formulas"][key]["formula"])}</code></td>'
+            f'<td style="padding:6px 16px;">{subs}</td></tr>')
 
+    relevant_note = ""
+    if relevant is not None:
+        relevant_note = (
+            f'<p class="note">The <b>total relevant</b> column excludes the '
+            f'fault-disposition waiver subclass <code>{_esc(waived)}</code> '
+            f'({_fmt(stats.total_faults - relevant.total_faults)} fault(s)) '
+            f'from the population, which is what the run\'s '
+            f'<code>set_relevant_coverage -exclude</code> does. '
+            f'ATPG effectiveness is reported over the total population in '
+            f'both columns: the waived faults were resolved by ATPG, so '
+            f'dropping them from the denominator would understate it.</p>')
+
+    credited = ", ".join(m["credited_posdet_families"]) or "none"
     return (
-        "<h3>2.1 Tessent coverage metrics</h3>"
+        "<h3>2.1 Coverage metrics</h3>"
         f'<p class="note">Possibly-detected credit '
-        f'(<code>posdet_credit</code>) = <b>{m["posdet_credit"]}</b>; the '
-        f'numerator is <code>DT + posdet_credit x PD</code> = '
-        f'{m["detected_credit"]}.{collapsing}</p>'
+        f'(<code>posdet_credit</code>) = <b>{m["posdet_credit"]}</b> in test '
+        f'and fault coverage, so the numerator is '
+        f'<code>DT + posdet_credit x PD</code> = {m["detected_credit"]}. '
+        f'ATPG effectiveness separately credits <b>{_esc(credited)}</b> at '
+        f'full weight.{collapsing}</p>'
         '<table style="width:auto;">'
-        "<tr><th>Metric</th><th>Value</th><th>Formula</th>"
-        "<th>Numeric substitution</th></tr>"
+        "<tr><th>Metric</th>"
+        + "".join(f"<th>{_esc(label)}</th>" for label, _, _ in payloads)
+        + "<th>Formula</th><th>Numeric substitution</th></tr>"
         + metric_rows + "</table>"
-        f'<p class="note">{_esc(m.get("ud_definition", ""))} '
-        f'{_esc(m.get("basis", ""))}</p>'
+        + relevant_note
+        + f'<p class="note">{_esc(m.get("ud_definition", ""))} '
+          f'{_esc(m.get("basis", ""))}</p>'
         '<table style="width:auto; margin-top:10px;">'
-        "<tr><th>Role</th><th>Meaning</th><th>Faults</th></tr>"
+        f"<tr><th>Role</th><th>Meaning</th>{col_head}</tr>"
         + role_rows + unrecognised_row
-        + f'<tr><td style="padding:4px 16px;"><b>FU</b></td>'
-          f'<td style="padding:4px 16px;">total fault population</td>'
-          f'<td class="num" style="padding:4px 16px;"><b>{_fmt(m["total_faults"])}'
-          f"</b></td></tr></table>"
+        + '<tr><td style="padding:4px 16px;"><b>FU</b></td>'
+          '<td style="padding:4px 16px;">total fault population</td>'
+        + "".join(f'<td class="num" style="padding:4px 16px;">'
+                  f'<b>{_fmt(p["total_faults"])}</b></td>'
+                  for _, _, p in payloads)
+        + "</tr></table>"
+        + _disposition_delta_html(report)
         + warning
     )
 
@@ -1401,7 +1522,32 @@ def _section_conclusions(report: AnalysisReport) -> str:
             f"fix them before treating this ranking as the design's real "
             f"coverage profile.")
 
-    return heading + primary + caveat + _footer()
+    return heading + primary + caveat + _visualizer_html(report) + _footer()
+
+
+def _visualizer_html(report: AnalysisReport) -> str:
+    """Sub-section of the conclusions: how to reopen this in the viewer.
+
+    Deliberately a sub-heading and not a numbered section -- the numbering is
+    checked for gaps, and this block only exists when a viewer session was
+    configured.
+    """
+    from ..analysis.investigate import serialize_visualizer
+
+    payload = serialize_visualizer(getattr(report, "visualizer_config", None))
+    steps = payload.get("steps") if payload else None
+    if not steps:
+        return ""
+    body = _esc("\n".join(steps))
+    return (
+        "<h3>9.1 Reproduce in Tessent Visualizer</h3>"
+        "<p>Every conclusion above is structural. To check one against the "
+        "tool that owns the authoritative answer, run the following. The "
+        "first line starts a new shell; everything from the tool invocation "
+        "onwards is typed at its prompt.</p>"
+        f"<pre>{body}</pre>"
+        f"<p style='font-size:8.5pt; color:#555;'>Launch profile: "
+        f"<code>{_esc(str(payload.get('profile', '')))}</code>.</p>")
 
 
 def _footer() -> str:

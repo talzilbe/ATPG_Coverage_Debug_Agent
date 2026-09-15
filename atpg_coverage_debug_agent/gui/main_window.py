@@ -44,6 +44,7 @@ from .skills_panel import SkillsPanel
 from .agent_panel import AgentPanel
 from .custom_skills_panel import CustomSkillsPanel
 from .triage_panel import TriagePanel
+from .visualizer_panel import VisualizerPanel
 from .workers import start_worker, start_multi_worker
 
 logger = logging.getLogger(__name__)
@@ -251,7 +252,9 @@ scan-boundary flags, and the diagnosed root cause.</p>
   <li class="step"><b>Click a row</b> to see full per-fault evidence in the
       Details panel on the right.</li>
   <li class="step"><b>Right-click a row</b> to <i>Ask the AI agent about this
-      fault</i> or <i>Exclude selected fault(s)</i> from the report.</li>
+      fault</i>, <i>Inspect in Tessent Visualizer</i> (see
+      section&nbsp;7), or <i>Exclude selected fault(s)</i> from the
+      report.</li>
 </ul>
 
 <h3>Logs / Warnings</h3>
@@ -267,6 +270,11 @@ card has an enable checkbox and tunable parameters; changes persist.</p>
 <p>Load your own Python skills from a directory, or write one in the built-in
 editor from the provided template, to add project-specific detectors. Loaded
 custom skills appear on the Skills tab and become AI agent tools.</p>
+
+<h3>Tessent Visualizer</h3>
+<p>Opens the vendor viewer on this same design in one click, so a structural
+conclusion can be confirmed in the tool that owns the authoritative answer.
+Fully described in section&nbsp;7.</p>
 
 <h2>4. Edit Report &mdash; waiving faults &amp; recomputing coverage</h2>
 <p>Open with <b>Edit Report</b>. Excluded faults are removed from the totals so
@@ -307,14 +315,22 @@ see this reported as <code>reduced</code>.</p>
 <p>Every fault class is assigned a <b>coverage role</b>, and the role &mdash;
 never the class label &mdash; drives the numbers. <code>DS</code> and
 <code>DI.*</code> are <code>DT</code> (detected); <code>PT</code> and
-<code>PU</code> are <code>PD</code> (possibly detected, partial credit);
+<code>PU</code> are <code>PD</code> (possibly detected);
 <code>UU</code>, <code>TI</code>, <code>BL</code> and <code>RE</code> are
 <code>UD</code> (undetectable, removed from the test-coverage denominator);
 <code>AU.*</code> is <code>AU</code>; <code>UO.*</code> and <code>UC.*</code>
 are <code>ND</code> (coverage loss).</p>
 <pre>test_coverage      = (DT + posdet_credit*PD) / (FU - UD)
 fault_coverage     = (DT + posdet_credit*PD) / FU
-atpg_effectiveness = (DT + posdet_credit*PD + UD + AU) / FU</pre>
+atpg_effectiveness = (DT + PU + UD + AU) / FU</pre>
+<p><code>posdet_credit</code> defaults to <b>0</b>, which is what the ATPG
+tool reports: a possibly-detected fault earns no test- or fault-coverage
+credit. ATPG effectiveness is different &mdash; it credits <code>PU</code>
+(possibly detected, untestable) and <b>not</b> <code>PT</code>, because a
+posdet-untestable fault is as resolved as ATPG can make it. Both rules are
+configurable (<code>posdet_credit</code> and
+<code>effectiveness_posdet_families</code>) and are printed in the report
+header.</p>
 <p>Counts are printed next to every percentage so any figure can be
 re-derived, and a metric that is undefined for this population is shown as
 <code>n/a</code> rather than invented. The report also states whether the
@@ -326,6 +342,27 @@ aborts if it does not.</p>
 catch-all. It keeps its verbatim token, is listed by name under <b>Input
 Quality</b> with sample records, is excluded from every metric, and past a
 configurable threshold it fails the run.</p>
+
+<h3>Which snapshot was analysed &mdash; pre- or post-disposition</h3>
+<p>A run commonly performs a <b>fault-disposition</b> step after its last ATPG
+phase: it reclassifies a block of faults into a waiver subclass and excludes
+that subclass from the relevant coverage column
+(<code>set_relevant_coverage -exclude</code>). That is why the tool prints two
+columns, <b>total</b> and <b>total relevant</b>, and the report reproduces
+both.</p>
+<p>The disposition does not only move the totals &mdash; it <b>rewrites the AU
+subclass distribution</b>, which is exactly what the category ranking and the
+fix plan are built from. So the report names the fault list it parsed and
+states whether it is <b>pre-disposition</b>, <b>post-disposition</b> or
+<b>undetermined</b>. The verdict comes from the file's contents (is the waiver
+subclass present?) with the phase tag in the file name breaking ties; a file
+name alone never decides it.</p>
+<p>If you point the tool at a per-phase snapshot it says so prominently, warns
+that the ranking may not reflect the final design state, and names the
+post-disposition file sitting beside it. Point <b>Fault list</b> at the
+<i>directory</i> instead and the best candidate is chosen for you. The triage
+is built from the relevant population, so a waived block never drives the fix
+plan.</p>
 
 <h3>Input quality &mdash; what the files actually gave us</h3>
 <p>The report separates <i>&ldquo;no constraint affects this fault&rdquo;</i>
@@ -553,6 +590,13 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           difference, which reads exactly like a real fault bucket to the
           next person. The correct action is to report the inconsistency and
           stop, and this makes that possible.</td></tr>
+      <tr><td><code>visualizer_commands</code></td><td>Returns the exact
+          command chain that reopens this design in Tessent Visualizer,
+          optionally with the inspection commands for one fault. The agent
+          quotes them; it never runs them. Available only once the
+          <b class="k">Tessent Visualizer</b> tab has been filled in &mdash;
+          otherwise it says so rather than inventing a project name or a
+          path.</td></tr>
       <tr><td><code>list_faults</code>, <code>get_fault_detail</code>,
           <code>why_blocked</code>, <code>list_constraints</code>,
           <code>trace_path</code>, <code>suggest_test_points</code></td>
@@ -653,6 +697,144 @@ work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in Agentic mode
 &rarr; <b>Verify</b> the answer &rarr; ask follow-ups &rarr; waive legitimate
 faults via <b>Edit Report</b> &rarr; <b>Save Report</b>.</div>
 
+<h2>7. Tessent Visualizer &mdash; opening the real tool</h2>
+<p>Everything this application concludes is <i>structural</i>: it is read off
+the netlist, the fault list and the constraint file, without simulation. The
+vendor tool owns the authoritative answer. The <b class="k">Tessent
+Visualizer</b> tab exists to close that gap in one click &mdash; it opens the
+viewer on the <i>same</i> design, so a finding can be confirmed rather than
+trusted.</p>
+
+<h3>What it does</h3>
+<p>It builds the whole chain for you: enter the project setup, set the licence
+environment, start the tool shell, set the context, read the ICL, the flat
+model and the fault list, and open the viewer. The chain runs in its own
+terminal window and is <b>detached</b>, so the session keeps running if you
+close this application &mdash; and the tool prompt stays usable after the
+viewer appears, for anything you want to type yourself.</p>
+
+<h3>Filling it in</h3>
+<table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><b class="k">Profile</b></td><td>The project. Profiles are JSON files
+    in the <code>profiles/</code> directory, so adding a project is adding a
+    file &mdash; no new version of this application. Point
+    <code>$ATPG_TOOL_PROFILES</code> at your own directory to add or override
+    one.</td></tr>
+<tr><td><b class="k">Project</b>, <b class="k">Config</b></td><td>Passed to the
+    setup wrapper. Pre-filled from the profile; override per run.</td></tr>
+<tr><td><b class="k">Workarea</b></td><td>Optional. Leave it blank and the
+    setup wrapper uses its own working directory.</td></tr>
+<tr><td><b class="k">Licence server</b></td><td>Optional. Blank uses the
+    profile's value. Must be <code>port@host</code>, colon separated.</td></tr>
+<tr><td><b class="k">Design inputs</b></td><td>Either type each path, or switch
+    to <b>Derive from an ATPG run directory</b> and press <b class="k">Fill
+    paths</b> &mdash; the profile's search patterns locate the ICL, the flat
+    model and the fault list. Every derived path stays editable, and an
+    ambiguous match is reported rather than chosen silently.</td></tr>
+<tr><td><b class="k">Use the fault list from the analysis inputs</b></td>
+    <td>On by default, so the viewer loads exactly the faults this report was
+    built from.</td></tr>
+</table>
+
+<h3>Saving a setup so you only type it once</h3>
+<p>Every field above is remembered <b>per user</b> &mdash; the project, config,
+workarea, licence server and each design path are written to
+<code>~/.atpg_debug_agent/settings.json</code> as you type them, and restored
+the next time the application starts. Nothing is shared between users, and the
+licence server in particular never has to be retyped.</p>
+<p>For designs you open regularly, use <b class="k">Saved configuration</b> at
+the top of the tab. <b class="k">Save as&hellip;</b> stores the whole form
+&mdash; setup, licence, workarea and every design path &mdash; under a name you
+choose; picking that name from the list later fills the entire form in one
+step, so launching is two clicks. <b class="k">Delete</b> forgets one. The
+saved configurations live in the same per-user settings file and survive a
+restart.</p>
+<p>The list opens on <i>(current form &mdash; not saved)</i>, which is the
+setup you were last using. Selecting a saved configuration overwrites the form
+with it, so save your current setup first if you want to keep it.</p>
+
+<h3>Seeing what will run, before it runs</h3>
+<p>The <b>Commands that will run</b> box shows the dofile verbatim. You can
+edit it &mdash; an edited dofile is used exactly as written, and is
+deliberately <i>not</i> re-checked against the fields above. <b class="k">
+Regenerate</b> rebuilds it and discards the edits.</p>
+<p><b class="k">Copy commands</b> puts the entire chain on the clipboard so you
+can run it by hand. This is the fallback whenever the launch itself is
+unavailable &mdash; for instance on a host with no terminal emulator.</p>
+
+<h3>Going straight to one fault</h3>
+<p>Right-click any row in the <b>Coverage Loss Table</b> and choose
+<b class="k">Inspect in Tessent Visualizer</b>. The profile's fault-inspection
+commands are appended to the dofile for that fault and its stuck-at value, so
+the session opens already looking at it. <b class="k">Clear added faults</b>
+removes them again.</p>
+
+<h3>Opening a signal in a session that is already running</h3>
+<p>Once the viewer is up you do not have to relaunch it to look at something
+else. <b>Right-click</b> a signal and choose <b class="k">Open signal in
+Tessent Visualizer</b>; it appears in the running session. This works from four
+places:</p>
+<ul>
+  <li>the <b>Triage &amp; Fix Plan</b> &rarr; <i>Where the loss is</i> tree, on
+      a fault sample;</li>
+  <li>the <b>Categories</b> table, which offers the tie drivers and constrained
+      signals identified as blocking that category;</li>
+  <li>the <b>Fix Plan</b>, on a proposal's hotspot path;</li>
+  <li>the <b>Coverage Loss Table</b>, on any fault row.</li>
+</ul>
+<p>On a <i>cluster prefix</i> the entry is deliberately <b>greyed out</b>. A
+prefix is a string the triage computed to show where faults concentrate &mdash;
+it is not an object in the design, so the tool could not resolve it.</p>
+<p>The status line beside <b class="k">Launch Visualizer</b> shows whether a
+live session is available. If there is none, the action does not fail silently:
+it tells you so and prints the exact command, so you can paste it yourself.
+The tool's own reply is shown verbatim &mdash; for instance, asking for a
+schematic before the design has been flattened reports exactly that.</p>
+
+<h3>How the live connection works, and what it is allowed to do</h3>
+<p>The generated dofile opens a small listener inside the tool session, and
+this application talks to it. It is deliberately narrow:</p>
+<ul>
+  <li>it listens on <code>127.0.0.1</code> only, on a port the operating system
+      picks, and hangs up on anything that is not a local connection;</li>
+  <li>every request carries a token generated per session and kept in a
+      private folder;</li>
+  <li><b>no command text is ever sent.</b> The request is a verb, one object and
+      option pairs, and the tool side rebuilds the command so that a bracket or
+      a <code>$</code> in an object name stays data and can never become code;</li>
+  <li>the verb must appear in the profile's <code>control.allowed_commands</code>
+      list, which the shipped profile limits to viewing commands. Widening it
+      is an edit to the profile, not something this application can decide.</li>
+</ul>
+<p>A profile can set <code>control.enabled</code> to <code>false</code> to turn
+the channel off entirely; the launch then works exactly as before, and the
+signal action reports that the profile disables it.</p>
+
+<h3>What it refuses to do</h3>
+<ul>
+  <li>Every path, project name and licence string is checked before it reaches
+      a generated script. Anything that could escape its quoting is rejected
+      with a message naming the offending character.</li>
+  <li>The launch is refused, with the list of what is still missing, rather
+      than started with a half-filled form.</li>
+  <li>If <code>$DISPLAY</code> is not set you are told <i>before</i> the
+      launch. The viewer is an X client, so otherwise the failure only appears
+      minutes later, after the design has finished loading.</li>
+</ul>
+
+<h3>Where the evidence goes</h3>
+<p>The generated scripts and the tool's log are written to a private scratch
+folder; <b class="k">Open script folder</b> opens it. The <b>Tool log</b> pane
+follows that log while the session runs, so a failure inside the tool is
+readable here without hunting for the terminal window. If the project setup
+itself fails, the terminal window stays open holding the error rather than
+closing instantly.</p>
+<p>Once configured, the launch details travel with the report: they are saved
+in the session file, printed in the Markdown and HTML reports under
+<i>Reproduce in Tessent Visualizer</i>, and offered to the AI agent through the
+<code>visualizer_commands</code> tool.</p>
+
 </body></html>
 """
 
@@ -752,6 +934,10 @@ class MainWindow(QMainWindow):
                 self.conf_filter.setCurrentIndex(idx)
         if s.agent:
             self.agent_panel.import_settings(s.agent)
+        if getattr(s, "visualizer", None):
+            self.visualizer_panel.import_settings(s.visualizer)
+        if s.last_faults:
+            self.visualizer_panel.set_analysis_faults(s.last_faults)
         if s.custom_skills_dir:
             self.custom_skills_panel.set_custom_dir(s.custom_skills_dir)
         self.autosave_check.setChecked(bool(getattr(s, "auto_save_report", False)))
@@ -903,6 +1089,22 @@ class MainWindow(QMainWindow):
         agent_scroll.setFrameShape(QFrame.NoFrame)
         agent_scroll.setWidget(self.agent_panel)
         self.tabs.addTab(agent_scroll, "AI Debug Agent")
+
+        self.visualizer_panel = VisualizerPanel()
+        self.visualizer_panel.config_changed.connect(self._save_settings)
+        self.visualizer_panel.status_message.connect(
+            lambda msg: self.statusBar().showMessage(msg))
+        # Tall form; scrolled for the same reason as the agent panel.
+        vis_scroll = QScrollArea()
+        vis_scroll.setWidgetResizable(True)
+        vis_scroll.setFrameShape(QFrame.NoFrame)
+        vis_scroll.setWidget(self.visualizer_panel)
+        self.tabs.addTab(vis_scroll, "Tessent Visualizer")
+        self.visualizer_panel.set_analysis_faults(self.faults_picker.path())
+        self.faults_picker.edit.textChanged.connect(
+            self.visualizer_panel.set_analysis_faults)
+        self.triage_panel.signal_inspect_requested.connect(
+            self._show_signal_in_visualizer)
 
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -1559,6 +1761,8 @@ class MainWindow(QMainWindow):
         fault_object = id_item.text()
         menu = QMenu(self)
         ask_act = menu.addAction("Ask AI agent about this fault")
+        inspect_act = menu.addAction("Inspect in Tessent Visualizer")
+        show_act = menu.addAction("Open signal in Tessent Visualizer")
         rows = {idx.row() for idx in self.table.selectionModel().selectedRows()}
         rows.add(item.row())
         exclude_act = None
@@ -1570,11 +1774,44 @@ class MainWindow(QMainWindow):
         if chosen == ask_act:
             self._switch_to_tab("AI Debug Agent")
             self.agent_panel.ask_about_fault(fault_object)
+        elif chosen == inspect_act:
+            self._inspect_fault_in_visualizer(item.row(), fault_object)
+        elif chosen == show_act:
+            self._show_signal_in_visualizer(fault_object)
         elif exclude_act is not None and chosen == exclude_act:
             if not self.table.selectionModel().isRowSelected(
                     item.row(), self.table.rootIndex()):
                 self.table.selectRow(item.row())
             self._exclude_selected_faults()
+
+    def _inspect_fault_in_visualizer(self, row: int, fault_object: str) -> None:
+        """Queue this fault's inspection commands on the Visualizer tab."""
+        stuck = ""
+        idx_item = self.table.item(row, 0)
+        idx = idx_item.data(Qt.UserRole) if idx_item is not None else None
+        if idx is not None and idx < len(self._results):
+            fault = getattr(self._results[idx], "fault", None)
+            stuck = str(getattr(fault, "fault_type", "") or "")
+        self._switch_to_tab("Tessent Visualizer")
+        if self.visualizer_panel.add_fault_commands(fault_object, stuck):
+            self.statusBar().showMessage(
+                f"Added {fault_object} to the Visualizer command list.")
+
+    def _sync_visualizer_config(self) -> None:
+        """Record the viewer form on the report, so it survives a save."""
+        config = self.visualizer_panel.export_settings()
+        has_paths = any(config.get("paths", {}).values())
+        for report in (self._report, self._base_report):
+            if report is not None:
+                report.visualizer_config = config if has_paths else None
+
+    def _show_signal_in_visualizer(self, obj: str) -> None:
+        """Display *obj* in the running viewer, via the live control channel."""
+        if not self.visualizer_panel.show_signal(obj):
+            # The panel holds the reason; surface it where the user is looking.
+            self._switch_to_tab("Tessent Visualizer")
+            self.statusBar().showMessage(
+                self.visualizer_panel.status_label.text())
 
     def _switch_to_tab(self, title: str) -> None:
         for i in range(self.tabs.count()):
@@ -1872,6 +2109,8 @@ class MainWindow(QMainWindow):
         s.conf_filter = self.conf_filter.currentText()
         s.update_skills(self._skill_manager.to_config())
         s.agent = self.agent_panel.export_settings()
+        s.visualizer = self.visualizer_panel.export_settings()
+        self._sync_visualizer_config()
         s.custom_skills_dir = self.custom_skills_panel.custom_dir()
         s.auto_save_report = self.autosave_check.isChecked()
         s.save()

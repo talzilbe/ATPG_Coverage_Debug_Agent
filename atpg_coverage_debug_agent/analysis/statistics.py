@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, List, Optional
 from ..config.analysis_config import (
     AnalysisConfig,
     CoverageRole,
+    DEFAULT_EFFECTIVENESS_BASIS,
+    DEFAULT_EFFECTIVENESS_POSDET_FAMILIES,
     resolve,
 )
 from ..diagnostics import CensusMismatch
@@ -128,9 +130,19 @@ class DerivedStatistics:
             record whose class the role map did not recognise.
         subclass_stats: Per-category statistics, largest first.
         role_counts: Faults per coverage role, including ``UNKNOWN``.
-        posdet_credit: Credit factor applied to ``PD`` faults, recorded so any
-            reported percentage can be re-derived from the counts.
-        source: Always :attr:`EvidenceSource.FAULT_LIST` — these numbers are a
+        posdet_credit: Credit factor applied to ``PD`` faults in test and
+            fault coverage, recorded so any reported percentage can be
+            re-derived from the counts. Defaults to ``0.0``, matching the tool.
+        effectiveness_posdet_families: ``PD`` families credited at full weight
+            in :attr:`atpg_effectiveness` only.
+        effectiveness_basis: ``"total"`` or ``"population"``; see
+            :meth:`atpg_effectiveness_on`.
+        population: Which population this breakdown describes -- ``"total"``
+            for the full fault list, or ``"relevant"`` once a waiver subclass
+            has been excluded.
+        excluded_subclass: The waiver subclass removed to form a ``relevant``
+            population, or ``None``.
+        source: Always :attr:`EvidenceSource.FAULT_LIST` -- these numbers are a
             direct aggregation of parsed records, not an inference.
     """
 
@@ -140,7 +152,12 @@ class DerivedStatistics:
     other_count: int = 0
     subclass_stats: List[SubclassStat] = field(default_factory=list)
     role_counts: Dict[str, int] = field(default_factory=dict)
-    posdet_credit: float = 0.5
+    posdet_credit: float = 0.0
+    effectiveness_posdet_families: List[str] = field(
+        default_factory=lambda: list(DEFAULT_EFFECTIVENESS_POSDET_FAMILIES))
+    effectiveness_basis: str = DEFAULT_EFFECTIVENESS_BASIS
+    population: str = "total"
+    excluded_subclass: Optional[str] = None
     source: EvidenceSource = EvidenceSource.FAULT_LIST
 
     # -- role census ------------------------------------------------------
@@ -189,11 +206,46 @@ class DerivedStatistics:
         )
 
     # -- Tessent coverage metrics -----------------------------------------
+    def family_count(self, family: str) -> int:
+        """Faults whose class family is *family* (e.g. ``PU``)."""
+        key = (family or "").strip().upper()
+        return sum(s.count for s in self.subclass_stats
+                   if (s.family or "").strip().upper() == key)
+
     @property
     def detected_credit(self) -> float:
-        """``DT + posdet_credit * PD`` — the numerator of every metric."""
+        """``DT + posdet_credit * PD`` — the test/fault-coverage numerator.
+
+        ``posdet_credit`` defaults to 0, so this is ordinarily just ``DT``.
+        """
         return (self.role(CoverageRole.DT)
                 + self.posdet_credit * self.role(CoverageRole.PD))
+
+    @property
+    def credited_posdet_families(self) -> List[str]:
+        """``PD`` families that carry effectiveness credit and are present."""
+        present = {(s.family or "").strip().upper() for s in self.subclass_stats}
+        return [f for f in (str(x).strip().upper()
+                            for x in self.effectiveness_posdet_families)
+                if f in present]
+
+    @property
+    def effectiveness_posdet_count(self) -> int:
+        """Possibly-detected faults credited in :attr:`atpg_effectiveness`.
+
+        The tool credits ``PU`` and not ``PT``: a posdet-untestable fault is as
+        resolved as ATPG can make it, a posdet-testable one is not. Kept
+        separate from :attr:`detected_credit` so the two never double-count.
+        """
+        return sum(self.family_count(f) for f in self.credited_posdet_families)
+
+    @property
+    def resolved_count(self) -> float:
+        """``DT + credited PD + UD + AU`` — the effectiveness numerator."""
+        return (self.role(CoverageRole.DT)
+                + self.effectiveness_posdet_count
+                + self.role(CoverageRole.UD)
+                + self.role(CoverageRole.AU))
 
     @property
     def test_coverage(self) -> Optional[float]:
@@ -218,26 +270,38 @@ class DerivedStatistics:
 
     @property
     def atpg_effectiveness(self) -> Optional[float]:
-        """``(DT + posdet_credit*PD + UD + AU) / FU`` in percent, or ``None``.
+        """``(DT + credited PD + UD + AU) / FU`` in percent, or ``None``.
 
         How much of the fault population ATPG resolved one way or the other:
         detected, proven undetectable, or proven ATPG-untestable.
         """
         if self.total_faults <= 0:
             return None
-        resolved = (self.detected_credit
-                    + self.role(CoverageRole.UD)
-                    + self.role(CoverageRole.AU))
-        return 100.0 * resolved / self.total_faults
+        return 100.0 * self.resolved_count / self.total_faults
 
-    def formulas(self) -> Dict[str, Dict[str, str]]:
+    def atpg_effectiveness_on(
+            self, total: Optional["DerivedStatistics"] = None
+            ) -> Optional[float]:
+        """Effectiveness as the tool reports it for this population.
+
+        Under the default ``effectiveness_basis="total"`` the figure is taken
+        from the FULL population and repeated for the relevant column, which is
+        what ``report_statistics`` prints: the waived block was resolved by
+        ATPG, so dropping it from the denominator would understate how much of
+        the design ATPG actually settled. ``"population"`` re-bases instead.
+        """
+        if (total is not None and total is not self
+                and str(self.effectiveness_basis).strip().lower() == "total"):
+            return total.atpg_effectiveness
+        return self.atpg_effectiveness
+
+    def formulas(self, total: Optional["DerivedStatistics"] = None
+                 ) -> Dict[str, Dict[str, str]]:
         """Each metric's formula and its numeric substitution.
 
         Printed next to every figure so a reader can re-derive it without
-        trusting this code, and so the specific mistake that motivated it --
-        reading ``UD`` as ``TI`` alone, when ``UD`` is the whole undetectable
-        set the role map defines -- is visible in the substitution itself
-        rather than buried in an implementation.
+        trusting this code. Every percentage this tool emits under a coverage
+        heading must be accompanied by one of these substitutions.
         """
         c = self.posdet_credit
         fu = self.total_faults
@@ -250,6 +314,21 @@ class DerivedStatistics:
         def _sub(text: str, value: Optional[float]) -> str:
             return f"{text} = " + ("undefined" if value is None
                                    else f"{value:.4f}%")
+
+        eff_src = self
+        eff_note = ""
+        if (total is not None and total is not self
+                and str(self.effectiveness_basis).strip().lower() == "total"):
+            eff_src = total
+            eff_note = " [over the total population, as the tool reports it]"
+
+        credited = eff_src.credited_posdet_families
+        credited_label = "+".join(credited) if credited else "0"
+        eff_pd = eff_src.effectiveness_posdet_count
+        eff_fu = eff_src.total_faults
+        eff_dt = eff_src.role(CoverageRole.DT)
+        eff_ud = eff_src.role(CoverageRole.UD)
+        eff_au = eff_src.role(CoverageRole.AU)
 
         return {
             "test_coverage": {
@@ -265,30 +344,41 @@ class DerivedStatistics:
                     self.fault_coverage),
             },
             "atpg_effectiveness": {
-                "formula": "(DT + c*PD + UD + AU) / FU",
+                "formula": f"(DT + {credited_label} + UD + AU) / FU",
                 "substitution": _sub(
-                    f"({dt} + {c}*{pd} + {ud} + {au}) / {fu} = "
-                    f"{num + ud + au:g} / {fu}",
-                    self.atpg_effectiveness),
+                    f"({eff_dt} + {eff_pd} + {eff_ud} + {eff_au}) / {eff_fu} = "
+                    f"{eff_src.resolved_count:g} / {eff_fu}{eff_note}",
+                    self.atpg_effectiveness_on(total)),
             },
         }
 
-    def metrics(self) -> Dict[str, Any]:
-        """Every coverage metric with the counts it was derived from."""
+    def metrics(self, total: Optional["DerivedStatistics"] = None
+                ) -> Dict[str, Any]:
+        """Every coverage metric with the counts it was derived from.
+
+        The single shared entry point: every report path renders from this, so
+        the GUI, the CSV export and the text report cannot drift apart.
+        """
+        effectiveness = self.atpg_effectiveness_on(total)
         return {
+            "population": self.population,
+            "excluded_subclass": self.excluded_subclass,
             "posdet_credit": self.posdet_credit,
+            "credited_posdet_families": list(self.credited_posdet_families),
+            "effectiveness_basis": self.effectiveness_basis,
             "total_faults": self.total_faults,
             "roles": {r.value: self.role(r) for r in CENSUS_ROLES},
             "unrecognised": self.unrecognised_count,
             "detected_credit": round(self.detected_credit, 4),
+            "effectiveness_posdet_count": self.effectiveness_posdet_count,
             "test_coverage": (None if self.test_coverage is None
                               else round(self.test_coverage, 4)),
             "fault_coverage": (None if self.fault_coverage is None
                                else round(self.fault_coverage, 4)),
-            "atpg_effectiveness": (None if self.atpg_effectiveness is None
-                                   else round(self.atpg_effectiveness, 4)),
+            "atpg_effectiveness": (None if effectiveness is None
+                                   else round(effectiveness, 4)),
             "census_balances": self.census_balances,
-            "formulas": self.formulas(),
+            "formulas": self.formulas(total),
             "ud_definition": (
                 "UD is the FULL undetectable population from the class-role "
                 "map, not TI alone. Reading UD as one class overstates the "
@@ -340,6 +430,11 @@ class DerivedStatistics:
             "source": self.source.value,
             "role_counts": dict(self.role_counts),
             "posdet_credit": self.posdet_credit,
+            "effectiveness_posdet_families":
+                list(self.effectiveness_posdet_families),
+            "effectiveness_basis": self.effectiveness_basis,
+            "population": self.population,
+            "excluded_subclass": self.excluded_subclass,
             "metrics": self.metrics(),
             "subclasses": [
                 {
@@ -397,7 +492,15 @@ class DerivedStatistics:
             other_count=int(data.get("other_count", 0) or 0),
             subclass_stats=stats,
             role_counts=role_counts,
-            posdet_credit=float(data.get("posdet_credit", 0.5) or 0.0),
+            posdet_credit=float(data.get("posdet_credit",
+                                         config.posdet_credit) or 0.0),
+            effectiveness_posdet_families=list(
+                data.get("effectiveness_posdet_families")
+                or config.effectiveness_posdet_families),
+            effectiveness_basis=str(data.get("effectiveness_basis")
+                                    or config.effectiveness_basis),
+            population=str(data.get("population") or "total"),
+            excluded_subclass=(data.get("excluded_subclass") or None),
         )
 
 
@@ -502,6 +605,8 @@ def compute_statistics(faults: Iterable[FaultRecord],
         subclass_stats=stats,
         role_counts=dict(role_counter),
         posdet_credit=config.posdet_credit,
+        effectiveness_posdet_families=list(config.effectiveness_posdet_families),
+        effectiveness_basis=config.effectiveness_basis,
     )
     if validate:
         result.validate_census()
@@ -647,12 +752,21 @@ def subtract_statistics(base: DerivedStatistics,
         ))
 
     kept.sort(key=lambda s: (-s.count, s.subclass_id))
+    return _rebuild(kept, base)
+
+
+def _rebuild(kept: List[SubclassStat], base: DerivedStatistics,
+             population: Optional[str] = None,
+             excluded_subclass: Optional[str] = None) -> DerivedStatistics:
+    """Recompute totals, percentages and the role census from *kept*.
+
+    Shared by every operation that removes categories, so a derived population
+    can never disagree with a freshly computed one about how its roles sum.
+    """
     total = sum(s.count for s in kept)
     for stat in kept:
         stat.pct = (100.0 * stat.count / total) if total else 0.0
 
-    # Rebuild the role census from the surviving categories so the coverage
-    # metrics describe the population that is actually left.
     role_counter: Counter = Counter()
     for stat in kept:
         role_counter[stat.role] += stat.count
@@ -668,4 +782,30 @@ def subtract_statistics(base: DerivedStatistics,
         subclass_stats=kept,
         role_counts=dict(role_counter),
         posdet_credit=base.posdet_credit,
+        effectiveness_posdet_families=list(base.effectiveness_posdet_families),
+        effectiveness_basis=base.effectiveness_basis,
+        population=population or base.population,
+        excluded_subclass=excluded_subclass or base.excluded_subclass,
     )
+
+
+def exclude_subclass(base: DerivedStatistics,
+                     subclass_id: str) -> DerivedStatistics:
+    """Return *base* without *subclass_id* — the tool's "relevant" population.
+
+    This is the local equivalent of ``set_relevant_coverage -exclude <X>``: the
+    waived subclass leaves the population entirely, so it is gone from ``FU``
+    and from its role bucket, and every percentage re-bases on what remains.
+
+    Returns *base* unchanged when the subclass is absent, so a pre-disposition
+    snapshot never grows a phantom second column.
+    """
+    key = (subclass_id or "").strip().upper()
+    if not key or base.get(key) is None:
+        return base
+
+    kept = [SubclassStat(
+        subclass_id=s.subclass_id, family=s.family, count=s.count,
+        sa0=s.sa0, sa1=s.sa1, unknown_sa=s.unknown_sa, role=s.role,
+    ) for s in base.subclass_stats if s.subclass_id.upper() != key]
+    return _rebuild(kept, base, population="relevant", excluded_subclass=key)
