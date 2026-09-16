@@ -18,6 +18,13 @@ from typing import Any, Dict, List, Optional
 from . import regression
 from ..models import VerdictConfidence
 
+#: Tools whose answer improves with the live parsed netlist. An out-of-process
+#: server loads the netlist lazily, on the first call to one of these, so a
+#: census question never pays for a design load it does not need.
+NETLIST_TOOLS = frozenset({
+    "scan_status", "diagnose_unresolved", "verify_paths", "trace_path",
+})
+
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers
@@ -976,6 +983,18 @@ def serialize_context(report: Any) -> Dict[str, Any]:
     viewer = serialize_visualizer(getattr(report, "visualizer_config", None))
     if viewer:
         payload["visualizer"] = viewer
+
+    # Where the offline analysis is weakest, and where its root causes
+    # contradict the ATPG tool's own labels. Both are read by the agent
+    # before it spends its tool budget, so they travel with the context.
+    agreement = getattr(report, "agreement", None)
+    if agreement is not None and hasattr(agreement, "as_dict"):
+        payload["classification_crosscheck"] = agreement.as_dict()
+    questions = getattr(report, "open_questions", None)
+    if questions:
+        payload["open_questions"] = [
+            q.as_dict() if hasattr(q, "as_dict") else dict(q)
+            for q in questions]
     return payload
 
 
@@ -1057,7 +1076,66 @@ def visualizer_commands(context: Optional[Dict[str, Any]],
 CONTEXT_SECTIONS = ("census", "snapshot", "evidence", "coverage_metrics",
                     "fault_list", "unrecognised_fault_classes",
                     "constraint_parsing", "analysis_config", "patterns",
-                    "warnings", "waivers", "visualizer")
+                    "warnings", "waivers", "visualizer", "open_questions",
+                    "classification_crosscheck")
+
+
+def list_open_questions(context: Optional[Dict[str, Any]],
+                        subject: Optional[str] = None,
+                        limit: int = 20) -> Dict[str, Any]:
+    """The questions the offline analysis left open, highest priority first.
+
+    Every entry names the tool that would settle it. An empty list is a
+    real answer -- it means the analysis recorded no reduced confidence,
+    partial picture, mixed verdict, unreconciled figure or contradiction.
+    """
+    if not context:
+        return {"error": "No report context available. Run an analysis first."}
+    rows = list(context.get("open_questions") or [])
+    wanted = (subject or "").strip().upper()
+    if wanted:
+        rows = [r for r in rows
+                if str(r.get("subject", "")).upper() == wanted]
+    cap = max(1, int(limit))
+    out: Dict[str, Any] = {
+        "total": len(rows),
+        "questions": rows[:cap],
+        "note": ("Ordered by priority (1 = first). Spend tool calls here "
+                 "before re-checking conclusions the analysis is already "
+                 "confident about. An empty list means the offline pass "
+                 "recorded no weak spot, not that none exists."),
+    }
+    if len(rows) > cap:
+        out["truncated"] = True
+    return out
+
+
+def classification_crosscheck(context: Optional[Dict[str, Any]],
+                              subclass: Optional[str] = None,
+                              only_disagreements: bool = False
+                              ) -> Dict[str, Any]:
+    """The subclass x root-cause matrix and the pairs that contradict."""
+    if not context:
+        return {"error": "No report context available. Run an analysis first."}
+    data = context.get("classification_crosscheck")
+    if not data:
+        return {"error": ("No classification cross-check was recorded for "
+                          "this run (report predates it, or no coverage-"
+                          "loss fault was analysed).")}
+    out = dict(data)
+    wanted = (subclass or "").strip().upper()
+    if wanted:
+        out["pairs"] = [p for p in out.get("pairs", [])
+                        if str(p.get("subclass", "")).upper() == wanted]
+        out["disagreements"] = [p for p in out.get("disagreements", [])
+                                if str(p.get("subclass", "")).upper() == wanted]
+        out["leads"] = [x for x in out.get("leads", [])
+                        if str(x.get("subclass", "")).upper() == wanted]
+        out["by_subclass"] = {k: v for k, v in out.get("by_subclass", {}).items()
+                              if k.upper() == wanted}
+    if only_disagreements:
+        out.pop("pairs", None)
+    return out
 
 
 def report_context(context: Optional[Dict[str, Any]],
@@ -1235,16 +1313,30 @@ def coverage_triage(triage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def recommend_fixes(triage: Optional[Dict[str, Any]],
                     subclass: Optional[str] = None,
-                    limit: int = 10) -> Dict[str, Any]:
-    """Return ranked fix proposals, optionally filtered to one subclass."""
+                    limit: int = 10, fix_edits: Any = None) -> Dict[str, Any]:
+    """Return ranked fix proposals, optionally filtered to one subclass.
+
+    When the agent has recorded fix-plan edits in this session (*fix_edits*
+    sink), the plan returned is the overlaid one the reader sees, so a
+    follow-up turn does not re-propose what it already proposed.
+    """
     if not triage:
         return dict(_NO_TRIAGE)
     rows = list(triage.get("recommendations", []))
+    edits = list(getattr(fix_edits, "items", None) or [])
+    if edits:
+        from .fix_plan_edits import (
+            _recommendations_from_payload,
+            apply_fix_plan_edits,
+        )
+        base = _recommendations_from_payload(
+            [r for r in rows if isinstance(r, dict)])
+        rows = [r.as_dict() for r in apply_fix_plan_edits(base, edits)]
     if subclass:
         key = subclass.strip().upper()
         rows = [r for r in rows if str(r.get("subclass", "")).upper() == key]
     limit = max(1, int(limit or 10))
-    return {
+    out = {
         "total": len(rows),
         "returned": min(len(rows), limit),
         "note": ("Commands are for you to run in your own ATPG session. Where "
@@ -1252,6 +1344,9 @@ def recommend_fixes(triage: Optional[Dict[str, Any]],
                  "predicted — only a re-run establishes the benefit."),
         "recommendations": rows[:limit],
     }
+    if edits:
+        out["agent_edits_applied"] = len(edits)
+    return out
 
 
 def explain_subclass(subclass: str) -> Dict[str, Any]:
@@ -1841,6 +1936,137 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                                                 "or measurement that would")},
         },
     },
+    "list_open_questions": {
+        "description": (
+            "The questions the OFFLINE analysis itself left open, ordered by "
+            "priority, each naming the tool that would settle it: categories "
+            "scored with reduced confidence, blockers only partly traced, "
+            "structurally mixed categories, truncated cones, an unreconciled "
+            "census, a pre-disposition snapshot, and every place this tool's "
+            "root cause contradicts the ATPG tool's own subclass. CALL THIS "
+            "EARLY and spend your tool budget here rather than re-checking "
+            "conclusions the analysis is already sure of."),
+        "params": {
+            "subject": {"type": "str", "default": "",
+                        "description": ("restrict to one subject: a subclass "
+                                        "id such as AU.TC, or census / "
+                                        "disposition / mapping / constraints")},
+            "limit": {"type": "int", "default": 20,
+                      "description": "max questions to return"},
+        },
+    },
+    "classification_crosscheck": {
+        "description": (
+            "Cross-check of the ATPG tool's fault subclass (AU.TC, AU.PC, "
+            "UO.AAB ...) against the structural root cause this tool derived "
+            "for the same fault. Returns the subclass x root-cause matrix "
+            "with a verdict per pair (agree / disagree / uninformative / "
+            "not_measured) and the disagreeing pairs as leads with verbatim "
+            "sample faults. A disagreement means one side is wrong or the "
+            "structure is not modelled -- it does NOT say which; investigate "
+            "the samples with get_fault_detail / why_blocked / scan_status."),
+        "params": {
+            "subclass": {"type": "str", "default": "",
+                         "description": "restrict to one subclass id"},
+            "only_disagreements": {"type": "bool", "default": False,
+                                   "description": ("drop the full matrix, "
+                                                   "keep totals + leads")},
+        },
+    },
+    "record_finding": {
+        "description": (
+            "Record a STRUCTURED finding about the offline analysis so it "
+            "reaches the report, the GUI and the saved session -- not just "
+            "this transcript. kind: correction (offline value is wrong; give "
+            "agent_value), confirmation (checked with tools and it holds), "
+            "new_lead (something the analysis did not surface), gap (the "
+            "evidence does not settle it). subject is the exact fault path, "
+            "the category id (AU.TC) or the report section. A correction or "
+            "new_lead MUST cite evidence: the tool result or section that "
+            "supports it. Nothing you record overwrites the offline value; "
+            "it is shown beside it, attributed to you."),
+        "params": {
+            "kind": {"type": "str",
+                     "description": ("correction | confirmation | new_lead "
+                                     "| gap")},
+            "subject": {"type": "str",
+                        "description": ("fault path, category id or report "
+                                        "section the finding is about")},
+            "field": {"type": "str", "default": "other",
+                      "description": ("root_cause | scan_status | tie_driver "
+                                      "| blocking_source | category_ranking "
+                                      "| fix_plan | mapping | other")},
+            "offline_value": {"type": "str", "default": "",
+                              "description": "what the offline analysis says"},
+            "agent_value": {"type": "str", "default": "",
+                            "description": ("what you conclude (required "
+                                            "for a correction)")},
+            "evidence": {"type": "str", "default": "",
+                         "description": ("the tool result / section that "
+                                         "supports it (required for "
+                                         "correction and new_lead)")},
+            "confidence": {"type": "str", "default": "medium",
+                           "description": ("high | medium | low | "
+                                           "insufficient")},
+        },
+    },
+    "propose_fix": {
+        "description": (
+            "Put your fix-plan review INTO the fix plan (Triage > Fix Plan "
+            "tab, report section 5), where the engineer reads it. "
+            "action=amend: attach a practical note to an existing offline "
+            "entry (target_rank + note) -- the offline text stays verbatim. "
+            "action=add: append your own proposal (subclass, title, "
+            "rationale, commands as text, effort, risk, evidence). "
+            "action=replace: you have a better fix than offline entry "
+            "target_rank -- your proposal takes its slot and the offline "
+            "entry is kept, demoted and marked superseded (needs reason + "
+            "evidence). Commands are copyable text for the user; this tool "
+            "RUNS NOTHING. Rejected if any text quotes a hierarchy path not "
+            "in the inputs, elides a path, or predicts a coverage gain -- the "
+            "same rules the offline plan obeys. Returns the plan as the "
+            "reader now sees it."),
+        "params": {
+            "action": {"type": "str",
+                       "description": "add | amend | replace"},
+            "subclass": {"type": "str", "default": "",
+                         "description": ("category id the fix is for "
+                                         "(add; inferred from target_rank "
+                                         "otherwise)")},
+            "target_rank": {"type": "int", "default": 0,
+                            "description": ("offline fix-plan rank to amend "
+                                            "or replace")},
+            "title": {"type": "str", "default": "",
+                      "description": "short imperative title (add/replace)"},
+            "rationale": {"type": "str", "default": "",
+                          "description": ("why this action addresses the "
+                                          "cause (add/replace)")},
+            "commands": {"type": "str", "default": "",
+                         "description": ("tool commands as text, one per "
+                                         "line; may be empty")},
+            "preconditions": {"type": "str", "default": "",
+                              "description": ("what to confirm first, one "
+                                              "per line")},
+            "expected_effect": {"type": "str", "default": "",
+                                "description": ("what success looks like -- "
+                                                "NEVER a percentage")},
+            "effort": {"type": "str", "default": "medium",
+                       "description": "low | medium | high"},
+            "risk": {"type": "str", "default": "low",
+                     "description": "low | medium | high"},
+            "note": {"type": "str", "default": "",
+                     "description": "the practical note (amend)"},
+            "reason": {"type": "str", "default": "",
+                       "description": ("why yours is better than the "
+                                       "offline entry (replace)")},
+            "evidence": {"type": "str", "default": "",
+                         "description": ("tool result / section supporting "
+                                         "it (add/replace)")},
+            "confidence": {"type": "str", "default": "medium",
+                           "description": ("high | medium | reduced | "
+                                           "insufficient")},
+        },
+    },
 }
 
 
@@ -1872,19 +2098,40 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              compare: Optional[Dict[str, Any]] = None,
              triage: Optional[Dict[str, Any]] = None,
              context: Optional[Dict[str, Any]] = None,
-             design: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             design: Optional[Dict[str, Any]] = None,
+             findings: Any = None,
+             fix_edits: Any = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
     Unknown parameters are ignored; missing ones fall back to defaults. When
-    *adjacency* is provided (out-of-process MCP server), ``trace_path`` uses it
-    instead of a live netlist. When *compare* (a baseline report payload) is
-    provided, the regression tools become available, and when *triage* is
-    provided the coverage-triage tools become available. *design* is the one
-    parsed-design handle every tool answers from, so no two tools can
-    disagree about whether the netlist was read.
+    the live *netlist* is absent and *adjacency* is provided (out-of-process
+    MCP server before the design is loaded), ``trace_path`` uses the
+    adjacency. When *compare* (a baseline report payload) is provided, the
+    regression tools become available, and when *triage* is provided the
+    coverage-triage tools become available. *design* is the one parsed-design
+    handle every tool answers from, so no two tools can disagree about whether
+    the netlist was read. *findings* is the sink ``record_finding`` writes to;
+    *fix_edits* the sink ``propose_fix`` writes to.
     """
     args = dict(args or {})
+    if name == "propose_fix":
+        from .fix_plan_edits import propose_fix
+        return propose_fix(fix_edits, args, triage=triage,
+                           fault_results=fault_results,
+                           constraints=constraints)
+    if name == "record_finding":
+        from .findings import record_finding
+        return record_finding(findings, args, fault_results=fault_results,
+                              triage=triage)
+    if name == "list_open_questions":
+        return list_open_questions(
+            context, subject=str(args.get("subject", "") or "") or None,
+            limit=int(args.get("limit", 20) or 20))
+    if name == "classification_crosscheck":
+        return classification_crosscheck(
+            context, subclass=str(args.get("subclass", "") or "") or None,
+            only_disagreements=bool(args.get("only_disagreements", False)))
     if name == "report_insufficient_evidence":
         return report_insufficient_evidence(
             question=str(args.get("question", "") or ""),
@@ -1920,7 +2167,8 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
         return recommend_fixes(
             triage,
             subclass=str(args.get("subclass", "") or "") or None,
-            limit=int(args.get("limit", 10) or 10))
+            limit=int(args.get("limit", 10) or 10),
+            fix_edits=fix_edits)
     if name == "explain_subclass":
         return explain_subclass(str(args.get("subclass", "")))
     if name == "list_clusters":
@@ -1979,7 +2227,7 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
         frm = str(args.get("from_instance", ""))
         to = str(args.get("to_instance", ""))
         depth = int(args.get("max_depth", 8) or 8)
-        if adjacency is not None:
+        if netlist is None and adjacency is not None:
             return trace_path_adjacency(adjacency, frm, to, depth)
         return trace_path(netlist, from_instance=frm, to_instance=to,
                           max_depth=depth)

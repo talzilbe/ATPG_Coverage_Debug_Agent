@@ -657,7 +657,9 @@ def _triage_section(report: AnalysisReport,
         lines.extend(_blocking_sources(selected))
         lines.extend(_structural_profiles(selected))
 
-    recommendations = report.recommendations or []
+    from ..analysis.fix_plan_edits import effective_plan
+
+    recommendations = effective_plan(report)
     if not recommendations:
         return lines
 
@@ -667,18 +669,37 @@ def _triage_section(report: AnalysisReport,
                  "session; this tool never executes them. Where an action is "
                  "marked as needing measurement, no coverage gain is predicted "
                  "— the re-run is what establishes the benefit.")
+    if any(r.origin == "agent" or r.agent_notes for r in recommendations):
+        lines.append(">")
+        lines.append("> The AI agent contributed to this plan. Its proposals "
+                     "are marked `[agent]`; an amended entry carries the "
+                     "agent's note beside the offline rationale; a superseded "
+                     "offline entry is kept at the end for reference. Verify "
+                     "agent proposals before acting on them.")
     lines.append("")
     for rec in recommendations:
-        lines.append(f"### {rec.rank}. {rec.title}")
+        status = ""
+        if rec.superseded:
+            status = f" _(superseded by #{rec.superseded_by})_"
+        elif rec.origin == "agent":
+            status = " _(AI agent proposal" + (
+                f", replaces #{rec.supersedes}" if rec.supersedes else "") + ")_"
+        lines.append(f"### {rec.rank}. {rec.title}{status}")
         lines.append("")
         lines.append(f"- **Category:** {rec.subclass_id} "
                      f"({rec.fault_count} faults, {rec.pct:.2f}%)")
+        if rec.edit_reason:
+            lines.append(f"- **Why the agent prefers this:** {rec.edit_reason}")
         if rec.hotspot:
             lines.append(f"- **Concentrated under:** `{rec.hotspot}`")
         lines.append(f"- **Worth acting on:** {rec.actionable}")
         lines.append(f"- **Confidence:** {rec.confidence.value}")
         lines.append(f"- **Effort / risk:** {rec.fix.effort} / {rec.fix.risk}")
         lines.append(f"- **Why:** {rec.fix.rationale}")
+        if rec.agent_notes:
+            lines.append("- **Agent's practical note(s):**")
+            for item in rec.agent_notes:
+                lines.append(f"  - {item}")
         if rec.fix.preconditions:
             lines.append("- **Confirm first:**")
             for item in rec.fix.preconditions:
@@ -699,6 +720,89 @@ def _triage_section(report: AnalysisReport,
             lines.extend(rec.fix.commands)
             lines.append("```")
         lines.append("")
+    return lines
+
+
+def _crosscheck_section(report: AnalysisReport) -> List[str]:
+    """The ATPG tool's subclass against this tool's root cause, per fault."""
+    agreement = getattr(report, "agreement", None)
+    if agreement is None:
+        return []
+    totals = dict(getattr(agreement, "totals", {}) or {})
+    lines = ["## Classification Cross-check", "",
+             "> " + str(getattr(agreement, "note", "")), "",
+             "| Verdict | Faults |", "| --- | --- |"]
+    for key, value in totals.items():
+        lines.append(f"| {key} | {value} |")
+    lines.append("")
+    leads = list(getattr(agreement, "leads", None) or [])
+    if leads:
+        lines.append("| Verdict | ATPG subclass | Structural root cause | "
+                     "Faults | Sample faults (verbatim) |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for lead in leads:
+            samples = ", ".join(f"`{s}`" for s in lead.get("samples", []))
+            lines.append(
+                f"| {lead.get('verdict', '')} | `{lead.get('subclass', '')}` | "
+                f"`{lead.get('root_cause', '')}` | {lead.get('count', 0)} | "
+                f"{samples} |")
+        lines.append("")
+        for lead in leads:
+            lines.append(f"- **{lead.get('subclass', '')} / "
+                         f"{lead.get('root_cause', '')}:** "
+                         f"{lead.get('why_it_matters', '')}")
+        lines.append("")
+    return lines
+
+
+def _open_questions_section(report: AnalysisReport) -> List[str]:
+    """Where this analysis is least sure, ordered for the reviewer."""
+    questions = list(getattr(report, "open_questions", None) or [])
+    if not questions:
+        return []
+    lines = ["## Open Questions", "",
+             "> Each row is a place where this report itself recorded reduced "
+             "confidence, a partial picture, a mixed verdict, an unreconciled "
+             "figure or a contradiction. Ordered by priority (1 = first); "
+             "each names the agent tool that would settle it. None is a "
+             "conclusion.", "",
+             "| Pri. | Subject | Question | Why it is open | Settle with |",
+             "| --- | --- | --- | --- | --- |"]
+    for q in questions:
+        d = q.as_dict() if hasattr(q, "as_dict") else dict(q)
+        lines.append(
+            f"| {d.get('priority', '')} | `{d.get('subject', '')}` | "
+            f"{d.get('question', '')} | {d.get('why', '')} | "
+            f"{', '.join(d.get('suggested_tools') or [])} |")
+    lines.append("")
+    return lines
+
+
+def _agent_review_section(report: AnalysisReport) -> List[str]:
+    """Structured findings the AI agent recorded, beside the offline values."""
+    investigation = getattr(report, "investigation", None) or {}
+    findings = list(investigation.get("findings") or []) \
+        if isinstance(investigation, dict) else []
+    if not findings:
+        return []
+    lines = ["## Agent Review (structured findings)", "",
+             f"> The AI agent recorded {len(findings)} finding(s) while "
+             "reviewing this analysis. The offline value is shown beside the "
+             "agent's; neither replaces the other. Verify a correction "
+             "before acting on it.", "",
+             "| Kind | Subject | Field | Offline value | Agent value | "
+             "Evidence | Confidence |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for f in findings:
+        subject = f"`{f.get('subject', '')}`"
+        if not f.get("subject_verified", True):
+            subject += " (subject not found in this report)"
+        lines.append(
+            f"| {f.get('kind', '')} | {subject} | {f.get('field', '')} | "
+            f"{f.get('offline_value', '') or '-'} | "
+            f"{f.get('agent_value', '') or '-'} | {f.get('evidence', '')} | "
+            f"{f.get('confidence', '')} |")
+    lines.append("")
     return lines
 
 
@@ -814,6 +918,8 @@ def render_markdown(report: AnalysisReport,
     lines.extend(_evidence_section(report))
     lines.extend(_input_quality_section(report))
     lines.extend(_triage_section(report, dumps))
+    lines.extend(_crosscheck_section(report))
+    lines.extend(_open_questions_section(report))
 
     # Per-fault table
     lines.append("## Per-Fault Detail")
@@ -868,6 +974,7 @@ def render_markdown(report: AnalysisReport,
     lines.append("")
 
     lines.extend(_visualizer_section(report))
+    lines.extend(_agent_review_section(report))
 
     # Skill Results
     if report.skill_results:

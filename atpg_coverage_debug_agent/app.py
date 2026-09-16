@@ -15,9 +15,9 @@ from .analysis.disposition import select_fault_list
 from .analysis.summarizer import build_report
 from .config.analysis_config import AnalysisConfig, resolve
 from .models import AnalysisReport
+from .parser import netlist_cache
 from .parser.constraint_parser import parse_constraints_file_ex
 from .parser.fault_parser import parse_fault_list_file_ex
-from .parser.verilog_parser import parse_verilog_file
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 
     if progress:
         progress(0, 5, "Parsing netlist")
-    netlist = parse_verilog_file(inputs.netlist_path)
+    netlist, netlist_origin = netlist_cache.load_or_parse(inputs.netlist_path)
 
     if progress:
         progress(1, 5, "Parsing fault list")
@@ -140,6 +140,7 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report.faults = faults
     report.constraints = constraints
     report.sources = _source_metadata(inputs, faults_path)
+    report.sources["netlist_origin"] = netlist_origin
     report.fault_list_header = fault_parse.header
     report.class_diagnostics = fault_parse.unrecognised
     report.constraint_diagnostics = (constraint_parse.summary()

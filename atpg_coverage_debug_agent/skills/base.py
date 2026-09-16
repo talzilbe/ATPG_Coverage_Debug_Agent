@@ -108,6 +108,12 @@ class AnalysisContext:
     #: The one parsed-design handle every tool answers from, so no two tools
     #: can disagree about whether the netlist was read.
     design: Any = None
+    #: Sink the ``record_finding`` tool writes structured findings into
+    #: (``analysis.findings.FindingsSink``), or ``None`` to refuse recording.
+    findings: Any = None
+    #: Sink the ``propose_fix`` tool writes fix-plan edits into
+    #: (``analysis.fix_plan_edits.FixEditsSink``), or ``None`` to refuse.
+    fix_edits: Any = None
 
 
 # ---------------------------------------------------------------------------

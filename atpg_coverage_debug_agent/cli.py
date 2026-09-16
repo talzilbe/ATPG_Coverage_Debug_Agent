@@ -247,23 +247,53 @@ def _print_triage(report: AnalysisReport, fix_limit: int) -> None:
             print(f"    {cat.subclass_id:<12s} {prof.dominant_label} "
                   f"({prof.dominant_share:.0%} of {prof.profiled} site(s))")
 
-    recommendations = report.recommendations or []
+    from .analysis.fix_plan_edits import effective_plan
+
+    recommendations = effective_plan(report)
     if not recommendations:
         return
     shown = recommendations[:max(1, fix_limit)]
     print(f"\nFix plan ({len(recommendations)} proposal(s), showing "
           f"{len(shown)}):")
     for rec in shown:
-        print(f"\n  {rec.rank}. [{rec.subclass_id}] {rec.title}")
+        tag = ""
+        if rec.superseded:
+            tag = f" (superseded by #{rec.superseded_by})"
+        elif rec.origin == "agent":
+            tag = " (AI agent proposal)"
+        print(f"\n  {rec.rank}. [{rec.subclass_id}] {rec.title}{tag}")
         print(f"     confidence={rec.confidence.value} "
               f"effort={rec.fix.effort} risk={rec.fix.risk}")
         print(f"     Why: {rec.fix.rationale}")
+        for note in rec.agent_notes:
+            print(f"     Agent note: {note}")
         if rec.fix.expected_effect:
             print(f"     Outcome: {rec.fix.expected_effect}")
         for caveat in rec.caveats:
             print(f"     Caveat: {caveat}")
         for command in rec.fix.commands:
             print(f"       {command}")
+
+
+def _print_open_questions(report: AnalysisReport) -> None:
+    """The cross-check verdicts and where the analysis is least sure."""
+    agreement = getattr(report, "agreement", None)
+    if agreement is not None:
+        totals = dict(getattr(agreement, "totals", {}) or {})
+        print("\nSubclass vs structural root cause (per mapped fault): "
+              + ", ".join(f"{k}={v}" for k, v in totals.items()))
+        for lead in list(getattr(agreement, "leads", None) or [])[:5]:
+            print(f"  {lead.get('verdict'):<12s} {lead.get('subclass'):<10s} "
+                  f"-> {lead.get('root_cause')} x{lead.get('count')}")
+    questions = list(getattr(report, "open_questions", None) or [])
+    if not questions:
+        return
+    print(f"\nOpen questions ({len(questions)}; 1 = look first):")
+    for q in questions:
+        print(f"  [{q.priority}] {q.subject}: {q.question}")
+        print(f"      why: {q.why}")
+        if q.suggested_tools:
+            print(f"      settle with: {', '.join(q.suggested_tools)}")
 
 
 def _print_summary(report: AnalysisReport) -> None:
@@ -480,6 +510,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     _print_summary(report)
     _print_triage(report, args.fix_limit)
+    _print_open_questions(report)
 
     if args.report_md:
         write_markdown(report, args.report_md)

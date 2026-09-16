@@ -525,3 +525,9 @@ class AnalysisReport:
     #: the design paths the user supplied (``dict``). ``None`` when no viewer
     #: session has been configured.
     visualizer_config: Any = None
+    #: Cross-check of the ATPG tool's subclass against this tool's root cause
+    #: per fault (``analysis.agreement.Agreement``). ``None`` for old reports.
+    agreement: Any = None
+    #: Where the offline analysis recorded a weak spot, as questions for the
+    #: reviewer (``List[analysis.open_questions.OpenQuestion]``).
+    open_questions: Any = None

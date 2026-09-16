@@ -437,12 +437,44 @@ set the **Copilot CLI** field to your `copilot` executable via **Browse…**
    run and the agent produces its A–F diagnosis. (Untick it for a single-shot
    run, or use **Build Prompt Only** to copy the prompt into your own chat.)
 6. Use the **Follow-up Chat** box to ask questions about the diagnosis — the
-   conversation keeps the full analysis context.
+   conversation keeps the full analysis context **and the investigation
+   tools**: after an agentic run the local MCP server (with the parsed
+   netlist handed to it) stays alive for every follow-up, and each tool call
+   the model makes is shown live in the **Agent Tool Trace** pane. The chat
+   box can be popped out into its own window; the "agent is replying"
+   indicator travels with it.
 
 > With the Copilot CLI backend, **Agentic tools** must stay ticked for a real
 > investigation loop. Unticked, the enabled skills run once locally and the
 > model gets a single pass with no way to request further evidence — the run
 > log says so explicitly.
+
+### The offline ↔ agent loop
+
+The offline analysis and the agent review each other rather than the agent
+merely restating the report:
+
+- **The analysis says where it is weakest.** Every place it recorded reduced
+  confidence, a blocker only partly traced, a structurally mixed category, a
+  truncated cone, an unreconciled census or a pre-disposition snapshot becomes
+  an **Open Question**, ordered by priority and naming the tool that would
+  settle it (`list_open_questions`; also in the reports). The agent is told to
+  spend its budget there first.
+- **The two classifications are cross-checked.** For every mapped fault the
+  ATPG tool's own subclass (`AU.TC`, `AU.PC`, `UO.AAB` …) is compared with the
+  structural root cause derived here. Pairs are judged *agree*, *disagree*,
+  *unconfirmed* (the tool names a mechanism the structural walk did not find)
+  or *uninformative*; contradictions come with verbatim sample faults as leads
+  (`classification_crosscheck`). It never decides which side is right.
+- **What the agent establishes comes back structured.** `record_finding` lets
+  it record a correction, confirmation, new lead or gap against a fault,
+  category or report section, with the evidence it cites. Findings are saved
+  with the session and listed in the reports under **Agent review** beside the
+  offline value — nothing offline is ever overwritten.
+- **The tools see the real design.** The parsed netlist is handed to the
+  out-of-process tool server (as a pickle, reused from a cache keyed on the
+  netlist file), so `scan_status`, `trace_path` and `verify_paths` answer from
+  the netlist itself rather than from recorded evidence.
 
 ### How the agent is kept honest
 

@@ -114,6 +114,11 @@ def apply_exclusions(report: AnalysisReport,
         "note": note or "",
         "removed_count": removed,
     }
+    # Waived faults leave the cross-check and the open questions as well.
+    from .agreement import cross_check
+    from .open_questions import build_open_questions
+    edited.agreement = cross_check(kept)
+    edited.open_questions = build_open_questions(edited)
     return edited
 
 

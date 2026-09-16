@@ -182,6 +182,13 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
         "constraint_diagnostics": getattr(report, "constraint_diagnostics",
                                           None),
         "analysis_config": getattr(report, "analysis_config", None),
+        # The subclass/root-cause cross-check and the open questions are
+        # stored as written: the questions that depend on attribution and
+        # reachability cannot be rebuilt without the netlist.
+        "agreement": (report.agreement.as_dict()
+                      if getattr(report, "agreement", None) else None),
+        "open_questions": [q.as_dict() for q in
+                           (getattr(report, "open_questions", None) or [])],
     }
 
 
@@ -390,6 +397,19 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
     viewer = data.get("visualizer_config")
     if viewer:
         report.visualizer_config = dict(viewer)
+
+    from ..analysis import agreement as agreement_mod
+    from ..analysis import open_questions as oq
+
+    report.agreement = agreement_mod.from_dict(data.get("agreement"))
+    if report.agreement is None and report.fault_results:
+        # An older session: the cross-check needs only the saved fault rows.
+        report.agreement = agreement_mod.cross_check(report.fault_results)
+    saved_questions = data.get("open_questions")
+    if saved_questions is None:
+        report.open_questions = oq.build_open_questions(report)
+    else:
+        report.open_questions = oq.from_dicts(saved_questions)
     return report
 
 

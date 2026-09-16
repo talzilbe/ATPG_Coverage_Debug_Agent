@@ -20,14 +20,23 @@ import copy
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import session
 from .analysis import investigate
+from .analysis.findings import FINDINGS_FILE, FindingsSink
+from .analysis.fix_plan_edits import FIX_EDITS_FILE, FixEditsSink
+from .parser import netlist_cache
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "atpg-coverage-debug"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
+
+#: Every ``tools/call`` is appended here (one JSON object per line) inside the
+#: session directory, so the GUI can show which evidence the agent actually
+#: looked at -- the Copilot CLI's own loop is opaque to the parent process.
+TOOL_LOG_FILE = "tool_calls.jsonl"
 
 _JSON_TYPES = {"int": "integer", "float": "number", "bool": "boolean",
                "str": "string"}
@@ -90,6 +99,9 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
     else:
         load_error = f"Evidence file not found: {path!r}"
         compare = None
+    work_dir = os.environ.get(session.SESSION_DIR_ENV, "")
+    if work_dir and not os.path.isdir(work_dir):
+        work_dir = ""
     return {
         "faults": faults,
         "constraints": constraints,
@@ -102,7 +114,68 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
         "evidence_path": path,
         "load_error": load_error,
         "initialized": False,
+        # The parsed netlist is loaded on the first call that needs it (see
+        # ``investigate.NETLIST_TOOLS``): from the pickle the parent handed
+        # over, else by re-parsing the source the design handle names.
+        "netlist": None,
+        "netlist_path": os.environ.get(netlist_cache.NETLIST_FILE_ENV, ""),
+        "netlist_origin": "not_loaded",
+        "findings": FindingsSink(
+            os.path.join(work_dir, FINDINGS_FILE) if work_dir else None),
+        "fix_edits": FixEditsSink(
+            os.path.join(work_dir, FIX_EDITS_FILE) if work_dir else None),
+        "tool_log_path": (os.path.join(work_dir, TOOL_LOG_FILE)
+                          if work_dir else ""),
     }
+
+
+def ensure_netlist(state: Dict[str, Any]) -> Any:
+    """Load the parsed netlist into *state* once, recording where it came from.
+
+    Order: the pickle named by ``ATPG_NETLIST_FILE``; then the netlist cache
+    or a fresh parse of the source path recorded in the design handle. A
+    failure leaves ``netlist`` ``None`` and the tools answer from recorded
+    evidence exactly as before, saying so in ``netlist_origin``.
+    """
+    if state.get("netlist") is not None or state.get("netlist_origin") not in (
+            "not_loaded", None):
+        return state.get("netlist")
+    netlist = netlist_cache.load(state.get("netlist_path") or "")
+    origin = "handoff_pickle" if netlist is not None else ""
+    if netlist is None:
+        source = ((state.get("design") or {}).get("sources") or {}).get(
+            "netlist") or ""
+        if source and os.path.isfile(source):
+            try:
+                netlist, origin = netlist_cache.load_or_parse(source)
+            except Exception as exc:  # noqa: BLE001 - fall back to evidence
+                origin = f"unavailable: {exc}"
+        else:
+            origin = "unavailable: no pickle handed over and the netlist " \
+                     "source path is not readable from this process"
+    state["netlist"] = netlist
+    state["netlist_origin"] = origin
+    design = state.get("design")
+    if isinstance(design, dict):
+        design["netlist_live"] = netlist is not None
+        design["netlist_origin"] = origin
+    return netlist
+
+
+def log_tool_call(state: Dict[str, Any], name: str, arguments: Dict[str, Any],
+                  ok: bool, chars: int, truncated: bool,
+                  elapsed_ms: float) -> None:
+    path = state.get("tool_log_path") or ""
+    if not path:
+        return
+    row = {"ts": time.strftime("%H:%M:%S"), "tool": name,
+           "args": arguments, "ok": ok, "chars": chars,
+           "truncated": truncated, "ms": round(elapsed_ms, 1)}
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str) + "\n")
+    except OSError:
+        pass
 
 
 def max_inline_chars() -> int:
@@ -338,29 +411,41 @@ def handle_message(msg: Dict[str, Any],
         arguments = params.get("arguments") or {}
         if name not in investigate.TOOL_SPECS:
             return _error(msg_id, -32602, f"Unknown tool '{name}'.")
+        started = time.monotonic()
+        netlist = (ensure_netlist(state) if name in investigate.NETLIST_TOOLS
+                   else state.get("netlist"))
         try:
             data = investigate.run_tool(
                 name, arguments,
                 fault_results=state["faults"],
                 constraints=state["constraints"],
-                netlist=None,
+                netlist=netlist,
                 adjacency=state["adjacency"],
                 compare=state.get("compare"),
                 triage=state.get("triage"),
                 context=state.get("context"),
                 design=state.get("design"),
+                findings=state.get("findings"),
+                fix_edits=state.get("fix_edits"),
             )
         except Exception as exc:  # noqa: BLE001
+            log_tool_call(state, name, arguments, False, 0, False,
+                          (time.monotonic() - started) * 1000)
             return _result(msg_id, {
                 "content": [{"type": "text", "text": f"ERROR: {exc}"}],
                 "isError": True,
             })
+        if name in investigate.NETLIST_TOOLS and isinstance(data, dict):
+            data.setdefault("netlist_origin", state.get("netlist_origin"))
         data = shrink_payload(
             data, max_inline_chars(),
             spill_dir=os.path.join(session.session_dir(
                 (state.get("stamp") or {}).get("design")), "spill"),
             tool_name=name)
         text = _encode(data)
+        log_tool_call(state, name, arguments, True, len(text),
+                      bool(isinstance(data, dict) and data.get("_truncation")),
+                      (time.monotonic() - started) * 1000)
         return _result(msg_id, {"content": [{"type": "text", "text": text}]})
 
     if is_notification:

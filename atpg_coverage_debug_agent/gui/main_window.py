@@ -597,6 +597,47 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           <b class="k">Tessent Visualizer</b> tab has been filled in &mdash;
           otherwise it says so rather than inventing a project name or a
           path.</td></tr>
+      <tr><td><code>list_open_questions</code></td><td>Where the <i>offline</i>
+          analysis itself is weakest, as an ordered list of questions each
+          naming the tool that would settle it: categories scored with
+          reduced confidence, blockers only partly traced, structurally mixed
+          categories, truncated cones, an unreconciled census, a
+          pre-disposition snapshot, and every place this tool's root cause
+          contradicts the ATPG tool's own subclass. The agent is told to call
+          it before choosing what to investigate, so its budget goes where
+          the analysis is least sure rather than where it is most sure. The
+          same list appears in the reports under <b>Open Questions</b>.
+          </td></tr>
+      <tr><td><code>classification_crosscheck</code></td><td>Compares the ATPG
+          tool's fault subclass (<code>AU.TC</code>, <code>AU.PC</code>,
+          <code>UO.AAB</code>&hellip;) with the structural root cause this
+          tool derived for the same fault, over every mapped fault. Each pair
+          gets a verdict: <i>agree</i>, <i>disagree</i> (the two contradict
+          &mdash; one is wrong or the structure is not modelled),
+          <i>unconfirmed</i> (the ATPG tool names a mechanism this tool could
+          not find at the site) or <i>uninformative</i>. Disagreeing and
+          unconfirmed pairs come with verbatim sample faults as leads. It
+          never decides which side is right.</td></tr>
+      <tr><td><code>record_finding</code></td><td>Lets the agent record a
+          <b>structured</b> finding &mdash; a correction, a confirmation, a
+          new lead or a gap &mdash; against a fault, a category or a report
+          section, with the evidence that supports it. Findings are shown in
+          the trace pane, saved with the report, and listed in the exported
+          reports under <b>Agent review</b>. They never overwrite an offline
+          value; they sit beside it, attributed to the agent, so both are
+          always visible.</td></tr>
+      <tr><td><code>propose_fix</code></td><td>Lets the agent put its fix-plan
+          review <b>into the Fix Plan</b> (Triage tab and report section 5)
+          rather than only into prose: <i>amend</i> attaches a practical note
+          to an offline entry (the offline text stays verbatim), <i>add</i>
+          appends the agent's own proposal, and <i>replace</i> puts a better
+          fix in an offline entry's slot &mdash; the offline entry is kept,
+          demoted to the end and marked <i>superseded</i>, so the
+          deterministic plan is always still readable. Proposals are held to
+          the same rules as the offline catalogue: no path that is not in
+          your inputs, no elided path, no predicted coverage gain, and
+          evidence for anything added or replaced. Commands are text for you
+          to run; the tool runs nothing.</td></tr>
       <tr><td><code>list_faults</code>, <code>get_fault_detail</code>,
           <code>why_blocked</code>, <code>list_constraints</code>,
           <code>trace_path</code>, <code>suggest_test_points</code></td>
@@ -611,6 +652,11 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
 <tr><td><b class="k">Run AI Debug Agent</b></td><td>Generate the A&ndash;F
     diagnosis. Output streams into the Agent Response pane; fault ids are
     clickable and focus the row in the table.</td></tr>
+<tr><td><b class="k">Stop</b></td><td>Stop the turn in progress (a run or a
+    follow-up reply). Whatever streamed so far is kept and marked
+    <i>partial</i>; the conversation, its session and its tools survive, so
+    you can ask a follow-up or run again. A second Stop sits in the chat row
+    so it is reachable from a popped-out chat window.</td></tr>
 <tr><td><b class="k">Build Prompt Only</b></td><td>Preview exactly what would be
     sent to the LLM, without calling it.</td></tr>
 <tr><td><b class="k">Verify</b></td><td>Cross-check the answer against the
@@ -653,6 +699,21 @@ the conversation keeps the full analysis context (e.g. &ldquo;which module
 contributes the most loss?&rdquo;, &ldquo;how would a control point on X
 help?&rdquo;). <b>Max tokens</b> and <b>Temperature</b> tune size and
 determinism (temperature&nbsp;0 is most repeatable).</p>
+<p><b>Follow-ups keep the tools.</b> After an agentic run the investigation
+tools stay attached for every follow-up question: with the Copilot CLI the
+local MCP server (and the parsed netlist handed to it) lives for the whole
+conversation, and with the HTTP backend each follow-up runs through the same
+tool loop as the first answer. The status line says whether a follow-up has
+tools or can only recall the first answer. Every follow-up answer gets the
+same guardrail correction as the first.</p>
+<p><b>Seeing what the agent looked at.</b> In agentic CLI mode every tool call
+the model makes is logged by the MCP server and appears in the <b>Agent Tool
+Trace</b> pane as it happens (<i>MCP tool call #n: name(args)</i>), so you can
+tell an answer grounded in fetched evidence from one recalled from the
+prompt.</p>
+<p><b>Popped-out chat.</b> The chat box's <b>Open in window</b> button detaches
+it into its own window; the &ldquo;agent is replying&rdquo; indicator is
+mirrored into that window so a slow reply is not mistaken for a hang.</p>
 
 <h3>Fault rows in prompt</h3>
 <p>This caps how many coverage-loss fault rows are written into the prompt's
@@ -1080,6 +1141,8 @@ class MainWindow(QMainWindow):
         self.agent_panel = AgentPanel()
         self.agent_panel.config_changed.connect(self._save_settings)
         self.agent_panel.fault_referenced.connect(self._focus_fault_in_table)
+        self.agent_panel.findings_changed.connect(self._on_agent_findings)
+        self.agent_panel.fix_plan_changed.connect(self._on_agent_fix_edits)
         # The agent panel is tall. Placed directly in the tab widget its
         # minimum size propagates to the whole window, which then cannot be
         # shrunk and barely changes when maximised. A scroll area decouples
@@ -1598,6 +1661,47 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self._error(f"Analysis failed:\n{message}")
         self.statusBar().showMessage("Analysis failed.")
+
+    def _on_agent_findings(self, findings: list) -> None:
+        """Carry the agent's structured findings into the report.
+
+        The Summary page renders section 9.2 from ``report.investigation``,
+        so it is refreshed here; the offline values themselves are untouched.
+        """
+        report = self._report
+        if report is None:
+            return
+        current = dict(getattr(report, "investigation", None) or {})
+        if list(current.get("findings") or []) == list(findings):
+            return
+        current["findings"] = list(findings)
+        report.investigation = current
+        self._populate_summary(report)
+        if findings:
+            self.statusBar().showMessage(
+                f"Agent recorded {len(findings)} structured finding(s) — "
+                "see Summary section 9.2 and the Agent Tool Trace.")
+
+    def _on_agent_fix_edits(self, edits: list) -> None:
+        """Overlay the agent's fix-plan edits onto the Triage tab and Summary.
+
+        The offline plan on the report is untouched; the edits live in
+        ``report.investigation`` and every renderer applies them on read.
+        """
+        report = self._report
+        if report is None:
+            return
+        current = dict(getattr(report, "investigation", None) or {})
+        if list(current.get("fix_plan_edits") or []) == list(edits):
+            return
+        current["fix_plan_edits"] = list(edits)
+        report.investigation = current
+        self.triage_panel.refresh_fix_plan()
+        self._populate_summary(report)
+        if edits:
+            self.statusBar().showMessage(
+                f"Agent contributed {len(edits)} fix-plan edit(s) — see "
+                "Triage & Fix Plan > Fix Plan and Summary section 5.")
 
     def _cleanup_thread(self) -> None:
         self._thread = None

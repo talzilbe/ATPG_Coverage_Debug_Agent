@@ -21,6 +21,7 @@ design's netlist connectivity.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import shutil
@@ -40,6 +41,10 @@ ROOT_NAME = "atpg_debug_sessions"
 
 _SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 
+#: Two runs started within the same second by the same process must not
+#: share a directory -- the second would silently reuse (or delete) the first.
+_RUN_COUNTER = itertools.count()
+
 
 def safe_name(value: Optional[str], fallback: str = "design") -> str:
     """Return *value* reduced to characters that are safe in a path segment."""
@@ -49,7 +54,8 @@ def safe_name(value: Optional[str], fallback: str = "design") -> str:
 
 def new_run_id() -> str:
     """A run identifier that sorts chronologically and cannot collide."""
-    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    return (f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+            f"-{next(_RUN_COUNTER)}")
 
 
 def session_dir(design: Optional[str] = None,

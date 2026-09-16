@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import re
@@ -45,8 +46,10 @@ from PySide6.QtWidgets import (
 )
 
 from ..agent.debug_agent import (
+    AgentCancelled,
     AgentConfig,
     AGENTIC_SYSTEM_PROMPT,
+    CancelToken,
     DebugAgent,
     SYSTEM_PROMPT,
     build_user_payload,
@@ -112,6 +115,7 @@ class _AgentWorker(QObject):
 
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(str)
     token = Signal(str)
 
     def __init__(self, agent: DebugAgent, report, session_id=None) -> None:
@@ -120,10 +124,16 @@ class _AgentWorker(QObject):
         self._report = report
         self._session_id = session_id
 
+    def cancel(self) -> None:
+        self._agent.cancel.cancel()
+
     def run(self) -> None:
         try:
             text = self._agent.run(self._report, session_id=self._session_id,
                                    on_chunk=lambda c: self.token.emit(c))
+        except AgentCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception as exc:  # noqa: BLE001
             logger.exception("AI debug agent failed")
             self.failed.emit(str(exc))
@@ -136,6 +146,7 @@ class _AgenticWorker(QObject):
 
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(str)
     trace = Signal(str)
     token = Signal(str)
 
@@ -148,6 +159,9 @@ class _AgenticWorker(QObject):
         self._ctx = ctx
         self._session_id = session_id
 
+    def cancel(self) -> None:
+        self._agent.cancel.cancel()
+
     def run(self) -> None:
         try:
             text = self._agent.run_agentic(
@@ -158,6 +172,9 @@ class _AgenticWorker(QObject):
                 session_id=self._session_id,
                 on_chunk=lambda c: self.token.emit(c),
             )
+        except AgentCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception as exc:  # noqa: BLE001
             logger.exception("Agentic AI debug agent failed")
             self.failed.emit(str(exc))
@@ -260,21 +277,36 @@ class _ChatWorker(QObject):
 
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(str)
     token = Signal(str)
+    trace = Signal(str)
 
-    def __init__(self, agent: DebugAgent, message, session_id, history) -> None:
+    def __init__(self, agent: DebugAgent, message, session_id, history,
+                 report=None, skill_manager=None, ctx=None) -> None:
         super().__init__()
         self._agent = agent
         self._message = message
         self._session_id = session_id
         self._history = history
+        self._report = report
+        self._skill_manager = skill_manager
+        self._ctx = ctx
+
+    def cancel(self) -> None:
+        self._agent.cancel.cancel()
 
     def run(self) -> None:
         try:
             text = self._agent.chat(
                 self._message, session_id=self._session_id,
                 history=self._history,
-                on_chunk=lambda c: self.token.emit(c))
+                on_chunk=lambda c: self.token.emit(c),
+                report=self._report,
+                skill_manager=self._skill_manager, ctx=self._ctx,
+                on_event=lambda m: self.trace.emit(m))
+        except AgentCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception as exc:  # noqa: BLE001
             logger.exception("Follow-up chat failed")
             self.failed.emit(str(exc))
@@ -291,6 +323,14 @@ class AgentPanel(QWidget):
     #: Emitted with a fault-object id when the user clicks a fault link in the
     #: agent output — the main window focuses that row in the results table.
     fault_referenced = Signal(str)
+
+    #: Emitted with the full list of structured findings (dicts) whenever the
+    #: agent records new ones, so other views can annotate their rows.
+    findings_changed = Signal(list)
+
+    #: Emitted with the full list of fix-plan edits (dicts) whenever the agent
+    #: records one, so the Triage tab and the Summary re-render the plan.
+    fix_plan_changed = Signal(list)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -312,6 +352,22 @@ class AgentPanel(QWidget):
         self._compare = None
         self._stream_buf: str = ""
         self._chat_stream_buf: str = ""
+        # Hand-off state of the current conversation: the on-disk MCP session
+        # (CLI backend) so follow-ups can re-attach the tool server, the
+        # in-process findings sink (HTTP backend), the tool context a chat
+        # turn investigates with, and the structured findings collected so
+        # far. Reset by _begin_session, closed by shutdown.
+        self._mcp_session = None
+        self._findings_sink = None
+        self._fix_edits_sink = None
+        self._chat_ctx = None
+        self._chat_agentic: bool = False
+        self._findings: list = []
+        self._fix_edits: list = []
+        self._tool_log_offset: int = 0
+        self._tool_log_calls: int = 0
+        self._live_agent = None
+        self._busy_chat: bool = False
         # Pop-out ("open in window") state: maps a docked panel box to its open
         # dialog + header button, so the same widget can be detached/re-docked.
         self._popouts: dict = {}
@@ -478,6 +534,13 @@ class AgentPanel(QWidget):
         btns = QHBoxLayout()
         self.run_btn = QPushButton("Run AI Debug Agent")
         self.run_btn.clicked.connect(self.on_run)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setToolTip(
+            "Stop the turn in progress. Whatever has streamed so far is kept "
+            "as a partial answer; the conversation and its tools survive, so "
+            "you can ask a follow-up or run again.")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.on_stop)
         self.build_btn = QPushButton("Build Prompt Only")
         self.build_btn.clicked.connect(self.on_build_prompt)
         self.copy_prompt_btn = QPushButton("Copy Prompt")
@@ -500,8 +563,9 @@ class AgentPanel(QWidget):
             "concrete DFT fixes (observation/control points, constraint "
             "relaxation, scan insertion) — no LLM used.")
         self.suggest_btn.clicked.connect(self.on_suggest_fixes)
-        for b in (self.run_btn, self.build_btn, self.copy_prompt_btn,
-                  self.save_prompt_btn, self.copy_resp_btn, self.save_resp_btn,
+        for b in (self.run_btn, self.stop_btn, self.build_btn,
+                  self.copy_prompt_btn, self.save_prompt_btn,
+                  self.copy_resp_btn, self.save_resp_btn,
                   self.verify_btn, self.suggest_btn):
             btns.addWidget(b)
         btns.addStretch(1)
@@ -585,12 +649,27 @@ class AgentPanel(QWidget):
         self.chat_input.returnPressed.connect(self.on_send_chat)
         self.chat_send_btn = QPushButton("Send")
         self.chat_send_btn.clicked.connect(self.on_send_chat)
+        # A second Stop lives in the chat row so it is reachable when the chat
+        # box is popped out into its own window.
+        self.chat_stop_btn = QPushButton("Stop")
+        self.chat_stop_btn.setToolTip("Stop the reply in progress.")
+        self.chat_stop_btn.setEnabled(False)
+        self.chat_stop_btn.clicked.connect(self.on_stop)
         self.chat_clear_btn = QPushButton("Clear chat")
         self.chat_clear_btn.clicked.connect(self.on_clear_chat)
         chat_row.addWidget(self.chat_input, 1)
         chat_row.addWidget(self.chat_send_btn)
+        chat_row.addWidget(self.chat_stop_btn)
         chat_row.addWidget(self.chat_clear_btn)
         chat_layout.addLayout(chat_row)
+
+        # The chat box can be popped out into its own window, where the main
+        # status line is out of sight. It gets its own copy of the busy
+        # indicator so a reply that takes a minute does not look like a hang.
+        self.chat_status_label = QLabel("")
+        self.chat_status_label.setStyleSheet("color: #555;")
+        self.chat_status_label.setVisible(False)
+        chat_layout.addWidget(self.chat_status_label)
         layout.addWidget(chat_box, 1)
 
         # Enable "open in window" (pop-out) on the four content panels. Store
@@ -996,6 +1075,12 @@ class AgentPanel(QWidget):
         self._compare = None
         self._session_id = None
         self._chat_messages = []
+        self._findings = []
+        self._fix_edits = []
+        self._chat_ctx = None
+        self._close_mcp_session()
+        self.findings_changed.emit([])
+        self.fix_plan_changed.emit([])
         self._set_chat_enabled(False)
         self.status_label.setText("Run an analysis first, then run the AI agent.")
         self._update_button_state()
@@ -1003,13 +1088,17 @@ class AgentPanel(QWidget):
     # -- investigation persistence (save/load with the report) ---------------
 
     def export_investigation(self) -> Optional[dict]:
-        """Return the current diagnosis + chat transcript + trace, or None."""
+        """Return the current diagnosis + chat transcript + trace + findings."""
         diagnosis = getattr(self, "_last_response", "") or ""
         chat = [{"role": r, "text": t} for r, t in self._chat_turns]
         trace = self.trace_view.toPlainText()
-        if not diagnosis and not chat and not trace.strip():
+        findings = list(self._findings)
+        fix_edits = list(self._fix_edits)
+        if (not diagnosis and not chat and not trace.strip() and not findings
+                and not fix_edits):
             return None
-        return {"diagnosis": diagnosis, "chat": chat, "trace": trace}
+        return {"diagnosis": diagnosis, "chat": chat, "trace": trace,
+                "findings": findings, "fix_plan_edits": fix_edits}
 
     def import_investigation(self, data: Optional[dict]) -> None:
         """Restore a saved investigation (view-only), or clear if *data* is None."""
@@ -1018,8 +1107,12 @@ class AgentPanel(QWidget):
         self.trace_view.clear()
         self._chat_turns = []
         self._last_response = ""
+        self._findings = []
+        self._fix_edits = []
         self._set_chat_enabled(False)
         if not data:
+            self.findings_changed.emit([])
+            self.fix_plan_changed.emit([])
             return
         diagnosis = data.get("diagnosis", "") or ""
         if diagnosis:
@@ -1029,6 +1122,10 @@ class AgentPanel(QWidget):
         trace = data.get("trace", "")
         if trace:
             self.trace_view.setPlainText(trace)
+        self._findings = [dict(f) for f in (data.get("findings") or [])]
+        self.findings_changed.emit(list(self._findings))
+        self._fix_edits = [dict(e) for e in (data.get("fix_plan_edits") or [])]
+        self.fix_plan_changed.emit(list(self._fix_edits))
         if diagnosis or data.get("chat"):
             self.status_label.setText(
                 "Loaded saved investigation (view-only transcript). Press Run "
@@ -1159,6 +1256,8 @@ class AgentPanel(QWidget):
                 getattr(r, "recommendations", None)),
             context=investigate.serialize_context(r),
             design=investigate.serialize_design(getattr(r, "netlist", None), r),
+            findings=self._findings_sink,
+            fix_edits=self._fix_edits_sink,
         )
 
     def on_run(self) -> None:
@@ -1190,6 +1289,7 @@ class AgentPanel(QWidget):
         self._stream_buf = ""
 
         agent = DebugAgent(config)
+        self._live_agent = agent
         self._thread = QThread()
         self._worker = _AgentWorker(agent, self._report,
                                     session_id=self._session_id)
@@ -1198,9 +1298,12 @@ class AgentPanel(QWidget):
         self._worker.token.connect(self._on_response_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
+        self._set_stop_enabled(True)
         self._thread.start()
 
     def _run_agentic(self, config: AgentConfig) -> None:
@@ -1219,10 +1322,15 @@ class AgentPanel(QWidget):
         self.run_btn.setEnabled(False)
         self._start_busy("Agent running, calling tools")
         self._begin_session(config, agentic=True)
+        # The context is built AFTER _begin_session so it carries this
+        # conversation's findings sink; it is kept for follow-up turns.
+        ctx = self._build_context()
+        self._chat_ctx = ctx
         self.response_view.clear()
         self._stream_buf = ""
 
         agent = DebugAgent(config)
+        self._live_agent = agent
         self._thread = QThread()
         self._worker = _AgenticWorker(agent, self._report,
                                       self._skill_manager, ctx,
@@ -1233,9 +1341,12 @@ class AgentPanel(QWidget):
         self._worker.token.connect(self._on_response_token)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
+        self._set_stop_enabled(True)
         self._thread.start()
 
     def _on_response_token(self, chunk: str) -> None:
@@ -1256,11 +1367,18 @@ class AgentPanel(QWidget):
             return f"{total // 60}m {total % 60:02d}s"
         return f"{total}s"
 
-    def _start_busy(self, message: str) -> None:
-        """Show *message* with a spinner and a running elapsed count."""
+    def _start_busy(self, message: str, chat: bool = False) -> None:
+        """Show *message* with a spinner and a running elapsed count.
+
+        With ``chat=True`` the same line is mirrored into the chat box, which
+        may be popped out into its own window where the status line is out
+        of sight.
+        """
         self._busy_message = message
         self._busy_started = time.monotonic()
         self._busy_frame = 0
+        self._busy_chat = chat
+        self.chat_status_label.setVisible(chat)
         self._tick_busy()
         self._busy_timer.start()
 
@@ -1268,16 +1386,233 @@ class AgentPanel(QWidget):
         frame = _BUSY_FRAMES[self._busy_frame % len(_BUSY_FRAMES)]
         self._busy_frame += 1
         elapsed = self._format_elapsed(time.monotonic() - self._busy_started)
-        self.status_label.setText(f"{frame}  {self._busy_message}… {elapsed}")
+        text = f"{frame}  {self._busy_message}… {elapsed}"
+        self.status_label.setText(text)
+        if self._busy_chat:
+            self.chat_status_label.setText(text)
+        # Every second, show the tool calls the MCP server has logged so far.
+        if self._busy_frame % 5 == 0:
+            self._poll_tool_log()
 
     def _stop_busy(self) -> float:
         """Stop the animation and return how long the work took, in seconds."""
         self._busy_timer.stop()
+        self._poll_tool_log()
+        self.chat_status_label.setVisible(False)
+        self.chat_status_label.setText("")
+        self._busy_chat = False
         if not self._busy_started:
             return 0.0
         elapsed = time.monotonic() - self._busy_started
         self._busy_started = 0.0
         return elapsed
+
+    # -- hand-off session: MCP server, tool log, findings --------------------
+
+    def _current_mcp_session(self):
+        """The live MCP session: the running agent's, else the panel's."""
+        agent = self._live_agent
+        live = getattr(agent, "mcp_session", None) if agent is not None else None
+        return live or self._mcp_session
+
+    def _poll_tool_log(self) -> None:
+        """Append any new MCP tool calls to the trace pane.
+
+        The Copilot CLI's own tool loop is opaque to this process; the MCP
+        server writes one line per call into the session directory, and this
+        is the only place the user can see which evidence the agent actually
+        looked at.
+        """
+        sess = self._current_mcp_session()
+        path = getattr(sess, "tool_log_path", None) if sess else None
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                fh.seek(self._tool_log_offset)
+                chunk = fh.read()
+                self._tool_log_offset = fh.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._tool_log_calls += 1
+            args = ", ".join(f"{k}={v}" for k, v in (row.get("args") or {}).items())
+            flags = "" if row.get("ok", True) else " ⚠ error"
+            if row.get("truncated"):
+                flags += " (truncated, spilled)"
+            self._append_trace(
+                f"→ [{row.get('ts', '')}] MCP tool call #{self._tool_log_calls}: "
+                f"{row.get('tool')}({args}) — {row.get('chars', 0)} chars, "
+                f"{row.get('ms', 0)} ms{flags}")
+
+    def _collect_findings(self) -> None:
+        """Pull the structured findings recorded so far into the panel."""
+        items: list = []
+        sess = self._current_mcp_session()
+        if sess is not None:
+            try:
+                items.extend(f.as_dict() for f in sess.findings())
+            except Exception:  # noqa: BLE001 - never break the run on this
+                pass
+        sink = self._findings_sink
+        if sink is not None:
+            items.extend(sink.as_dicts())
+        # Dedupe on content: the same finding can be seen via both routes.
+        seen = set()
+        unique = []
+        for f in items:
+            key = json.dumps({k: f.get(k) for k in
+                              ("kind", "subject", "field", "agent_value")},
+                             sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(f)
+        new = unique[len(self._findings):]
+        self._findings = unique
+        if new:
+            self._append_trace(
+                f"✓ {len(new)} structured finding(s) recorded by the agent "
+                f"({len(unique)} total) — saved with the report.")
+            for f in new:
+                self._append_trace(
+                    f"   [{f.get('kind')}] {f.get('subject')} "
+                    f"({f.get('field')}): {f.get('agent_value') or '-'} "
+                    f"[{f.get('confidence')}]"
+                    + ("" if f.get("subject_verified") else
+                       "  ⚠ subject not found in this report"))
+        self.findings_changed.emit(list(self._findings))
+
+    def current_findings(self) -> list:
+        """Structured findings the agent recorded in this conversation."""
+        return list(self._findings)
+
+    def _collect_fix_edits(self) -> None:
+        """Pull the fix-plan edits recorded so far into the panel."""
+        items: list = []
+        sess = self._current_mcp_session()
+        if sess is not None:
+            try:
+                items.extend(e.as_dict() for e in sess.fix_edits())
+            except Exception:  # noqa: BLE001 - never break the run on this
+                pass
+        sink = self._fix_edits_sink
+        if sink is not None:
+            items.extend(sink.as_dicts())
+        seen = set()
+        unique = []
+        for e in items:
+            key = json.dumps({k: e.get(k) for k in
+                              ("action", "subclass", "target_rank", "title",
+                               "note", "reason")}, sort_keys=True,
+                             default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+        new = unique[len(self._fix_edits):]
+        self._fix_edits = unique
+        if new:
+            self._append_trace(
+                f"✓ {len(new)} fix-plan edit(s) recorded by the agent "
+                f"({len(unique)} total) — see Triage > Fix Plan.")
+            for e in new:
+                target = (f" #{e.get('target_rank')}" if e.get("target_rank")
+                          else "")
+                self._append_trace(
+                    f"   [{e.get('action')}{target}] {e.get('subclass')}: "
+                    f"{e.get('title') or e.get('note') or e.get('reason')}")
+        self.fix_plan_changed.emit(list(self._fix_edits))
+
+    def current_fix_edits(self) -> list:
+        """Fix-plan edits the agent recorded in this conversation."""
+        return list(self._fix_edits)
+
+    def _collect_agent_output(self) -> None:
+        self._collect_findings()
+        self._collect_fix_edits()
+
+    # -- stopping a turn -----------------------------------------------------
+
+    def _set_stop_enabled(self, enabled: bool) -> None:
+        self.stop_btn.setEnabled(enabled)
+        self.chat_stop_btn.setEnabled(enabled)
+
+    def on_stop(self) -> None:
+        """Stop the turn in progress; the conversation is kept."""
+        worker = self._worker or self._chat_worker
+        if worker is None:
+            self.status_label.setText("Nothing is running.")
+            return
+        self._set_stop_enabled(False)
+        self._busy_message = "Stopping"
+        try:
+            worker.cancel()
+        except Exception:  # noqa: BLE001 - a stop must never raise into Qt
+            logger.exception("Cancel failed")
+
+    def _on_cancelled(self, partial: str) -> None:
+        """The first-answer turn was stopped by the user."""
+        elapsed = self._stop_busy()
+        agent = self._live_agent
+        # A stopped first run still keeps its hand-off session when the
+        # server config was written: follow-ups can use the tools even though
+        # the answer is partial.
+        if agent is not None and getattr(agent, "mcp_session", None) is not None:
+            self._mcp_session = agent.mcp_session
+        self._live_agent = None
+        self._collect_agent_output()
+        text = (partial or getattr(self, "_stream_buf", "") or "").strip()
+        marker = ("\n\n---\n**Stopped by user** — the answer above is "
+                  "PARTIAL and was not checked or corrected."
+                  if text else "*(Stopped by user before any output.)*")
+        self._set_response((text + marker) if text else marker)
+        self.status_label.setText(
+            f"Stopped by user after {self._format_elapsed(elapsed)} — "
+            "partial answer kept; the conversation is still open.")
+        self.run_btn.setEnabled(True)
+        self._set_stop_enabled(False)
+        self._chat_view_reset()
+        if text:
+            self._append_chat("Agent", text + "\n\n(stopped by user)")
+            if self._chat_backend != "cli":
+                self._chat_messages.append({"role": "assistant",
+                                            "content": text})
+        self._set_chat_enabled(True)
+
+    def _on_chat_cancelled(self, partial: str) -> None:
+        """A follow-up reply was stopped by the user."""
+        elapsed = self._stop_busy()
+        self._collect_agent_output()
+        text = (partial or getattr(self, "_chat_stream_buf", "") or "").strip()
+        self._chat_turns.append(
+            ("Agent", (text + "\n\n(stopped by user)") if text
+             else "(stopped by user before any reply)"))
+        if self._chat_backend != "cli" and text:
+            self._chat_messages.append({"role": "assistant", "content": text})
+        self._rebuild_chat_view()
+        self._set_chat_enabled(True)
+        self._set_stop_enabled(False)
+        self.status_label.setText(
+            f"Reply stopped after {self._format_elapsed(elapsed)} — "
+            "the conversation is still open.")
+        self.chat_input.setFocus()
+
+    def _close_mcp_session(self) -> None:
+        sess = self._mcp_session
+        self._mcp_session = None
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                pass
 
     def _append_trace(self, line: str) -> None:
         self.trace_view.appendPlainText(line)
@@ -1310,13 +1645,26 @@ class AgentPanel(QWidget):
 
     def _on_finished(self, text: str) -> None:
         elapsed = self._stop_busy()
+        # Keep the hand-off session the run created so follow-ups can use it.
+        agent = self._live_agent
+        if agent is not None and getattr(agent, "mcp_session", None) is not None:
+            self._mcp_session = agent.mcp_session
+        self._live_agent = None
+        self._collect_agent_output()
         final = text or getattr(self, "_stream_buf", "")
         final = self._audit_answer(final)
         self._set_response(final)
+        tools_note = ""
+        if self._chat_backend == "cli" and self._chat_agentic:
+            tools_note = (" Follow-ups keep the investigation tools."
+                          if self._mcp_session is not None and
+                          self._mcp_session.alive else
+                          " Follow-ups have NO tools (no MCP session).")
         self.status_label.setText(
             f"Agent response received in {self._format_elapsed(elapsed)} — "
-            "click a fault to focus it, or Verify.")
+            "click a fault to focus it, or Verify." + tools_note)
         self.run_btn.setEnabled(True)
+        self._set_stop_enabled(False)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
         self._append_chat("Agent", final)
@@ -1328,8 +1676,10 @@ class AgentPanel(QWidget):
 
     def _on_failed(self, message: str) -> None:
         elapsed = self._stop_busy()
+        self._live_agent = None
         self._set_response(f"[ERROR] {message}")
         self.run_btn.setEnabled(True)
+        self._set_stop_enabled(False)
         if is_cli_auth_error(message):
             self.status_label.setText(
                 "Copilot CLI is not authenticated — opening the Authentication "
@@ -1359,6 +1709,13 @@ class AgentPanel(QWidget):
         left to interpreter shutdown.
         """
         self._busy_timer.stop()
+        # Stop a turn in flight first, so the wait below is short.
+        for worker in (self._worker, self._chat_worker):
+            if worker is not None:
+                try:
+                    worker.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
         for attr in ("_model_thread", "_thread", "_chat_thread"):
             thread = getattr(self, attr, None)
             if thread is None:
@@ -1369,6 +1726,7 @@ class AgentPanel(QWidget):
                     thread.wait(timeout_ms)
             except RuntimeError:  # already destroyed by Qt
                 pass
+        self._close_mcp_session()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self.shutdown()
@@ -1378,6 +1736,18 @@ class AgentPanel(QWidget):
 
     def _begin_session(self, config: AgentConfig, agentic: bool) -> None:
         """Start a fresh conversation context for a new agent run."""
+        from ..analysis.findings import FindingsSink
+        from ..analysis.fix_plan_edits import FixEditsSink
+
+        self._close_mcp_session()
+        self._findings_sink = FindingsSink()
+        self._fix_edits_sink = FixEditsSink()
+        self._findings = []
+        self._fix_edits = []
+        self._tool_log_offset = 0
+        self._tool_log_calls = 0
+        self._chat_agentic = agentic
+        self._chat_ctx = None
         self._session_id = str(uuid.uuid4())
         self._chat_backend = config.backend
         self.chat_view.clear()
@@ -1479,9 +1849,14 @@ class AgentPanel(QWidget):
     def ask_about_fault(self, fault_object: str) -> None:
         """Pre-fill a follow-up question about *fault_object* (from the table)."""
         self.tabs.setCurrentIndex(0)
-        question = (f"Explain why coverage is lost for fault "
-                    f"'{fault_object}'. Use why_blocked and get_fault_detail "
-                    "and cite the structural evidence.")
+        if self._chat_agentic:
+            question = (f"Explain why coverage is lost for fault "
+                        f"'{fault_object}'. Use why_blocked and "
+                        "get_fault_detail and cite the structural evidence.")
+        else:
+            question = (f"Explain why coverage is lost for fault "
+                        f"'{fault_object}', citing only the structural "
+                        "evidence already in the analysis.")
         self.chat_input.setText(question)
         if self.chat_input.isEnabled():
             self.chat_input.setFocus()
@@ -1589,13 +1964,24 @@ class AgentPanel(QWidget):
         self.chat_input.clear()
         self._append_chat("You", msg)
 
+        # A follow-up turn re-attaches the same tools the first answer had:
+        # the on-disk MCP session (CLI) or the in-process tool loop (HTTP).
+        tools_ctx = self._chat_ctx if self._chat_agentic else None
+        tools_mgr = (self._skill_manager
+                     if (self._chat_agentic and self._chat_backend != "cli"
+                         and tools_ctx is not None)
+                     else None)
+
         history = None
         if self._chat_backend != "cli":
             self._chat_messages.append({"role": "user", "content": msg})
-            history = list(self._chat_messages)
+            # The tool loop extends the history in place with the evidence
+            # it gathered, so hand it the real list rather than a copy.
+            history = (self._chat_messages if tools_mgr is not None
+                       else list(self._chat_messages))
 
         self._set_chat_enabled(False)
-        self._start_busy("Agent is replying")
+        self._start_busy("Agent is replying", chat=True)
         self._chat_stream_buf = ""
         # Live streaming cue appended below the You turn; replaced on finish.
         self._append_html(
@@ -1603,17 +1989,26 @@ class AgentPanel(QWidget):
             f'<p dir="ltr" style="{_LTR_STYLE}">'
             '<b style="color:#036;">Agent:</b> </p>')
 
-        agent = DebugAgent(config)
+        # A follow-up turn re-attaches the same tools the first answer had:
+        # the on-disk MCP session (CLI) or the in-process tool loop (HTTP).
+        agent = DebugAgent(config, mcp_session=self._mcp_session)
         self._chat_thread = QThread()
-        self._chat_worker = _ChatWorker(agent, msg, self._session_id, history)
+        self._chat_worker = _ChatWorker(
+            agent, msg, self._session_id, history,
+            report=self._report, skill_manager=tools_mgr,
+            ctx=tools_ctx if tools_mgr is not None else None)
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_thread.started.connect(self._chat_worker.run)
         self._chat_worker.token.connect(self._on_chat_token)
+        self._chat_worker.trace.connect(self._append_trace)
         self._chat_worker.finished.connect(self._on_chat_finished)
         self._chat_worker.failed.connect(self._on_chat_failed)
+        self._chat_worker.cancelled.connect(self._on_chat_cancelled)
         self._chat_worker.finished.connect(self._chat_thread.quit)
         self._chat_worker.failed.connect(self._chat_thread.quit)
+        self._chat_worker.cancelled.connect(self._chat_thread.quit)
         self._chat_thread.finished.connect(self._chat_cleanup)
+        self._set_stop_enabled(True)
         self._chat_thread.start()
 
     def _on_chat_token(self, chunk: str) -> None:
@@ -1624,6 +2019,7 @@ class AgentPanel(QWidget):
 
     def _on_chat_finished(self, text: str) -> None:
         elapsed = self._stop_busy()
+        self._collect_agent_output()
         final = text or getattr(self, "_chat_stream_buf", "")
         # Follow-up answers get the same guardrail check as the first one.
         # They are in fact the likelier place for an unmeasured claim, since
@@ -1635,6 +2031,7 @@ class AgentPanel(QWidget):
         # Rebuild so the streamed plain text becomes linkified transcript.
         self._rebuild_chat_view()
         self._set_chat_enabled(True)
+        self._set_stop_enabled(False)
         self.status_label.setText(
             f"Reply received in {self._format_elapsed(elapsed)} — continue the "
             "conversation or re-run.")
@@ -1645,6 +2042,7 @@ class AgentPanel(QWidget):
         self._chat_turns.append(("Error", (message or "").strip()))
         self._rebuild_chat_view()
         self._set_chat_enabled(True)
+        self._set_stop_enabled(False)
         if is_cli_auth_error(message):
             self.status_label.setText(
                 "Copilot CLI is not authenticated — see the Authentication tab.")

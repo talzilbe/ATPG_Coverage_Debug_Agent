@@ -58,6 +58,8 @@ class _InvestigativeSkill(SkillBase):
                 triage=getattr(ctx, "triage", None),
                 context=getattr(ctx, "context", None),
                 design=getattr(ctx, "design", None),
+                findings=getattr(ctx, "findings", None),
+                fix_edits=getattr(ctx, "fix_edits", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -580,3 +582,111 @@ class VerifyPathsSkill(_InvestigativeSkill):
                 confidence="high",
                 recommendation=("Quote the path verbatim from a source "
                                 "artefact instead."))
+
+
+@register
+class ListOpenQuestionsSkill(_InvestigativeSkill):
+    skill_id = "list_open_questions"
+    tool_name = "list_open_questions"
+    display_name = "List Open Questions (query)"
+    description = investigate.TOOL_SPECS["list_open_questions"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"list_open_questions: {data['error']}"
+        return (f"list_open_questions: {data.get('total', 0)} question(s) "
+                "the offline analysis left open.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for q in data.get("questions", []):
+            result.add_finding(
+                title=f"[{q.get('priority')}] {q.get('subject')}: "
+                      f"{q.get('question')}",
+                description=q.get("why", ""),
+                recommendation="Settle with: " + ", ".join(
+                    q.get("suggested_tools", [])),
+                confidence="high")
+
+
+@register
+class ClassificationCrosscheckSkill(_InvestigativeSkill):
+    skill_id = "classification_crosscheck"
+    tool_name = "classification_crosscheck"
+    display_name = "Subclass vs Root-Cause Cross-check (query)"
+    description = investigate.TOOL_SPECS["classification_crosscheck"][
+        "description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"classification_crosscheck: {data['error']}"
+        t = data.get("totals", {})
+        return (f"classification_crosscheck: {t.get('agree', 0)} agree, "
+                f"{t.get('disagree', 0)} disagree, "
+                f"{t.get('unconfirmed', 0)} unconfirmed.")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        for lead in data.get("leads", []):
+            result.add_finding(
+                title=(f"{lead.get('verdict')}: {lead.get('count')} "
+                       f"{lead.get('subclass')} fault(s) resolve to "
+                       f"{lead.get('root_cause')}"),
+                description=lead.get("why_it_matters", ""),
+                evidence=list(lead.get("samples", [])),
+                affected_objects=list(lead.get("samples", [])),
+                confidence="medium")
+
+
+@register
+class RecordFindingSkill(_InvestigativeSkill):
+    skill_id = "record_finding"
+    tool_name = "record_finding"
+    display_name = "Record Finding (action)"
+    description = investigate.TOOL_SPECS["record_finding"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"record_finding: {data['error']}"
+        f = data.get("finding", {})
+        return (f"record_finding: {f.get('kind')} on {f.get('subject')} "
+                f"recorded ({data.get('count', 0)} so far).")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        if data.get("error"):
+            return
+        f = data.get("finding", {})
+        result.add_finding(
+            title=f"{f.get('kind')}: {f.get('subject')} [{f.get('field')}]",
+            description=(f"offline: {f.get('offline_value') or '-'} | agent: "
+                         f"{f.get('agent_value') or '-'}"),
+            evidence=[f.get("evidence", "")] if f.get("evidence") else [],
+            affected_objects=[f.get("subject", "")],
+            confidence=f.get("confidence", "medium"))
+
+
+@register
+class ProposeFixSkill(_InvestigativeSkill):
+    skill_id = "propose_fix"
+    tool_name = "propose_fix"
+    display_name = "Propose Fix (action)"
+    description = investigate.TOOL_SPECS["propose_fix"]["description"]
+
+    def _summarize(self, data: Dict[str, Any]) -> str:
+        if data.get("error"):
+            return f"propose_fix: {data['error']}"
+        e = data.get("edit", {})
+        return (f"propose_fix: {e.get('action')} on {e.get('subclass')} "
+                f"recorded ({data.get('edits_so_far', 0)} edit(s) so far).")
+
+    def _add_findings(self, result: SkillResult, data: Dict[str, Any]) -> None:
+        if data.get("error"):
+            return
+        e = data.get("edit", {})
+        result.add_finding(
+            title=f"fix plan {e.get('action')}: {e.get('subclass')} "
+                  f"{e.get('title') or ''}".strip(),
+            description=e.get("rationale") or e.get("note") or "",
+            evidence=[e.get("evidence", "")] if e.get("evidence") else [],
+            affected_objects=[e.get("subclass", "")],
+            recommendation="\n".join(e.get("commands") or []),
+            confidence=e.get("confidence", "medium"))
+

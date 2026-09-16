@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -24,8 +25,127 @@ from typing import Any, List, Optional, Tuple
 from .. import session
 from ..analysis import investigate
 from ..analysis.census import build_census
+from ..analysis.findings import FINDINGS_FILE, read_findings
+from ..analysis.fix_plan_edits import FIX_EDITS_FILE, read_edits
+from ..parser import netlist_cache
 
 logger = logging.getLogger(__name__)
+
+#: File the MCP server appends one line per tool call to (see mcp_server).
+TOOL_LOG_FILE = "tool_calls.jsonl"
+
+#: Seconds a stopped CLI gets to exit on SIGTERM before it is killed.
+CANCEL_GRACE_S = 3.0
+
+
+class AgentCancelled(Exception):
+    """The user stopped the turn. Distinct from a failure: whatever streamed
+    before the stop is still valid partial output and the conversation
+    survives."""
+
+
+class CancelToken:
+    """Cooperative stop signal shared between the GUI and a running turn.
+
+    The turn checks :meth:`raise_if_cancelled` at every boundary it already
+    has -- between model rounds, before each tool call, between streamed
+    chunks -- and registers the live subprocess so :meth:`cancel` can
+    terminate it instead of waiting for the read loop to notice.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def attach(self, proc: Optional[subprocess.Popen]) -> None:
+        with self._lock:
+            self._proc = proc
+        if proc is not None and self.cancelled:
+            self._terminate(proc)
+
+    def cancel(self) -> None:
+        self._event.set()
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            self._terminate(proc)
+
+    @staticmethod
+    def _terminate(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            return
+
+        def _kill_later() -> None:
+            try:
+                proc.wait(timeout=CANCEL_GRACE_S)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        threading.Thread(target=_kill_later, daemon=True).start()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise AgentCancelled("Stopped by user.")
+
+
+@dataclass
+class McpSession:
+    """The hand-off artefacts of one agent conversation, kept on disk.
+
+    The evidence, the MCP server config, the netlist pickle, the findings
+    file and the tool-call log all live in ``work_dir``. They used to be
+    deleted the moment the first answer came back, which is why a follow-up
+    question could never call a tool: the server it would have needed was
+    already gone. Now the session outlives the first turn and is closed by
+    whoever owns the conversation (the GUI panel, on a new run or on exit).
+    """
+
+    work_dir: str
+    config_path: str
+    evidence_path: str
+    netlist_path: Optional[str] = None
+
+    @property
+    def findings_path(self) -> str:
+        return os.path.join(self.work_dir, FINDINGS_FILE)
+
+    @property
+    def fix_edits_path(self) -> str:
+        return os.path.join(self.work_dir, FIX_EDITS_FILE)
+
+    @property
+    def tool_log_path(self) -> str:
+        return os.path.join(self.work_dir, TOOL_LOG_FILE)
+
+    @property
+    def alive(self) -> bool:
+        return bool(self.config_path) and os.path.isfile(self.config_path)
+
+    def extra_args(self) -> List[str]:
+        """CLI arguments that attach the tool server to a (resumed) turn."""
+        if not self.alive:
+            return []
+        return ["--additional-mcp-config", "@" + self.config_path]
+
+    def findings(self) -> List[Any]:
+        return read_findings(self.findings_path)
+
+    def fix_edits(self) -> List[Any]:
+        return read_edits(self.fix_edits_path)
+
+    def close(self) -> None:
+        session.cleanup(self.work_dir)
 
 #: Cap on the loss categories listed in the prompt. The per-fault table has a
 #: user knob, but the triage census had none, so a design with many small
@@ -232,7 +352,11 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
   F. Fix Plan Review — do not invent a parallel plan. Take the ranked plan in
      S5 and, per proposal, state agree / re-rank / reject with the reason.
      Add a proposal only for something the plan misses, and say why it is
-     missing.
+     missing. When tools are available, PUT the review INTO the plan with
+     `propose_fix`: a practical note on an entry you agree with (amend), your
+     own proposal for what the plan misses (add), or a better fix in place
+     of an offline entry (replace, with the reason). The prose here then
+     summarises what you changed; the engineer reads the plan itself.
 
 8. DECISION LOGIC
   PRECEDENCE: before applying any UC/UO/AU rule below, complete Step 5a. If
@@ -326,6 +450,29 @@ Rules for tool use:
 - Before quoting any hierarchy path in your answer, pass it through
   `verify_paths`. A shortened or reconstructed path will not resolve when the
   reader pastes it into a tool.
+- Call `list_open_questions` BEFORE choosing what to investigate. It lists
+  where the offline analysis itself recorded a weak spot -- reduced confidence,
+  a blocker only partly traced, a structurally mixed category, a truncated
+  cone, a contradiction between the ATPG tool's subclass and this tool's root
+  cause -- each with the tool that would settle it. Spend your budget there,
+  not on re-checking conclusions the analysis is already sure of.
+- `classification_crosscheck` compares the ATPG tool's own subclass with the
+  structural root cause on every mapped fault. A `disagree` pair means one
+  side is wrong or the structure is not modelled; an `unconfirmed` pair means
+  the tool named a mechanism this analysis could not find. Neither says which
+  side is right -- check a sample before you decide.
+- Every conclusion you reach that corrects, confirms or adds to the offline
+  analysis, and every question you must leave open, goes through
+  `record_finding` so it reaches the report and the saved session rather than
+  only this transcript. A correction must state the corrected value and cite
+  the tool result that supports it; the offline value is never overwritten,
+  your finding is shown beside it under your name.
+- Your fix-plan review goes INTO the plan through `propose_fix` (amend / add /
+  replace). Commands you propose are text for the engineer to run; the tool
+  runs nothing. A proposal is refused if it quotes a path not in the inputs,
+  elides a path, or predicts a coverage gain -- the same rules the offline
+  plan is held to. A replaced offline entry is kept, demoted and marked
+  superseded; nothing you propose deletes anything.
 """
 
 
@@ -420,6 +567,53 @@ class AgentConfig:
 # ---------------------------------------------------------------------------
 # Payload builder
 # ---------------------------------------------------------------------------
+#: Open questions printed in the digest; the rest are one tool call away.
+MAX_DIGEST_OPEN_QUESTIONS = 12
+
+
+def _open_questions_payload(report: Any, agentic: bool = False) -> List[str]:
+    """Where the offline analysis is weakest, so the review starts there.
+
+    Also prints the subclass/root-cause cross-check totals: a reviewer who
+    sees 25 faults the ATPG tool calls tied that this tool could not resolve
+    to a constant knows immediately where the structural model is thin.
+    """
+    lines: List[str] = []
+    agreement = getattr(report, "agreement", None)
+    questions = list(getattr(report, "open_questions", None) or [])
+    if agreement is None and not questions:
+        return lines
+
+    lines.append("## Open Questions (where the OFFLINE analysis is weakest)")
+    if agreement is not None:
+        totals = dict(getattr(agreement, "totals", {}) or {})
+        lines.append(
+            "- Subclass vs structural root cause, per mapped fault: "
+            + ", ".join(f"{k}={v}" for k, v in totals.items()))
+        lines.append(f"    {getattr(agreement, 'note', '')}")
+    if not questions:
+        lines.append("- The offline pass recorded no weak spot. That is not "
+                     "proof there is none.")
+    else:
+        lines.append(
+            f"- {len(questions)} open question(s), highest priority first "
+            "(1 = first). Spend investigation effort HERE before re-checking "
+            "conclusions the analysis is already confident about:")
+        for q in questions[:MAX_DIGEST_OPEN_QUESTIONS]:
+            tools = ", ".join(q.suggested_tools) if agentic else ""
+            lines.append(f"    [{q.priority}] {q.subject}: {q.question}")
+            lines.append(f"        why: {q.why}")
+            if tools:
+                lines.append(f"        settle with: {tools}")
+        if len(questions) > MAX_DIGEST_OPEN_QUESTIONS:
+            lines.append(
+                f"    ... {len(questions) - MAX_DIGEST_OPEN_QUESTIONS} more "
+                "(complete list: list_open_questions tool / report section "
+                "'Open Questions').")
+    lines.append("")
+    return lines
+
+
 def _triage_payload(report: Any) -> List[str]:
     """Serialise the offline triage conclusions and the ranked fix plan.
 
@@ -826,6 +1020,7 @@ def build_user_payload(report: Any, max_faults: int = 200,
     # they must be in the payload in BOTH modes -- in agentic mode the tools
     # are for drilling deeper, not for re-deriving what is already here.
     lines.extend(_triage_payload(report))
+    lines.extend(_open_questions_payload(report, agentic=agentic))
 
     # Repeated patterns
     if report.pattern_groups:
@@ -935,8 +1130,16 @@ def build_user_payload(report: Any, max_faults: int = 200,
 class DebugAgent:
     """Runs the strict debug system prompt against an OpenAI-compatible LLM."""
 
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(self, config: AgentConfig,
+                 mcp_session: Optional[McpSession] = None,
+                 cancel: Optional[CancelToken] = None) -> None:
         self.config = config
+        #: The on-disk hand-off of the current conversation. Set by an
+        #: agentic CLI run; passed back in by the owner for follow-up turns.
+        self.mcp_session: Optional[McpSession] = mcp_session
+        #: Stop signal for the turn in flight. Always present so call sites
+        #: never have to test for None.
+        self.cancel = cancel or CancelToken()
 
     def build_prompt(self, report: Any) -> str:
         """Return the full user payload (without calling any LLM)."""
@@ -998,6 +1201,8 @@ class DebugAgent:
             correct or the correction could not be made. Never raises: a
             failed correction must not lose the user their analysis.
         """
+        if self.cancel.cancelled:
+            return answer
         if not answer or report is None or not self.config.guardrail_retry:
             return answer
         try:
@@ -1087,6 +1292,28 @@ class DebugAgent:
                                            on_chunk=on_chunk)
             return self.correct_guardrail_issues(answer, report, emit)
 
+        messages: List[dict] = [
+            {"role": "system", "content": AGENTIC_SYSTEM_PROMPT},
+            {"role": "user",
+             "content": build_user_payload(report, self.config.max_faults,
+                                           agentic=True)
+             + _regression_note(getattr(ctx, "compare", None))},
+        ]
+        answer = self._tool_loop(messages, skill_manager, ctx, emit,
+                                 max_iterations=max_iterations)
+        return self.correct_guardrail_issues(answer, report, emit)
+
+    def _tool_loop(self, messages: List[dict], skill_manager: Any, ctx: Any,
+                   emit, max_iterations: int = 8, report: Any = None) -> str:
+        """Run the OpenAI-style tool-calling loop over *messages*.
+
+        *messages* is extended IN PLACE with every intermediate assistant
+        tool-call message and every tool result, so a caller that keeps a
+        conversation history (the follow-up chat) sees the evidence the model
+        gathered. The final answer is returned and NOT appended -- the caller
+        owns that message. Shared by the first answer and every follow-up so
+        the two cannot drift apart in budget, caching or error handling.
+        """
         enabled = skill_manager.enabled_skills()
         tools = [s.to_tool_schema() for s in enabled]
         skills_by_id = {s.skill_id: s for s in enabled}
@@ -1095,14 +1322,6 @@ class DebugAgent:
              "Agentic run started with NO enabled skills (enable some in the "
              "Skills tab for tool use).")
 
-        messages: List[dict] = [
-            {"role": "system", "content": AGENTIC_SYSTEM_PROMPT},
-            {"role": "user",
-             "content": build_user_payload(report, self.config.max_faults,
-                                           agentic=True)
-             + _regression_note(getattr(ctx, "compare", None))},
-        ]
-
         # Loop budget: cap total tool calls and cache identical calls so the
         # model cannot burn the budget on repeated or runaway tool use.
         max_tool_calls = max(len(tools) * 3, 12)
@@ -1110,18 +1329,19 @@ class DebugAgent:
         call_cache: dict = {}
 
         for iteration in range(1, max_iterations + 1):
+            self.cancel.raise_if_cancelled()
             emit(f"— Iteration {iteration}/{max_iterations}: asking the model…")
             message = self._post_chat(messages, tools=tools)
-            messages.append(message)
             tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
                 emit("Model returned a final answer (no tool calls).")
-                return self.correct_guardrail_issues(
-                    message.get("content") or "", report, emit)
+                return message.get("content") or ""
+            messages.append(message)
 
             budget_hit = False
             for call in tool_calls:
+                self.cancel.raise_if_cancelled()
                 fn = call.get("function", {})
                 name = fn.get("name", "")
                 raw_args = fn.get("arguments") or "{}"
@@ -1174,6 +1394,7 @@ class DebugAgent:
                 break
 
         emit("Reached max iterations — asking the model for a final answer.")
+        self.cancel.raise_if_cancelled()
         messages.append({
             "role": "user",
             "content": (
@@ -1186,31 +1407,61 @@ class DebugAgent:
                 "investigation as a complete one."),
         })
         final = self._post_chat(messages, tools=None)
-        return self.correct_guardrail_issues(
-            final.get("content") or "(no final answer produced)", report, emit)
+        return final.get("content") or "(no final answer produced)"
 
     def chat(self, message: str, session_id: Optional[str] = None,
-             history: Optional[List[dict]] = None, on_chunk=None) -> str:
+             history: Optional[List[dict]] = None, on_chunk=None,
+             report: Any = None, skill_manager: Any = None, ctx: Any = None,
+             on_event=None, max_iterations: int = 6) -> str:
         """Send a follow-up message and return the reply.
 
         CLI backend: resumes the prior CLI session (``session_id``) so the model
-        keeps the full analysis context. HTTP backend: replays ``history`` (a
-        full OpenAI messages list already including the new user turn).
+        keeps the full analysis context, and re-attaches the MCP tool server
+        when this agent holds a live :class:`McpSession` -- so a follow-up can
+        investigate, not just recall. HTTP backend: replays ``history`` (a
+        full OpenAI messages list already including the new user turn); when
+        *skill_manager* and *ctx* are given the turn runs through the same
+        tool loop as the first answer.
+
+        When *report* is given the reply gets the same guardrail correction
+        as the first answer -- follow-ups are where "how much would that
+        recover?" lands.
         """
         if not self.config.configured:
             raise RuntimeError("No LLM backend configured.")
+
+        def emit(msg: str) -> None:
+            if on_event:
+                on_event(msg)
+
         if self.config.backend == "cli":
             if not session_id:
                 raise RuntimeError(
                     "No CLI session to resume — run the agent first.")
-            return self._call_cli("", message, session_id=session_id,
-                                  resume=True, on_chunk=on_chunk)
-        if not history:
-            raise RuntimeError("No conversation history for HTTP chat.")
-        if on_chunk is not None:
-            return self._post_stream(history, on_chunk)
-        reply = self._post_chat(history, tools=None)
-        return reply.get("content") or ""
+            extra = self.mcp_session.extra_args() if self.mcp_session else []
+            if extra:
+                emit("Follow-up turn with the ATPG MCP tools attached.")
+            else:
+                emit("Follow-up turn WITHOUT tools: the model can only recall "
+                     "the first answer's evidence.")
+            answer = self._call_cli("", message, session_id=session_id,
+                                    resume=True, on_chunk=on_chunk,
+                                    extra_args=extra or None)
+        else:
+            if not history:
+                raise RuntimeError("No conversation history for HTTP chat.")
+            if skill_manager is not None and ctx is not None:
+                # history is extended in place with the tool exchange.
+                answer = self._tool_loop(history, skill_manager, ctx, emit,
+                                         max_iterations=max_iterations)
+            elif on_chunk is not None:
+                answer = self._post_stream(history, on_chunk)
+            else:
+                reply = self._post_chat(history, tools=None)
+                answer = reply.get("content") or ""
+        if report is not None:
+            answer = self.correct_guardrail_issues(answer, report, emit)
+        return answer
 
     # -- internal ------------------------------------------------------------
 
@@ -1275,18 +1526,21 @@ class DebugAgent:
         """CLI agentic run where the model drives the investigative tools via a
         local MCP server.
 
-        Serialises the analysis evidence to a temp file, writes an MCP server
-        config pointing at :mod:`atpg_coverage_debug_agent.mcp_server`, and runs
-        the Copilot CLI with that config so the model can call
+        Serialises the analysis evidence to a file, writes an MCP server
+        config pointing at :mod:`atpg_coverage_debug_agent.mcp_server`, and
+        runs the Copilot CLI with that config so the model can call
         ``list_faults`` / ``get_fault_detail`` / ``why_blocked`` /
         ``list_constraints`` / ``trace_path`` itself.
 
-        Every artefact goes into one directory named after the design and this
-        run, and is deleted when the run ends. Flat temp files from earlier
-        runs of *other* designs were being left where an agent doing
-        filesystem discovery could read them as current input; nothing in a
-        bare ``atpg_evidence_xxxx.json`` says which design it describes.
+        Every artefact goes into one directory named after the design and
+        this run. The directory is kept in :attr:`mcp_session` -- NOT deleted
+        when the answer returns -- so follow-up turns can re-attach the same
+        server, and so the parsed netlist handed over here (a pickle, or the
+        cache entry) lets those tools run the real structural machinery.
+        The owner of the conversation closes it.
         """
+        if self.mcp_session is not None:
+            self.mcp_session.close()
         sources = dict(getattr(report, "sources", None) or {})
         stamp = session.stamp(sources.get("design"), sources)
         work_dir = session.session_dir(stamp["design"], stamp["run_id"],
@@ -1304,11 +1558,16 @@ class DebugAgent:
         with open(ev_path, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)
 
+        netlist_pkl = netlist_cache.handoff_path(
+            getattr(ctx, "netlist", None), sources.get("netlist"), work_dir)
+
         server_env = {
             "PYTHONPATH": _REPO_ROOT,
             "ATPG_EVIDENCE_FILE": ev_path,
             session.SESSION_DIR_ENV: work_dir,
         }
+        if netlist_pkl:
+            server_env[netlist_cache.NETLIST_FILE_ENV] = netlist_pkl
         if self.config.cli_home.strip():
             server_env["COPILOT_HOME"] = self.config.cli_home.strip()
         mcp_cfg = {
@@ -1325,6 +1584,9 @@ class DebugAgent:
         cfg_path = os.path.join(work_dir, "mcp-config.json")
         with open(cfg_path, "w", encoding="utf-8") as fh:
             json.dump(mcp_cfg, fh)
+        self.mcp_session = McpSession(work_dir=work_dir, config_path=cfg_path,
+                                      evidence_path=ev_path,
+                                      netlist_path=netlist_pkl)
 
         tool_names = ", ".join(investigate.TOOL_SPECS)
         payload = build_user_payload(report, self.config.max_faults,
@@ -1337,17 +1599,24 @@ class DebugAgent:
             "(e.g. list_faults(fault_class='UO'), get_fault_detail(fault=...), "
             "why_blocked(fault=...), trace_path(from_instance=..., "
             "to_instance=...)). Every result is Observed/Derived structural "
-            "fact. When you have enough evidence, produce the full A-F report.")
+            "fact. "
+            + ("The parsed netlist IS available to these tools in this "
+               "session, so scan_status / trace_path / verify_paths answer "
+               "from the design itself. " if netlist_pkl else
+               "The parsed netlist could not be handed to the tools in this "
+               "session; they answer from recorded evidence. ")
+            + "Start with list_open_questions, record what you establish with "
+            "record_finding, and when you have enough evidence produce the "
+            "full A-F report.")
         payload += _regression_note(getattr(ctx, "compare", None))
 
         emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")
-        try:
-            return self._call_cli(
-                AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
-                extra_args=["--additional-mcp-config", "@" + cfg_path],
-                on_chunk=on_chunk)
-        finally:
-            session.cleanup(work_dir)
+        emit("Netlist handed to the tools: "
+             + (netlist_pkl or "NO (tools answer from recorded evidence)"))
+        return self._call_cli(
+            AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
+            extra_args=["--additional-mcp-config", "@" + cfg_path],
+            on_chunk=on_chunk)
 
     def _call_cli(self, system_prompt: str, user_payload: str,
                   session_id: Optional[str] = None,
@@ -1407,38 +1676,20 @@ class DebugAgent:
         if extra_args:
             cmd += list(extra_args)
 
-        if on_chunk is not None:
-            return self._call_cli_streaming(cmd, env, scratch, on_chunk)
-
-        try:
-            proc = subprocess.run(
-                cmd, env=env, capture_output=True, text=True,
-                timeout=self.config.timeout,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Copilot CLI timed out after {self.config.timeout}s") from exc
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip()
-            raise RuntimeError(
-                f"Copilot CLI exited {proc.returncode}: {err[:800]}")
-        out = (proc.stdout or "").strip()
-        if not out:
-            err = (proc.stderr or "").strip()
-            raise RuntimeError(
-                "Copilot CLI returned no output."
-                + (f" stderr: {err[:400]}" if err else ""))
-        return out
+        # Every CLI call goes through Popen so a Stop can terminate it; the
+        # non-streaming path simply collects instead of forwarding chunks.
+        self.cancel.raise_if_cancelled()
+        return self._call_cli_streaming(cmd, env, scratch, on_chunk)
 
     def _call_cli_streaming(self, cmd: List[str], env: dict, scratch: str,
-                            on_chunk) -> str:
+                            on_chunk=None) -> str:
         """Run the CLI with :class:`subprocess.Popen`, emitting stdout as it
-        arrives via *on_chunk*, and return the full accumulated text."""
+        arrives via *on_chunk* (when given), and return the full text.
+
+        The process is registered with the cancel token, so a Stop
+        terminates it; the partial text is then raised inside
+        :class:`AgentCancelled` so the caller can keep what arrived.
+        """
         parts: List[str] = []
         try:
             proc = subprocess.Popen(
@@ -1447,12 +1698,14 @@ class DebugAgent:
         except FileNotFoundError as exc:
             shutil.rmtree(scratch, ignore_errors=True)
             raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+        self.cancel.attach(proc)
         try:
             assert proc.stdout is not None
             for chunk in iter(lambda: proc.stdout.read(80), ""):
                 if chunk:
                     parts.append(chunk)
-                    on_chunk(chunk)
+                    if on_chunk is not None:
+                        on_chunk(chunk)
             try:
                 proc.wait(timeout=self.config.timeout)
             except subprocess.TimeoutExpired as exc:
@@ -1461,8 +1714,11 @@ class DebugAgent:
                     f"Copilot CLI timed out after {self.config.timeout}s") from exc
             err = (proc.stderr.read() if proc.stderr else "") or ""
         finally:
+            self.cancel.attach(None)
             shutil.rmtree(scratch, ignore_errors=True)
 
+        if self.cancel.cancelled:
+            raise AgentCancelled("".join(parts).strip())
         if proc.returncode not in (0, None):
             detail = (err or "".join(parts)).strip()
             raise RuntimeError(
@@ -1532,6 +1788,8 @@ class DebugAgent:
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
                 for raw_line in resp:
+                    if self.cancel.cancelled:
+                        raise AgentCancelled("".join(parts))
                     line = raw_line.decode("utf-8", "replace").strip()
                     if not line or not line.startswith("data:"):
                         continue

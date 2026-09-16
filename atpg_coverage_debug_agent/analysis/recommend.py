@@ -58,6 +58,19 @@ class Recommendation:
     caveats: List[str] = field(default_factory=list)
     actionable: str = "partial"
     hotspot: str = ""
+    #: ``offline`` for the deterministic plan, ``agent`` for a proposal the
+    #: AI agent added or substituted during its review.
+    origin: str = "offline"
+    #: Practical notes the agent attached to this entry. Shown beside the
+    #: offline rationale, never merged into it.
+    agent_notes: List[str] = field(default_factory=list)
+    #: Rank of the agent proposal that superseded this entry, when one did.
+    #: The entry stays visible (demoted) so the offline plan stays auditable.
+    superseded_by: Optional[int] = None
+    #: Rank of the offline entry this agent proposal replaced, when it did.
+    supersedes: Optional[int] = None
+    #: Why the agent replaced the offline entry.
+    edit_reason: str = ""
 
     @property
     def title(self) -> str:
@@ -67,6 +80,10 @@ class Recommendation:
     def requires_measurement(self) -> bool:
         """True when the benefit must be measured rather than estimated."""
         return self.fix.requires_measurement
+
+    @property
+    def superseded(self) -> bool:
+        return self.superseded_by is not None
 
     def as_dict(self) -> Dict[str, object]:
         """Plain-dict view for serialisation and tool responses."""
@@ -89,6 +106,11 @@ class Recommendation:
             "hotspot": self.hotspot,
             "evidence": list(self.evidence),
             "caveats": list(self.caveats),
+            "origin": self.origin,
+            "agent_notes": list(self.agent_notes),
+            "superseded_by": self.superseded_by,
+            "supersedes": self.supersedes,
+            "edit_reason": self.edit_reason,
         }
 
 

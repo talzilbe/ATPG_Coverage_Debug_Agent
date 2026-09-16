@@ -1100,7 +1100,81 @@ def _section_triage(report: AnalysisReport,
     parts.append(_triage_hotspots(selected))
     parts.append(_triage_blocking(selected))
     parts.append(_triage_profiles(selected))
+    parts.append(_triage_crosscheck(report))
+    parts.append(_open_questions_html(report))
     return "".join(parts)
+
+
+def _triage_crosscheck(report: AnalysisReport) -> str:
+    """4.6 -- the ATPG tool's subclass against this tool's root cause.
+
+    Only the pairs that matter are tabled: contradictions and the mechanisms
+    the ATPG tool named that this tool could not find. Agreements are counted
+    in the totals line; listing them would be the report agreeing with itself.
+    """
+    agreement = getattr(report, "agreement", None)
+    if agreement is None:
+        return ""
+    totals = dict(getattr(agreement, "totals", {}) or {})
+    leads = list(getattr(agreement, "leads", None) or [])
+    blocks = ["<h3>4.6 Does the structural root cause agree with the ATPG "
+              "tool's subclass?</h3>",
+              _callout("info", _esc(getattr(agreement, "note", "")))]
+    blocks.append(
+        "<p>" + " &nbsp;|&nbsp; ".join(
+            f"<b>{_esc(k)}</b>: {_fmt(v)}" for k, v in totals.items())
+        + "</p>")
+    if not leads:
+        return "".join(blocks)
+    rows = []
+    for lead in leads:
+        samples = "<br/>".join(
+            f"<code>{_esc(s)}</code>" for s in lead.get("samples", []))
+        rows.append(
+            "<tr>"
+            f"<td>{_esc(lead.get('verdict', ''))}</td>"
+            f"<td><code>{_esc(lead.get('subclass', ''))}</code></td>"
+            f"<td><code>{_esc(lead.get('root_cause', ''))}</code></td>"
+            f"<td class='num'>{_fmt(lead.get('count', 0))}</td>"
+            f"<td>{_esc(lead.get('why_it_matters', ''))}</td>"
+            f"<td>{samples}</td>"
+            "</tr>")
+    blocks.append(
+        "<table><thead><tr><th>Verdict</th><th>ATPG subclass</th>"
+        "<th>Structural root cause</th><th class='num'>Faults</th>"
+        "<th>Why it matters</th><th>Sample faults (verbatim)</th></tr>"
+        "</thead><tbody>" + "".join(rows) + "</tbody></table>")
+    return "".join(blocks)
+
+
+def _open_questions_html(report: AnalysisReport) -> str:
+    """4.7 -- where this analysis is least sure, for whoever reviews it."""
+    questions = list(getattr(report, "open_questions", None) or [])
+    if not questions:
+        return ""
+    rows = []
+    for q in questions:
+        d = q.as_dict() if hasattr(q, "as_dict") else dict(q)
+        rows.append(
+            "<tr>"
+            f"<td class='num'>{_esc(d.get('priority', ''))}</td>"
+            f"<td><code>{_esc(d.get('subject', ''))}</code></td>"
+            f"<td>{_esc(d.get('question', ''))}</td>"
+            f"<td>{_esc(d.get('why', ''))}</td>"
+            f"<td>{_esc(', '.join(d.get('suggested_tools') or []))}</td>"
+            "</tr>")
+    return (
+        "<h3>4.7 Open questions this analysis leaves for the reviewer</h3>"
+        + _callout("warn",
+                   "Every row below is a place where this report itself "
+                   "recorded reduced confidence, a partial picture, a mixed "
+                   "verdict, an unreconciled figure or a contradiction. "
+                   "They are ordered by priority (1 = first) and each names "
+                   "the agent tool that would settle it. None of them is a "
+                   "conclusion.")
+        + "<table><thead><tr><th class='num'>Pri.</th><th>Subject</th>"
+          "<th>Question</th><th>Why it is open</th><th>Settle with</th></tr>"
+          "</thead><tbody>" + "".join(rows) + "</tbody></table>")
 
 
 def _dump_links_html(dump: Any) -> str:
@@ -1248,8 +1322,16 @@ def _triage_profiles(selected: List) -> str:
 
 
 def _section_fix_plan(report: AnalysisReport) -> str:
-    """Render the ranked fix proposals with their evidence and commands."""
-    recommendations = getattr(report, "recommendations", None) or []
+    """Render the ranked fix proposals with their evidence and commands.
+
+    The plan shown is the offline plan with the AI agent's edits overlaid:
+    agent proposals are marked as such, amended entries carry the agent's
+    note beside the offline rationale, and a superseded offline entry stays
+    in the list (demoted) so the deterministic plan remains auditable.
+    """
+    from ..analysis.fix_plan_edits import effective_plan
+
+    recommendations = effective_plan(report)
     heading = "<h2>5. Fix Plan</h2>"
     if not recommendations:
         return ""
@@ -1260,10 +1342,28 @@ def _section_fix_plan(report: AnalysisReport) -> str:
         "tool never executes them. Where an action is marked as needing "
         "measurement, <b>no coverage gain is predicted</b> &mdash; the re-run "
         "is what establishes the benefit.")]
+    agent_edits = sum(1 for r in recommendations
+                      if r.origin == "agent" or r.agent_notes)
+    if agent_edits:
+        parts.append(_callout(
+            "warn",
+            f"<b>The AI agent contributed to this plan</b> ({agent_edits} "
+            "entr(y/ies) added, amended or replaced). Its entries are marked "
+            "<i>[agent]</i>; a superseded offline entry is kept at the end "
+            "for reference. Verify agent proposals before acting on them."))
 
     for rec in recommendations:
+        status = ""
+        if rec.superseded:
+            status = (f" <span style='color:#a00; font-weight:normal;'>"
+                      f"(superseded by #{rec.superseded_by})</span>")
+        elif rec.origin == "agent":
+            status = (" <span style='color:#0a4d8c; font-weight:normal;'>"
+                      "(AI agent proposal"
+                      + (f", replaces #{rec.supersedes}" if rec.supersedes
+                         else "") + ")</span>")
         detail = [
-            f"<h3>5.{rec.rank} {_esc(rec.title)}</h3>",
+            f"<h3>5.{rec.rank} {_esc(rec.title)}{status}</h3>",
             f"<p><b>Category:</b> <code>{_esc(rec.subclass_id)}</code> "
             f"({_fmt(rec.fault_count)} faults, {rec.pct:.2f}%)"
             f" &nbsp;&middot;&nbsp; <b>worth acting on:</b> "
@@ -1273,10 +1373,20 @@ def _section_fix_plan(report: AnalysisReport) -> str:
             f" &nbsp;&middot;&nbsp; <b>effort / risk:</b> "
             f"{_esc(rec.fix.effort)} / {_esc(rec.fix.risk)}</p>",
         ]
+        if rec.edit_reason:
+            detail.append(f"<p><b>Why the agent prefers this:</b> "
+                          f"{_esc(rec.edit_reason)}</p>")
         if rec.hotspot:
             detail.append(f"<p><b>Concentrated under:</b> "
                           f"<code>{_esc(rec.hotspot)}</code></p>")
         detail.append(f"<p><b>Why:</b> {_esc(rec.fix.rationale)}</p>")
+        if rec.agent_notes:
+            detail.append(
+                "<div style='background:#f3eefc; border-left:3px solid "
+                "#5a3d8c; padding:6px 10px; margin:6px 0;'>"
+                "<b>Agent's practical note(s):</b><ul>"
+                + "".join(f"<li>{_esc(n)}</li>" for n in rec.agent_notes)
+                + "</ul></div>")
         if rec.fix.preconditions:
             detail.append("<p><b>Confirm first:</b></p><ul>" + "".join(
                 f"<li>{_esc(p)}</li>" for p in rec.fix.preconditions) + "</ul>")
@@ -1492,7 +1602,7 @@ def _section_conclusions(report: AnalysisReport) -> str:
             "coverage-loss fault either failed to map onto the netlist or is "
             "held at a hard constant &mdash; see &sect;3. Close those gaps "
             "before drawing a conclusion about the dominant mechanism.")
-        return heading + body + _footer()
+        return heading + body + _agent_review_html(report) + _footer()
 
     total_actionable = len(actionable)
     top_rc, top_results = next(iter(groups.items()))
@@ -1522,7 +1632,47 @@ def _section_conclusions(report: AnalysisReport) -> str:
             f"fix them before treating this ranking as the design's real "
             f"coverage profile.")
 
-    return heading + primary + caveat + _visualizer_html(report) + _footer()
+    return (heading + primary + caveat + _visualizer_html(report)
+            + _agent_review_html(report) + _footer())
+
+
+def _agent_review_html(report: AnalysisReport) -> str:
+    """9.2 -- the structured findings the AI agent recorded, if any.
+
+    Each finding is attributed and sits beside the offline value it refers
+    to; nothing here replaced anything the deterministic pass computed.
+    """
+    investigation = getattr(report, "investigation", None) or {}
+    findings = list(investigation.get("findings") or []) \
+        if isinstance(investigation, dict) else []
+    if not findings:
+        return ""
+    rows = []
+    for f in findings:
+        verified = "" if f.get("subject_verified", True) else \
+            " <span style='color:#a00;'>(subject not found in this report)</span>"
+        rows.append(
+            "<tr>"
+            f"<td>{_esc(f.get('kind', ''))}</td>"
+            f"<td><code>{_esc(f.get('subject', ''))}</code>{verified}</td>"
+            f"<td>{_esc(f.get('field', ''))}</td>"
+            f"<td>{_esc(f.get('offline_value', '') or _DASH)}</td>"
+            f"<td>{_esc(f.get('agent_value', '') or _DASH)}</td>"
+            f"<td>{_esc(f.get('evidence', ''))}</td>"
+            f"<td>{_esc(f.get('confidence', ''))}</td>"
+            "</tr>")
+    return (
+        "<h3>9.2 Agent review &mdash; structured findings</h3>"
+        + _callout("info",
+                   f"The AI agent recorded {len(findings)} finding(s) while "
+                   "reviewing this analysis. The offline value is shown "
+                   "beside the agent's; neither replaces the other. A "
+                   "<i>correction</i> is the agent's reading, supported by "
+                   "the evidence it cites &mdash; verify before acting.")
+        + "<table><thead><tr><th>Kind</th><th>Subject</th><th>Field</th>"
+          "<th>Offline value</th><th>Agent value</th><th>Evidence</th>"
+          "<th>Confidence</th></tr></thead><tbody>"
+        + "".join(rows) + "</tbody></table>")
 
 
 def _visualizer_html(report: AnalysisReport) -> str:

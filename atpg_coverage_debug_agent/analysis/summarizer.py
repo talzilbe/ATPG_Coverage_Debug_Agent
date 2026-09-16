@@ -308,4 +308,13 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
     if census_issues:
         report.warnings.extend(census_issues)
         report.summary.warnings = list(report.warnings)
+
+    # Compare the ATPG tool's own subclass with the structural root cause on
+    # every mapped fault, then turn every recorded weak spot -- reduced
+    # confidence, partial attribution, mixed profile, contradiction -- into
+    # an ordered list of questions the reviewer should spend its budget on.
+    from .agreement import cross_check
+    from .open_questions import build_open_questions
+    report.agreement = cross_check(results)
+    report.open_questions = build_open_questions(report)
     return report

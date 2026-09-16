@@ -347,6 +347,377 @@ def popout(panel_with_report):
         panel._toggle_popout(box, "Assembled Prompt")
 
 
+# ---------------------------------------------------------------------------
+# The chat box carries its own busy indicator (for when it is popped out)
+# ---------------------------------------------------------------------------
+def test_chat_busy_indicator_is_mirrored_into_the_chat_box(panel_with_report):
+    panel, _rep = panel_with_report
+    assert not panel.chat_status_label.isVisibleTo(panel)
+
+    panel._start_busy("Agent is replying", chat=True)
+    assert panel.chat_status_label.isVisibleTo(panel)
+    first = panel.chat_status_label.text()
+    panel._tick_busy()
+    second = panel.chat_status_label.text()
+    assert first != second and "Agent is replying" in second
+    assert second == panel.status_label.text(), "same line in both places"
+
+    panel._chat_backend = "cli"
+    panel._chat_turns = []
+    panel._on_chat_finished("reply")
+    assert not panel.chat_status_label.isVisibleTo(panel)
+    assert panel.chat_status_label.text() == ""
+
+
+def test_the_chat_indicator_lives_inside_the_popped_out_chat_window(
+        panel_with_report):
+    """The whole point: when the chat box is in its own window, the busy
+    line must travel with it, not stay behind on the main tab."""
+    panel, _rep = panel_with_report
+    box = panel._chat_box
+    panel._toggle_popout(box, "Follow-up Chat with the Agent")
+    try:
+        dlg, _btn = panel._popouts[box]
+        assert panel.chat_status_label.window() is dlg
+        assert panel.status_label.window() is not dlg
+        panel._start_busy("Agent is replying", chat=True)
+        assert panel.chat_status_label.isVisibleTo(dlg)
+        assert "Agent is replying" in panel.chat_status_label.text()
+        panel._stop_busy()
+    finally:
+        if box in panel._popouts:
+            panel._toggle_popout(box, "Follow-up Chat with the Agent")
+    assert panel.chat_status_label.window() is panel.window()
+
+
+def test_a_main_run_does_not_light_the_chat_indicator(panel_with_report):
+    panel, _rep = panel_with_report
+    panel._start_busy("Calling the LLM")
+    assert not panel.chat_status_label.isVisibleTo(panel)
+    panel._stop_busy()
+
+
+def test_on_send_chat_uses_the_chat_indicator(panel_with_report, monkeypatch):
+    panel, _rep = panel_with_report
+    from PySide6.QtCore import QThread
+    started = []
+    monkeypatch.setattr(QThread, "start", lambda self, *a: started.append(1))
+    panel._session_id = "sid"
+    panel._chat_backend = "cli"
+    panel.cli_path_edit.setText(__file__)  # any existing file "configures" it
+    panel._set_chat_enabled(True)
+    panel.chat_input.setText("why?")
+    panel.on_send_chat()
+    assert started, "a chat worker thread was set up"
+    assert panel._busy_chat is True
+    assert panel.chat_status_label.isVisibleTo(panel)
+    panel._stop_busy()
+    panel._chat_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Findings and the tool-call log reach the panel
+# ---------------------------------------------------------------------------
+def test_findings_are_collected_persisted_and_restored(panel_with_report,
+                                                       tmp_path):
+    from atpg_coverage_debug_agent.agent.debug_agent import McpSession
+    from atpg_coverage_debug_agent.analysis.findings import (
+        Finding,
+        FindingsSink,
+    )
+    panel, rep = panel_with_report
+    fo = rep.fault_results[0].fault.fault_object
+
+    # CLI route: findings written by the MCP server into the session dir.
+    sess = McpSession(work_dir=str(tmp_path), config_path="", evidence_path="")
+    FindingsSink(sess.findings_path).record(
+        Finding(kind="correction", subject=fo, field="root_cause",
+                agent_value="tied", evidence="why_blocked"))
+    # HTTP route: the in-process sink.
+    panel._findings_sink = FindingsSink()
+    panel._findings_sink.record(Finding(kind="gap", subject="AU.TC"))
+    panel._mcp_session = sess
+
+    emitted = []
+    panel.findings_changed.connect(emitted.append)
+    panel._collect_findings()
+    kinds = sorted(f["kind"] for f in panel.current_findings())
+    assert kinds == ["correction", "gap"]
+    assert emitted and len(emitted[-1]) == 2
+    assert "structured finding(s) recorded" in panel.trace_view.toPlainText()
+
+    # Collecting again does not duplicate.
+    panel._collect_findings()
+    assert len(panel.current_findings()) == 2
+
+    data = panel.export_investigation()
+    assert len(data["findings"]) == 2
+    fresh = AgentPanel()
+    try:
+        fresh.set_report(rep, None)
+        fresh.import_investigation(data)
+        assert len(fresh.current_findings()) == 2
+        fresh.import_investigation(None)
+        assert fresh.current_findings() == []
+    finally:
+        fresh.shutdown()
+    panel._mcp_session = None
+
+
+def test_tool_calls_logged_by_the_server_are_tailed_into_the_trace(
+        panel_with_report, tmp_path):
+    import json
+    from atpg_coverage_debug_agent.agent.debug_agent import McpSession
+    panel, _rep = panel_with_report
+    sess = McpSession(work_dir=str(tmp_path), config_path="", evidence_path="")
+    panel._mcp_session = sess
+    panel._tool_log_offset = 0
+    panel._tool_log_calls = 0
+    with open(sess.tool_log_path, "w") as fh:
+        fh.write(json.dumps({"ts": "01:02:03", "tool": "list_faults",
+                             "args": {"limit": 2}, "ok": True, "chars": 10,
+                             "truncated": False, "ms": 1.5}) + "\n")
+    panel._poll_tool_log()
+    text = panel.trace_view.toPlainText()
+    assert "MCP tool call #1: list_faults(limit=2)" in text
+
+    # Only NEW lines are appended on the next poll.
+    with open(sess.tool_log_path, "a") as fh:
+        fh.write(json.dumps({"ts": "01:02:04", "tool": "scan_status",
+                             "args": {"target": "x"}, "ok": False, "chars": 0,
+                             "truncated": True, "ms": 2}) + "\n")
+    panel._poll_tool_log()
+    text = panel.trace_view.toPlainText()
+    assert text.count("list_faults(limit=2)") == 1
+    assert "MCP tool call #2: scan_status(target=x)" in text
+    assert "error" in text and "truncated" in text
+    panel._mcp_session = None
+
+
+def test_a_new_session_closes_the_previous_mcp_session(panel_with_report,
+                                                       tmp_path):
+    from atpg_coverage_debug_agent import session
+    from atpg_coverage_debug_agent.agent.debug_agent import (
+        AgentConfig,
+        McpSession,
+    )
+    panel, _rep = panel_with_report
+    work = session.session_dir("panel_test", "run-x", reuse_env=False)
+    cfg = os.path.join(work, "mcp-config.json")
+    open(cfg, "w").write("{}")
+    panel._mcp_session = McpSession(work_dir=work, config_path=cfg,
+                                    evidence_path="")
+    panel._begin_session(AgentConfig(backend="cli", cli_path=__file__),
+                         agentic=True)
+    assert panel._mcp_session is None
+    assert not os.path.isdir(work)
+    assert panel._findings_sink is not None and panel._chat_agentic is True
+
+
+def test_prefilled_question_only_names_tools_when_the_chat_has_them(
+        panel_with_report):
+    panel, rep = panel_with_report
+    fo = rep.fault_results[0].fault.fault_object
+    panel._chat_agentic = False
+    panel.ask_about_fault(fo)
+    assert "why_blocked" not in panel.chat_input.text()
+    panel._chat_agentic = True
+    panel.ask_about_fault(fo)
+    assert "why_blocked" in panel.chat_input.text()
+
+
+# ---------------------------------------------------------------------------
+# Stop: the turn ends, the conversation survives
+# ---------------------------------------------------------------------------
+def test_stop_buttons_are_disabled_until_a_turn_runs(panel_with_report):
+    panel, _rep = panel_with_report
+    assert not panel.stop_btn.isEnabled()
+    assert not panel.chat_stop_btn.isEnabled()
+    panel.on_stop()
+    assert "Nothing is running" in panel.status_label.text()
+
+
+def test_the_chat_row_stop_lives_in_the_chat_box(panel_with_report):
+    panel, _rep = panel_with_report
+    box = panel._chat_box
+    panel._toggle_popout(box, "Follow-up Chat with the Agent")
+    try:
+        dlg, _btn = panel._popouts[box]
+        assert panel.chat_stop_btn.window() is dlg
+    finally:
+        if box in panel._popouts:
+            panel._toggle_popout(box, "Follow-up Chat with the Agent")
+
+
+def test_sending_a_chat_enables_stop_and_stop_cancels_the_worker(
+        panel_with_report, monkeypatch):
+    panel, _rep = panel_with_report
+    from PySide6.QtCore import QThread
+    monkeypatch.setattr(QThread, "start", lambda self, *a: None)
+    panel._session_id = "sid"
+    panel._chat_backend = "cli"
+    panel.cli_path_edit.setText(__file__)
+    panel._set_chat_enabled(True)
+    panel.chat_input.setText("why?")
+    panel.on_send_chat()
+    assert panel.stop_btn.isEnabled() and panel.chat_stop_btn.isEnabled()
+    worker = panel._chat_worker
+    assert worker is not None and not worker._agent.cancel.cancelled
+    panel.on_stop()
+    assert worker._agent.cancel.cancelled
+    assert not panel.stop_btn.isEnabled()
+    assert "Stopping" in panel._busy_message
+    panel._on_chat_cancelled("half a reply")
+    panel._chat_thread = None
+    panel._chat_worker = None
+
+
+def test_a_stopped_run_keeps_the_partial_answer_and_the_conversation(
+        panel_with_report):
+    panel, _rep = panel_with_report
+    panel._chat_backend = "cli"
+    panel._chat_agentic = False
+    panel._start_busy("Calling the LLM")
+    panel._set_stop_enabled(True)
+    panel.run_btn.setEnabled(False)
+    panel._on_cancelled("first half of the diagnosis")
+    text = panel.response_view.toPlainText()
+    assert "first half of the diagnosis" in text
+    assert "Stopped by user" in text and "PARTIAL" in text
+    assert not panel._busy_timer.isActive()
+    assert panel.run_btn.isEnabled()
+    assert not panel.stop_btn.isEnabled()
+    assert panel.chat_input.isEnabled(), "the conversation stays open"
+    assert "Stopped by user after" in panel.status_label.text()
+    assert "stopped by user" in panel.chat_view.toPlainText()
+
+
+def test_a_stop_with_no_output_says_so(panel_with_report):
+    panel, _rep = panel_with_report
+    panel._chat_backend = "cli"
+    panel._stream_buf = ""
+    panel._start_busy("Calling the LLM")
+    panel._on_cancelled("")
+    assert "before any output" in panel.response_view.toPlainText()
+
+
+def test_a_stopped_chat_reply_is_kept_as_a_turn(panel_with_report):
+    panel, _rep = panel_with_report
+    panel._chat_backend = "http"
+    panel._chat_messages = []
+    panel._chat_turns = [("You", "why?")]
+    panel._start_busy("Agent is replying", chat=True)
+    panel._on_chat_cancelled("partial reply")
+    assert panel._chat_turns[-1][0] == "Agent"
+    assert "partial reply" in panel._chat_turns[-1][1]
+    assert "stopped by user" in panel._chat_turns[-1][1]
+    assert panel._chat_messages[-1] == {"role": "assistant",
+                                        "content": "partial reply"}
+    assert panel.chat_input.isEnabled()
+    assert not panel.chat_status_label.isVisibleTo(panel)
+    assert "Reply stopped after" in panel.status_label.text()
+
+
+def test_worker_reports_a_cancel_as_cancelled_not_failed(panel_with_report):
+    from atpg_coverage_debug_agent.agent.debug_agent import AgentCancelled
+    from atpg_coverage_debug_agent.gui.agent_panel import _AgentWorker
+
+    class _Agent:
+        class cancel:  # noqa: N801 - mimics DebugAgent.cancel
+            @staticmethod
+            def cancel():
+                pass
+
+        def run(self, report, session_id=None, on_chunk=None):
+            raise AgentCancelled("partial")
+
+    worker = _AgentWorker(_Agent(), None)
+    got = {}
+    worker.cancelled.connect(lambda t: got.setdefault("cancelled", t))
+    worker.failed.connect(lambda t: got.setdefault("failed", t))
+    worker.run()
+    assert got == {"cancelled": "partial"}
+
+
+# ---------------------------------------------------------------------------
+# Fix-plan edits reach the panel and the triage tab
+# ---------------------------------------------------------------------------
+def test_fix_plan_edits_are_collected_and_persisted(panel_with_report,
+                                                    tmp_path):
+    from atpg_coverage_debug_agent.agent.debug_agent import McpSession
+    from atpg_coverage_debug_agent.analysis.fix_plan_edits import (
+        FixEditsSink,
+        FixPlanEdit,
+    )
+    panel, rep = panel_with_report
+    sess = McpSession(work_dir=str(tmp_path), config_path="", evidence_path="")
+    FixEditsSink(sess.fix_edits_path).record(
+        FixPlanEdit(action="amend", subclass="UO", target_rank=1, note="n"))
+    panel._fix_edits_sink = FixEditsSink()
+    panel._fix_edits_sink.record(
+        FixPlanEdit(action="add", subclass="UO", title="T", rationale="r",
+                    evidence="e"))
+    panel._mcp_session = sess
+
+    emitted = []
+    panel.fix_plan_changed.connect(emitted.append)
+    panel._collect_fix_edits()
+    assert sorted(e["action"] for e in panel.current_fix_edits()) == \
+        ["add", "amend"]
+    assert emitted and len(emitted[-1]) == 2
+    assert "fix-plan edit(s) recorded" in panel.trace_view.toPlainText()
+    panel._collect_fix_edits()
+    assert len(panel.current_fix_edits()) == 2
+
+    data = panel.export_investigation()
+    assert len(data["fix_plan_edits"]) == 2
+    fresh = AgentPanel()
+    try:
+        fresh.set_report(rep, None)
+        fresh.import_investigation(data)
+        assert len(fresh.current_fix_edits()) == 2
+        fresh.import_investigation(None)
+        assert fresh.current_fix_edits() == []
+    finally:
+        fresh.shutdown()
+    panel._mcp_session = None
+
+
+def test_triage_tab_shows_the_agents_edits(qapp):
+    from atpg_coverage_debug_agent.gui.triage_panel import TriagePanel
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data = os.path.join(here, "sample_data")
+    rep = run_analysis(os.path.join(data, "demo_netlist.v"),
+                       os.path.join(data, "demo_faults.mtfi"),
+                       os.path.join(data, "demo_constraints.do"))
+    base_count = len(rep.recommendations)
+    tp = TriagePanel()
+    tp.set_report(rep)
+    assert tp.fix_list.count() == base_count
+
+    rep.investigation = {"fix_plan_edits": [
+        {"action": "amend", "subclass": rep.recommendations[0].subclass_id,
+         "target_rank": 1, "note": "do the what-if first"},
+        {"action": "replace", "subclass": rep.recommendations[1].subclass_id,
+         "target_rank": 2, "title": "Better", "rationale": "r",
+         "reason": "cheaper", "evidence": "e"},
+    ]}
+    tp.refresh_fix_plan()
+    labels = [tp.fix_list.item(i).text() for i in range(tp.fix_list.count())]
+    assert tp.fix_list.count() == base_count + 1
+    assert labels[0].startswith("1. [amended]")
+    assert "[agent] Better" in labels[1]
+    assert labels[-1].startswith(f"{base_count + 1}. [superseded]")
+
+    tp.fix_list.setCurrentRow(0)
+    assert "do the what-if first" in tp.fix_detail.toPlainText()
+    tp.fix_list.setCurrentRow(1)
+    detail = tp.fix_detail.toPlainText()
+    assert "Proposed by the AI agent" in detail and "cheaper" in detail
+    tp.fix_list.setCurrentRow(tp.fix_list.count() - 1)
+    assert "Superseded" in tp.fix_detail.toPlainText()
+
+
 def test_popout_asks_for_real_window_controls(popout):
     """A plain QDialog frame often has no maximise button at all."""
     from PySide6.QtCore import Qt

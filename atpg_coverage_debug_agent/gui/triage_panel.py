@@ -228,16 +228,30 @@ class TriagePanel(QWidget):
     # -- population -------------------------------------------------------
     def set_report(self, report: Any) -> None:
         """Populate every view from *report*, or clear when it has no triage."""
+        from ..analysis.fix_plan_edits import effective_plan
+
         self._report = report
         self._categories = list(getattr(report, "selected_categories", None)
                                 or [])
-        self._recommendations = list(getattr(report, "recommendations", None)
-                                     or [])
+        # The plan shown is the offline plan with the agent's edits overlaid.
+        self._recommendations = list(effective_plan(report))
         self._populate_totals(report)
         self._populate_categories()
         self._populate_clusters()
         self._populate_fixes()
         self.export_categories_btn.setEnabled(bool(self._categories))
+
+    def refresh_fix_plan(self) -> None:
+        """Re-read the fix plan (after the agent recorded an edit)."""
+        if self._report is None:
+            return
+        from ..analysis.fix_plan_edits import effective_plan
+
+        current = self.fix_list.currentRow()
+        self._recommendations = list(effective_plan(self._report))
+        self._populate_fixes()
+        if 0 <= current < self.fix_list.count():
+            self.fix_list.setCurrentRow(current)
 
     def clear(self) -> None:
         """Reset every view to its empty state."""
@@ -536,10 +550,26 @@ class TriagePanel(QWidget):
     def _populate_fixes(self) -> None:
         self.fix_list.clear()
         for rec in self._recommendations:
-            entry = QListWidgetItem(
-                f"{rec.rank}. [{rec.subclass_id}] {rec.title}")
-            entry.setToolTip(f"{rec.fault_count} fault(s) · "
-                             f"{rec.confidence.value} confidence")
+            label = f"{rec.rank}. [{rec.subclass_id}] {rec.title}"
+            tip = (f"{rec.fault_count} fault(s) · "
+                   f"{rec.confidence.value} confidence")
+            if rec.superseded:
+                label = f"{rec.rank}. [superseded] [{rec.subclass_id}] {rec.title}"
+                tip += (f" · superseded by agent proposal "
+                        f"#{rec.superseded_by}; kept for reference")
+            elif rec.origin == "agent":
+                tip += " · proposed by the AI agent; verify before acting"
+            elif rec.agent_notes:
+                label = f"{rec.rank}. [amended] [{rec.subclass_id}] {rec.title}"
+                tip += f" · {len(rec.agent_notes)} agent note(s)"
+            entry = QListWidgetItem(label)
+            entry.setToolTip(tip)
+            if rec.superseded:
+                entry.setForeground(QColor("#888"))
+            elif rec.origin == "agent":
+                entry.setForeground(QColor("#0a4d8c"))
+            elif rec.agent_notes:
+                entry.setForeground(QColor("#5a3d8c"))
             self.fix_list.addItem(entry)
         if self._recommendations:
             self.fix_list.setCurrentRow(0)
@@ -565,6 +595,22 @@ class TriagePanel(QWidget):
 
     def _fix_html(self, rec: Any) -> str:
         parts = [f"<h3>{_esc(rec.title)}</h3>"]
+        if rec.superseded:
+            parts.append(
+                "<p style='color:#a00;'><b>Superseded.</b> The AI agent "
+                f"proposed a different fix (entry #{rec.superseded_by}) for "
+                "this category. This offline entry is kept for reference; "
+                "the reasoning below is unchanged.</p>")
+        elif rec.origin == "agent":
+            parts.append(
+                "<p style='color:#0a4d8c;'><b>Proposed by the AI agent</b> "
+                "during its review"
+                + (f", replacing offline entry #{rec.supersedes}"
+                   if rec.supersedes else "")
+                + ". The offline plan is unchanged; verify before acting."
+                + (f"<br><b>Why it replaces the offline entry:</b> "
+                   f"{_esc(rec.edit_reason)}" if rec.edit_reason else "")
+                + "</p>")
         parts.append(
             f"<p><b>Category:</b> {_esc(rec.subclass_id)} "
             f"({rec.fault_count} faults, {rec.pct:.2f}%)<br>"
@@ -576,6 +622,13 @@ class TriagePanel(QWidget):
             parts.append(f"<p><b>Concentrated under:</b> "
                          f"<code>{_esc(rec.hotspot)}</code></p>")
         parts.append(f"<p><b>Why:</b> {_esc(rec.fix.rationale)}</p>")
+        if rec.agent_notes:
+            parts.append(
+                "<div style='background:#f3eefc; border-left:3px solid "
+                "#5a3d8c; padding:6px 10px; margin:6px 0;'>"
+                "<p><b>Agent's practical note(s)</b></p><ul>"
+                + "".join(f"<li>{_esc(n)}</li>" for n in rec.agent_notes)
+                + "</ul></div>")
 
         if rec.fix.preconditions:
             parts.append("<p><b>Confirm first</b></p><ul>")
