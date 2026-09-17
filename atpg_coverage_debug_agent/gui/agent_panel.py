@@ -9,7 +9,8 @@ import os
 import re
 import time
 import uuid
-from typing import Optional
+from datetime import datetime
+from typing import List, Optional, Tuple
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import (
@@ -22,7 +23,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -332,9 +333,14 @@ class AgentPanel(QWidget):
     #: records one, so the Triage tab and the Summary re-render the plan.
     fix_plan_changed = Signal(list)
 
+    #: Emitted with a design object path the user right-clicked in the agent's
+    #: text and asked to see in the running Tessent Visualizer session.
+    signal_inspect_requested = Signal(str)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._report = None
+        self._path_registry = None
         self._skill_manager = None
         self._thread: Optional[QThread] = None
         self._worker = None
@@ -607,16 +613,22 @@ class AgentPanel(QWidget):
         trace_layout.addWidget(self.trace_view)
         splitter.addWidget(trace_box)
 
-        resp_box = QGroupBox("Agent Response (click a fault to focus it in the table)")
+        resp_box = QGroupBox(
+            "Agent Response (click a fault to focus it in the table; "
+            "right-click a path to open it in Tessent Visualizer)")
         resp_layout = QVBoxLayout(resp_box)
         self.response_view = QTextBrowser()
         self.response_view.setLayoutDirection(Qt.LeftToRight)
         self.response_view.setOpenLinks(False)
         self.response_view.setOpenExternalLinks(False)
         self.response_view.anchorClicked.connect(self._on_anchor_clicked)
+        self.response_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.response_view.customContextMenuRequested.connect(
+            lambda pos: self._on_text_context_menu(self.response_view, pos))
         self.response_view.setPlaceholderText(
             "The agent's evidence-driven A–F diagnosis appears here. Fault ids "
-            "are clickable.")
+            "are clickable; right-click a hierarchy path to open it in the "
+            "running Tessent Visualizer.")
         resp_layout.addWidget(self.response_view)
         splitter.addWidget(resp_box)
 
@@ -637,9 +649,14 @@ class AgentPanel(QWidget):
         self.chat_view.setOpenLinks(False)
         self.chat_view.setOpenExternalLinks(False)
         self.chat_view.anchorClicked.connect(self._on_anchor_clicked)
+        self.chat_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chat_view.customContextMenuRequested.connect(
+            lambda pos: self._on_text_context_menu(self.chat_view, pos))
         self.chat_view.setPlaceholderText(
             "After you run the agent, ask follow-up questions about its "
-            "diagnosis here — the conversation keeps the full analysis context.")
+            "diagnosis here — the conversation keeps the full analysis context. "
+            "Right-click a hierarchy path in a reply to open it in the running "
+            "Tessent Visualizer.")
         chat_layout.addWidget(self.chat_view, 1)
 
         chat_row = QHBoxLayout()
@@ -657,10 +674,17 @@ class AgentPanel(QWidget):
         self.chat_stop_btn.clicked.connect(self.on_stop)
         self.chat_clear_btn = QPushButton("Clear chat")
         self.chat_clear_btn.clicked.connect(self.on_clear_chat)
+        self.chat_save_btn = QPushButton("Save chat…")
+        self.chat_save_btn.setToolTip(
+            "Save the whole conversation as Markdown: the initial diagnosis "
+            "and every follow-up turn, including turns removed from view by "
+            "'Clear chat'.")
+        self.chat_save_btn.clicked.connect(self.on_save_chat)
         chat_row.addWidget(self.chat_input, 1)
         chat_row.addWidget(self.chat_send_btn)
         chat_row.addWidget(self.chat_stop_btn)
         chat_row.addWidget(self.chat_clear_btn)
+        chat_row.addWidget(self.chat_save_btn)
         chat_layout.addLayout(chat_row)
 
         # The chat box can be popped out into its own window, where the main
@@ -1023,6 +1047,7 @@ class AgentPanel(QWidget):
     def set_report(self, report, skill_manager=None) -> None:
         """Provide the latest analysis report (and skill manager) to the panel."""
         self._report = report
+        self._path_registry = None
         if skill_manager is not None:
             self._skill_manager = skill_manager
         self._update_button_state()
@@ -1066,6 +1091,7 @@ class AgentPanel(QWidget):
 
     def clear(self) -> None:
         self._report = None
+        self._path_registry = None
         self.prompt_view.clear()
         self.trace_view.clear()
         self.response_view.clear()
@@ -1845,6 +1871,145 @@ class AgentPanel(QWidget):
         s = url.toString()
         if s.startswith("fault:"):
             self.fault_referenced.emit(unquote(s[len("fault:"):]))
+
+    # -- right-click a path in the agent's text -> Tessent Visualizer --------
+
+    #: Menu rows offered when the cursor is on prose rather than on a path.
+    MAX_MENU_PATHS = 8
+
+    _UNKNOWN_PATH_TIP = (
+        "Not found in the analysed design (netlist, fault list, constraints), "
+        "so the tool could not resolve it. 'Copy path' is still available.")
+
+    def _known_paths(self):
+        """The registry of paths the analysed design can vouch for (cached)."""
+        if self._path_registry is None and self._report is not None:
+            try:
+                from ..analysis.guardrails import PathRegistry
+                self._path_registry = PathRegistry.from_report(self._report)
+            except Exception:  # noqa: BLE001 - a menu must never break the run
+                logger.debug("path registry unavailable", exc_info=True)
+        return self._path_registry
+
+    def _is_known_path(self, obj: str) -> bool:
+        registry = self._known_paths()
+        return bool(registry is not None and registry.is_known(obj))
+
+    def _text_menu_model(self, block_text: str, pos_in_block: int,
+                         anchor_href: str = "") -> Tuple[str, List[Tuple[str, bool, str]]]:
+        """Decide what a right-click on the agent's text offers.
+
+        Returns ``(primary, rows)`` where *primary* is the object under the
+        cursor ("" when the cursor is on prose) and each row is
+        ``(label, enabled, action_id)`` with action ids ``show:<obj>`` and
+        ``copy:<obj>``.  An object the analysed design does not contain keeps
+        its row but disabled -- the same honesty rule the triage tree applies
+        to derived prefixes.
+        """
+        from ..analysis.guardrails import find_paths
+
+        objects: List[str] = []
+        primary = ""
+        if anchor_href.startswith("fault:"):
+            primary = unquote(anchor_href[len("fault:"):])
+        else:
+            for token, start, end in find_paths(block_text or ""):
+                if start <= pos_in_block <= end:
+                    primary = token
+                    break
+        if primary:
+            objects = [primary]
+        else:
+            objects = [t for t, _s, _e in find_paths(block_text or "")]
+            objects = objects[: self.MAX_MENU_PATHS]
+
+        rows: List[Tuple[str, bool, str]] = []
+        for obj in objects:
+            rows.append((f"Open {obj} in Tessent Visualizer",
+                         self._is_known_path(obj), f"show:{obj}"))
+        for obj in objects:
+            rows.append((f"Copy path {obj}" if len(objects) > 1 else "Copy path",
+                         True, f"copy:{obj}"))
+        return primary, rows
+
+    def _run_text_menu_action(self, action_id: str) -> None:
+        if action_id.startswith("show:"):
+            self.signal_inspect_requested.emit(action_id[len("show:"):])
+        elif action_id.startswith("copy:"):
+            QApplication.clipboard().setText(action_id[len("copy:"):])
+            self.status_label.setText("Path copied to clipboard.")
+
+    def _on_text_context_menu(self, view: QTextBrowser, pos) -> None:
+        cursor = view.cursorForPosition(pos)
+        block_text = cursor.block().text()
+        _primary, rows = self._text_menu_model(
+            block_text, cursor.positionInBlock(), view.anchorAt(pos))
+        # Parent to the view so the menu follows it into a popped-out window.
+        menu = view.createStandardContextMenu(pos)
+        mapping = {}
+        if rows:
+            menu.setToolTipsVisible(True)
+            existing = menu.actions()
+            anchor = menu.insertSeparator(existing[0]) if existing else None
+            for label, enabled, action_id in rows:
+                act = QAction(label, menu)
+                act.setEnabled(enabled)
+                if not enabled:
+                    act.setToolTip(self._UNKNOWN_PATH_TIP)
+                if anchor is not None:
+                    menu.insertAction(anchor, act)
+                else:
+                    menu.addAction(act)
+                mapping[act] = action_id
+        chosen = menu.exec(view.viewport().mapToGlobal(pos))
+        if chosen in mapping:
+            self._run_text_menu_action(mapping[chosen])
+
+    # -- saving the conversation --------------------------------------------
+
+    def _design_label(self) -> str:
+        r = self._report
+        if r is None:
+            return ""
+        sources = getattr(r, "sources", None) or {}
+        design = sources.get("design") or ""
+        netlist = sources.get("netlist") or ""
+        if not design and netlist:
+            design = os.path.basename(netlist)
+        return str(design or netlist or "")
+
+    def chat_transcript(self) -> str:
+        """The whole conversation as Markdown; "" when there is nothing yet."""
+        diagnosis = (self._last_response or "").strip()
+        turns = [(r, t) for r, t in self._chat_turns if (t or "").strip()]
+        if not diagnosis and not turns:
+            return ""
+        backend = self._chat_backend or self._current_backend()
+        if backend == "cli":
+            model = self.cli_model_combo.currentText().strip() or "auto"
+        else:
+            model = self.model_edit.text().strip() or "(unset)"
+        lines = [
+            "# ATPG Coverage Debug Agent — conversation",
+            "",
+            f"- Saved: {datetime.now().isoformat(timespec='seconds')}",
+        ]
+        design = self._design_label()
+        if design:
+            lines.append(f"- Design: {design}")
+        lines.append(f"- Backend: {backend}, model: {model}, "
+                     f"agentic tools: {'yes' if self._chat_agentic else 'no'}")
+        lines += ["", "## Initial diagnosis", "",
+                  diagnosis or "(the agent has not been run yet)", ""]
+        lines += ["## Follow-up conversation", ""]
+        if not turns:
+            lines += ["(no follow-up questions were asked)", ""]
+        for role, text in turns:
+            lines += [f"### {role}", "", text.strip(), ""]
+        return "\n".join(lines)
+
+    def on_save_chat(self) -> None:
+        self._save(self.chat_transcript(), "atpg_agent_chat.md")
 
     def ask_about_fault(self, fault_object: str) -> None:
         """Pre-fill a follow-up question about *fault_object* (from the table)."""

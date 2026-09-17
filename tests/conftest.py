@@ -15,6 +15,12 @@ if _ROOT not in sys.path:
 SAMPLE_DIR = os.path.join(_ROOT, "sample_data")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_user_profile_dir(tmp_path, monkeypatch):
+    """Keep a developer's imported launch profiles out of every test."""
+    monkeypatch.setenv("ATPG_USER_PROFILE_DIR", str(tmp_path / "user_profiles"))
+
+
 @pytest.fixture
 def sample_netlist_path() -> str:
     return os.path.join(SAMPLE_DIR, "sample_netlist.v")

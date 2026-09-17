@@ -699,6 +699,12 @@ the conversation keeps the full analysis context (e.g. &ldquo;which module
 contributes the most loss?&rdquo;, &ldquo;how would a control point on X
 help?&rdquo;). <b>Max tokens</b> and <b>Temperature</b> tune size and
 determinism (temperature&nbsp;0 is most repeatable).</p>
+<p><b>Keeping the conversation.</b> <b class="k">Save chat&hellip;</b> writes
+the whole session as Markdown &mdash; the initial diagnosis and every
+follow-up turn, including turns removed from view by <b class="k">Clear
+chat</b>, which only clears the display. <b>Right-click</b> a hierarchy path
+in a reply to <b class="k">Open</b> it <b class="k">in Tessent
+Visualizer</b> (see section&nbsp;7) or copy it.</p>
 <p><b>Follow-ups keep the tools.</b> After an agentic run the investigation
 tools stay attached for every follow-up question: with the Copilot CLI the
 local MCP server (and the parsed netlist handed to it) lives for the whole
@@ -779,9 +785,11 @@ viewer appears, for anything you want to type yourself.</p>
 <tr><th>Field</th><th>Meaning</th></tr>
 <tr><td><b class="k">Profile</b></td><td>The project. Profiles are JSON files
     in the <code>profiles/</code> directory, so adding a project is adding a
-    file &mdash; no new version of this application. Point
-    <code>$ATPG_TOOL_PROFILES</code> at your own directory to add or override
-    one.</td></tr>
+    file &mdash; no new version of this application. <b class="k">Load
+    profile&hellip;</b> takes a profile JSON from anywhere on disk, checks it,
+    copies it into <code>~/.atpg_debug_agent/profiles</code> so it is found
+    again next time, and selects it. <code>$ATPG_TOOL_PROFILES</code> can also
+    point at your own directory to add or override one.</td></tr>
 <tr><td><b class="k">Project</b>, <b class="k">Config</b></td><td>Passed to the
     setup wrapper. Pre-filled from the profile; override per run.</td></tr>
 <tr><td><b class="k">Workarea</b></td><td>Optional. Leave it blank and the
@@ -805,12 +813,16 @@ workarea, licence server and each design path are written to
 the next time the application starts. Nothing is shared between users, and the
 licence server in particular never has to be retyped.</p>
 <p>For designs you open regularly, use <b class="k">Saved configuration</b> at
-the top of the tab. <b class="k">Save as&hellip;</b> stores the whole form
-&mdash; setup, licence, workarea and every design path &mdash; under a name you
-choose; picking that name from the list later fills the entire form in one
-step, so launching is two clicks. <b class="k">Delete</b> forgets one. The
-saved configurations live in the same per-user settings file and survive a
-restart.</p>
+the top of the tab. <b class="k">Save as&hellip;</b> writes the whole form
+&mdash; setup, licence, workarea and every design path &mdash; to a JSON file
+<b>you choose the location of</b> (it opens in
+<code>~/.atpg_debug_agent/visualizer_configs</code>), and lists it under the
+file's name; picking that name from the list later fills the entire form in
+one step, so launching is two clicks. <b class="k">Load&hellip;</b> opens a
+configuration file saved earlier &mdash; by you, or by a colleague who kept one
+beside a run directory &mdash; and applies it. <b class="k">Delete</b> forgets
+an entry in the list; the file on disk is left alone. The list itself survives
+a restart through the per-user settings file.</p>
 <p>The list opens on <i>(current form &mdash; not saved)</i>, which is the
 setup you were last using. Selecting a saved configuration overwrites the form
 with it, so save your current setup first if you want to keep it.</p>
@@ -834,7 +846,7 @@ removes them again.</p>
 <h3>Opening a signal in a session that is already running</h3>
 <p>Once the viewer is up you do not have to relaunch it to look at something
 else. <b>Right-click</b> a signal and choose <b class="k">Open signal in
-Tessent Visualizer</b>; it appears in the running session. This works from four
+Tessent Visualizer</b>; it appears in the running session. This works from five
 places:</p>
 <ul>
   <li>the <b>Triage &amp; Fix Plan</b> &rarr; <i>Where the loss is</i> tree, on
@@ -842,7 +854,12 @@ places:</p>
   <li>the <b>Categories</b> table, which offers the tie drivers and constrained
       signals identified as blocking that category;</li>
   <li>the <b>Fix Plan</b>, on a proposal's hotspot path;</li>
-  <li>the <b>Coverage Loss Table</b>, on any fault row.</li>
+  <li>the <b>Coverage Loss Table</b>, on any fault row;</li>
+  <li>the <b>AI Debug Agent</b>'s <b>Agent Response</b> and <b>Follow-up
+      Chat</b> text, on any hierarchy path the agent mentions. A path the
+      analysed design does not contain is <b>greyed out</b> (the agent may have
+      shortened or invented it); <b class="k">Copy path</b> stays available.
+      Right-click on prose lists every path in that paragraph.</li>
 </ul>
 <p>On a <i>cluster prefix</i> the entry is deliberately <b>greyed out</b>. A
 prefix is a string the triage computed to show where faults concentrate &mdash;
@@ -1143,6 +1160,8 @@ class MainWindow(QMainWindow):
         self.agent_panel.fault_referenced.connect(self._focus_fault_in_table)
         self.agent_panel.findings_changed.connect(self._on_agent_findings)
         self.agent_panel.fix_plan_changed.connect(self._on_agent_fix_edits)
+        self.agent_panel.signal_inspect_requested.connect(
+            self._show_signal_in_visualizer)
         # The agent panel is tall. Placed directly in the tab widget its
         # minimum size propagates to the whole window, which then cannot be
         # shrunk and barely changes when maximised. A scroll area decouples

@@ -1,12 +1,12 @@
 {
-  "name": "example",
-  "display_name": "Example Project",
-  "description": "Template launch profile. Copy this file, rename it, and fill in your site's setup wrapper, licence server and tool paths. Profiles are data: adding a project is adding a file here, never a code change. Point $ATPG_TOOL_PROFILES at your own directory to keep site-specific profiles outside this repository.",
+  "name": "ttlc",
+  "display_name": "TTLC",
+  "description": "Tessent Visualizer for TTLC, entered through the Cheetah project setup (cth_psetup). Ready to launch as shipped; to target another project copy this file, change the name, and adjust the setup wrapper, -proj/-cfg, licence server and tool path. Profiles are data: adding a project is adding a file, never a code change. Point $ATPG_TOOL_PROFILES at your own directory, or use 'Load profile…' in the GUI, to keep site profiles outside this repository.",
   "shell": "/bin/tcsh",
   "psetup": {
-    "executable": "/path/to/your/project/setup/wrapper",
-    "proj": "yourproject/RELEASE",
-    "cfg": "yourconfig.cth",
+    "executable": "/nfs/site/proj/hdk/pu_tu/prd/liteinfra/1.15.SP1.p02/commonFlow/bin/cth_psetup",
+    "proj": "ttlcdie/TS2026.6_TTLC.HF",
+    "cfg": "ttlc78a0.cth",
     "proj_flag": "-proj",
     "cfg_flag": "-cfg",
     "ward_flag": "-ward",
@@ -14,10 +14,10 @@
     "extra_args": []
   },
   "environment": {
-    "SALT_LICENSE_SERVER": "PORT@your.licence.server"
+    "SALT_LICENSE_SERVER": "1717@mentor14p.elic.intel.com:1717@mentor06p.elic.intel.com:1717@mentor37p.elic.intel.com:1717@mentor47p.elic.intel.com:1717@siemens12p.elic.intel.com"
   },
   "tool": {
-    "executable": "/path/to/tessent",
+    "executable": "/p/hdk/cad/tessent/2026.1/bin/tessent",
     "shell_flag": "-shell",
     "dofile_flag": "-dofile",
     "logfile_flag": "-logfile",

@@ -8,9 +8,23 @@ ordered commands that load a design.
 project identifier belongs anywhere in `atpg_coverage_debug_agent/` — a test
 enforces that.
 
-Set `ATPG_TOOL_PROFILES` to a colon-separated list of directories to add your
-own; they are searched before this one, so a file here can be shadowed without
-editing it.
+The shipped `ttlc.json` is a complete, launchable profile for the TTLC project
+(Cheetah `cth_psetup` wrapper, `-proj ttlcdie/TS2026.6_TTLC.HF`,
+`-cfg ttlc78a0.cth`, the Siemens licence servers and
+`/p/hdk/cad/tessent/2026.1/bin/tessent -shell`).  To target another project,
+copy it, change `name`/`display_name`, and adjust the setup wrapper, `-proj`/
+`-cfg`, licence server and tool path.
+
+Profiles are searched in this order, first match per `name` wins:
+
+1. every directory in `ATPG_TOOL_PROFILES` (colon separated);
+2. `~/.atpg_debug_agent/profiles` — the GUI's **Load profile…** button copies
+   a chosen JSON file here after validating it, so it is found again on the
+   next start;
+3. this directory.
+
+A file here (other than `ttlc.json`) is ignored by git, so a local profile can
+live here without being published.
 
 ## Fields
 

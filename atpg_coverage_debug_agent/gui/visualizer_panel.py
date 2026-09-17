@@ -18,7 +18,7 @@ from PySide6.QtCore import QProcess, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
     QWidget,
 )
@@ -29,8 +29,11 @@ from ..launcher import (
     list_profiles, signal_inspect_actions, write_launch_bundle,
 )
 from ..launcher.visualizer import (
+    ConfigFileError, config_file_stem, default_config_dir,
     derive_paths_from_run_dir, fault_inspect_commands, missing_inputs,
+    read_launch_config, write_launch_config,
 )
+from ..launcher.profiles import import_profile_file, user_profile_dir
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,7 @@ class VisualizerPanel(QWidget):
         self._profiles: List[ToolProfile] = []
         self._path_rows: Dict[str, _PathRow] = {}
         self._presets: Dict[str, Dict[str, Any]] = {}
+        self._preset_files: Dict[str, str] = {}
         self._extra_commands: List[str] = []
         self._analysis_faults = ""
         self._dofile_edited = False
@@ -142,6 +146,13 @@ class VisualizerPanel(QWidget):
         self.profile_combo = QComboBox()
         self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         row.addWidget(self.profile_combo, 1)
+        self.load_profile_btn = QPushButton("Load profile…")
+        self.load_profile_btn.setToolTip(
+            "Pick a profile JSON file anywhere on disk. It is checked, copied "
+            f"into {user_profile_dir()} so it is found again next time, and "
+            "selected.")
+        self.load_profile_btn.clicked.connect(self.on_load_profile)
+        row.addWidget(self.load_profile_btn, 0)
         reload_btn = QPushButton("Reload")
         reload_btn.setToolTip(
             "Re-read the profile files. Use after editing or adding one.")
@@ -165,12 +176,23 @@ class VisualizerPanel(QWidget):
 
         self.save_preset_btn = QPushButton("Save as…")
         self.save_preset_btn.setToolTip(
-            "Store the current project setup, licence server, workarea and "
-            "design paths under a name you choose.")
+            "Write the current project setup, licence server, workarea and "
+            "design paths to a JSON file you choose. The file is also listed "
+            "here under its name.")
         self.save_preset_btn.clicked.connect(self.on_save_preset)
         preset_row.addWidget(self.save_preset_btn, 0)
 
+        self.load_preset_btn = QPushButton("Load…")
+        self.load_preset_btn.setToolTip(
+            "Open a configuration file saved earlier (by you or a colleague) "
+            "and fill the form from it.")
+        self.load_preset_btn.clicked.connect(self.on_load_preset)
+        preset_row.addWidget(self.load_preset_btn, 0)
+
         self.delete_preset_btn = QPushButton("Delete")
+        self.delete_preset_btn.setToolTip(
+            "Forget the selected configuration in this list. The file on disk "
+            "is left alone.")
         self.delete_preset_btn.setEnabled(False)
         self.delete_preset_btn.clicked.connect(self.on_delete_preset)
         preset_row.addWidget(self.delete_preset_btn, 0)
@@ -383,6 +405,31 @@ class VisualizerPanel(QWidget):
         index = self.profile_combo.findData(name)
         if index >= 0:
             self.profile_combo.setCurrentIndex(index)
+
+    def import_profile(self, path: str) -> bool:
+        """Validate *path*, copy it into the user profile directory, select it."""
+        try:
+            profile, target, warnings = import_profile_file(path)
+        except ProfileError as exc:
+            self._set_status(f"Cannot load profile: {exc}", True)
+            return False
+        self.reload_profiles()
+        self.select_profile(profile.name)
+        message = f"Loaded profile '{profile.title}' (copied to {target})."
+        if profile.is_template:
+            message += "  " + self._template_message(profile)
+        if warnings:
+            message += "  " + "  ".join(warnings)
+        self._set_status(message, bool(warnings) or profile.is_template)
+        return True
+
+    def on_load_profile(self) -> None:
+        """Ask for a profile file and import it."""
+        start = str(user_profile_dir()) if user_profile_dir().is_dir() else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load launch profile", start, "Profile JSON (*.json);;All files (*)")
+        if path:
+            self.import_profile(path)
 
     def _on_profile_changed(self, *_args: Any) -> None:
         profile = self.current_profile()
@@ -762,10 +809,11 @@ class VisualizerPanel(QWidget):
         return True
 
     def delete_preset(self, name: str) -> bool:
-        """Forget the saved configuration *name*."""
+        """Forget the saved configuration *name* (its file, if any, is kept)."""
         if (name or "").strip() not in self._presets:
             return False
         del self._presets[name.strip()]
+        self._preset_files.pop(name.strip(), None)
         self._refresh_preset_combo()
         self._set_status(f"Deleted configuration '{name}'.")
         self._notify_config_changed()
@@ -774,6 +822,44 @@ class VisualizerPanel(QWidget):
     def current_preset_name(self) -> str:
         """The saved configuration currently selected, or ``""``."""
         return str(self.preset_combo.currentData() or "")
+
+    def save_preset_to_file(self, path: str, name: str = "") -> bool:
+        """Write the current form to *path* and list it under *name*.
+
+        The name defaults to the file stem, so a file called ``fuse_hf.json``
+        shows up as ``fuse_hf`` in the list.
+        """
+        name = (name or "").strip() or os.path.splitext(os.path.basename(path))[0]
+        try:
+            write_launch_config(path, name, self._form_config())
+        except OSError as exc:
+            self._set_status(f"Cannot save configuration: {exc}", True)
+            return False
+        self._presets[name] = self._form_config()
+        self._preset_files[name] = path
+        self._refresh_preset_combo(select=name)
+        self._set_status(f"Saved configuration '{name}' to {path}.")
+        self._notify_config_changed()
+        return True
+
+    def load_preset_from_file(self, path: str) -> bool:
+        """Read a configuration file, apply it, and list it by its name."""
+        try:
+            name, cfg = read_launch_config(path)
+        except ConfigFileError as exc:
+            self._set_status(f"Cannot load configuration: {exc}", True)
+            return False
+        self._presets[name] = dict(cfg)
+        self._preset_files[name] = path
+        self._apply_form_config(cfg)
+        self._refresh_preset_combo(select=name)
+        self._set_status(f"Loaded configuration '{name}' from {path}.")
+        self._notify_config_changed()
+        return True
+
+    def preset_file(self, name: str) -> str:
+        """The file a listed configuration came from or was saved to, or ""."""
+        return self._preset_files.get((name or "").strip(), "")
 
     def _refresh_preset_combo(self, select: str = "") -> None:
         keep = select or self.current_preset_name()
@@ -794,16 +880,30 @@ class VisualizerPanel(QWidget):
             self.load_preset(name)
 
     def on_save_preset(self) -> None:
-        """Prompt for a name and store the current form under it."""
-        suggested = self.current_preset_name() or self.proj_edit.text().strip()
-        name, accepted = QInputDialog.getText(
-            self, "Save configuration",
-            "Name for this launch configuration:", text=suggested)
-        if not accepted:
+        """Ask where to write the current form, then save and list it."""
+        current = self.current_preset_name()
+        suggested = self.preset_file(current) if current else ""
+        if not suggested:
+            stem = config_file_stem(current or self.proj_edit.text().strip()
+                                    or self.current_profile_name())
+            suggested = os.path.join(default_config_dir(), stem + ".json")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save launch configuration", suggested,
+            "Launch configuration (*.json);;All files (*)")
+        if not path:
             return
-        if not self.save_preset(name):
-            self._set_status("A configuration needs a name to be saved.",
-                             warning=True)
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        self.save_preset_to_file(path)
+
+    def on_load_preset(self) -> None:
+        """Ask for a configuration file and apply it."""
+        start = default_config_dir() if os.path.isdir(default_config_dir()) else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load launch configuration", start,
+            "Launch configuration (*.json);;All files (*)")
+        if path:
+            self.load_preset_from_file(path)
 
     def on_delete_preset(self) -> None:
         """Delete the selected saved configuration, after confirming."""
@@ -877,6 +977,7 @@ class VisualizerPanel(QWidget):
         payload = self._form_config()
         payload["presets"] = {name: dict(cfg)
                               for name, cfg in self._presets.items()}
+        payload["preset_files"] = dict(self._preset_files)
         payload["last_preset"] = self.current_preset_name()
         return payload
 
@@ -887,6 +988,11 @@ class VisualizerPanel(QWidget):
             str(name): dict(value)
             for name, value in dict(cfg.get("presets") or {}).items()
             if isinstance(value, dict)
+        }
+        self._preset_files = {
+            str(name): str(path)
+            for name, path in dict(cfg.get("preset_files") or {}).items()
+            if name in self._presets and path
         }
         self._apply_form_config(cfg)
         # The form was just restored from the last session, so the remembered

@@ -19,11 +19,12 @@ terminal is a list, never a command string, so no shell parses it.
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import re
 import stat
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .live_session import (
     PORT_FILE, TOKEN_FILE, InspectAction, build_listener_tcl, new_token,
@@ -581,3 +582,71 @@ def iter_load_entries(profile: ToolProfile) -> Iterable[Tuple[str, str, bool]]:
     """(key, label, required) for each load command, for building a form."""
     for entry in profile.commands.load:
         yield entry.key, entry.label or entry.key, entry.required
+
+
+# ---------------------------------------------------------------------------
+# Saved launch configurations (the GUI form, as a file the user can keep)
+# ---------------------------------------------------------------------------
+
+CONFIG_KIND = "atpg_visualizer_launch_config"
+CONFIG_VERSION = 1
+CONFIG_DIR_ENV = "ATPG_VIS_CONFIG_DIR"
+
+
+class ConfigFileError(Exception):
+    """A launch-configuration file is missing, malformed, or not ours."""
+
+
+def default_config_dir() -> str:
+    """Where 'Save configuration' opens by default."""
+    override = os.environ.get(CONFIG_DIR_ENV, "").strip()
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(os.path.expanduser("~"), ".atpg_debug_agent",
+                        "visualizer_configs")
+
+
+def config_file_stem(name: str) -> str:
+    """A filesystem-safe stem for a configuration name."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip()).strip("._-")
+    return stem or "launch_config"
+
+
+def write_launch_config(path: str, name: str, form: Dict[str, Any]) -> None:
+    """Write the form *form* under *name* to *path* as JSON."""
+    payload = {
+        "kind": CONFIG_KIND,
+        "version": CONFIG_VERSION,
+        "name": (name or "").strip(),
+        "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+        "config": dict(form),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def read_launch_config(path: str) -> Tuple[str, Dict[str, Any]]:
+    """Read a configuration written by :func:`write_launch_config`.
+
+    Returns ``(name, form)``; the name falls back to the file stem.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ConfigFileError(f"cannot read '{path}': {exc}") from exc
+    except ValueError as exc:
+        raise ConfigFileError(f"'{path}' is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or data.get("kind") != CONFIG_KIND:
+        raise ConfigFileError(
+            f"'{path}' is not a Tessent Visualizer launch configuration "
+            f"(expected \"kind\": \"{CONFIG_KIND}\").")
+    form = data.get("config")
+    if not isinstance(form, dict):
+        raise ConfigFileError(f"'{path}' holds no \"config\" object.")
+    name = str(data.get("name") or "").strip()
+    if not name:
+        name = os.path.splitext(os.path.basename(path))[0]
+    return name, form

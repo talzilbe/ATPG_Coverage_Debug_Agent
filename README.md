@@ -91,9 +91,17 @@ runs it in its own terminal. The session is detached, so it outlives the
 application and the tool prompt stays usable after the viewer appears.
 
 Projects are **data**: one JSON file per project in `profiles/`, so adding a
-project needs no code change. Point `$ATPG_TOOL_PROFILES` at your own directory
-to add or shadow one. See [profiles/README.md](profiles/README.md) for the
-schema.
+project needs no code change. The shipped `profiles/ttlc.json` is a complete
+TTLC profile (project setup, licence servers, `tessent -shell` path), so a
+fresh clone can launch the viewer after at most a few edits. Point
+`$ATPG_TOOL_PROFILES` at your own directory, or use **Load profile&hellip;** in
+the tab to import a JSON file into `~/.atpg_debug_agent/profiles`. See
+[profiles/README.md](profiles/README.md) for the schema.
+
+The launch form itself &mdash; project, config, workarea, licence server and
+every design path &mdash; can be written to a JSON file with **Save
+as&hellip;** (you choose the location) and brought back with **Load&hellip;**,
+so a setup can be kept beside a run directory or handed to a colleague.
 
 The exact dofile is shown before it runs and can be edited; **Copy commands**
 puts the whole chain on the clipboard for hosts where the launch is not

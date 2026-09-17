@@ -26,11 +26,12 @@ copilot-home/
 # Not ours to publish, and overwritten on every reinstall.
 SageAGENT/
 
-# Site-specific launch profiles. These carry real project names, tool paths and
-# licence servers, so only the sanitised template is published. Copy
-# profiles/example.json to add your own, or point $ATPG_TOOL_PROFILES elsewhere.
+# Launch profiles. The TTLC profile is published so a fresh clone can launch
+# the viewer with only small adjustments; any other profile added here stays
+# local. Prefer $ATPG_TOOL_PROFILES or the GUI's "Load profile…" (which copies
+# into ~/.atpg_debug_agent/profiles) for site profiles you do not want here.
 profiles/*.json
-!profiles/example.json
+!profiles/ttlc.json
 
 # Scratch workareas left behind by the vendor-tool setup wrapper.
 TTLC_test/

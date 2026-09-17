@@ -9,7 +9,9 @@ package.
 Search order for profiles:
 
 1. every directory listed in ``$ATPG_TOOL_PROFILES`` (colon separated),
-2. the repository's ``profiles/`` directory.
+2. the per-user directory ``~/.atpg_debug_agent/profiles`` (where the GUI's
+   "Load profile" copies a file to),
+3. the repository's ``profiles/`` directory.
 
 A profile found earlier wins, so a user directory can shadow a shipped one.
 """
@@ -19,14 +21,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
 #: Environment variable holding extra profile directories.
 PROFILE_PATH_ENV = "ATPG_TOOL_PROFILES"
+
+#: Environment variable overriding the per-user profile directory (tests).
+USER_PROFILE_DIR_ENV = "ATPG_USER_PROFILE_DIR"
 
 #: Executable paths starting with this are the shipped template's placeholders.
 TEMPLATE_PATH_PREFIX = "/path/to/"
@@ -306,6 +312,14 @@ def _default_profile_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "profiles"
 
 
+def user_profile_dir() -> Path:
+    """The per-user directory that imported profiles are copied into."""
+    override = os.environ.get(USER_PROFILE_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".atpg_debug_agent" / "profiles"
+
+
 def profile_search_path() -> List[Path]:
     """Directories searched for profile JSON files, highest priority first."""
     dirs: List[Path] = []
@@ -314,6 +328,7 @@ def profile_search_path() -> List[Path]:
         part = part.strip()
         if part:
             dirs.append(Path(part).expanduser())
+    dirs.append(user_profile_dir())
     dirs.append(_default_profile_dir())
     seen: set = set()
     unique: List[Path] = []
@@ -377,3 +392,49 @@ def get_profile(name: str,
 def with_overrides(profile: ToolProfile, **overrides: Any) -> ToolProfile:
     """Return a copy of *profile* with top-level fields replaced."""
     return replace(profile.copy(), **overrides)
+
+
+def read_profile_file(path: str) -> ToolProfile:
+    """Parse one profile file, raising :class:`ProfileError` on any defect."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ProfileError(f"cannot read '{path}': {exc}") from exc
+    except ValueError as exc:
+        raise ProfileError(f"'{path}' is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProfileError(f"'{path}' does not hold a profile object")
+    return ToolProfile.from_dict(data, str(path))
+
+
+def import_profile_file(path: str,
+                        dest_dir: Optional[Path] = None) -> Tuple[ToolProfile, Path, List[str]]:
+    """Validate *path* and copy it into the per-user profile directory.
+
+    Returns ``(profile, copied_path, warnings)``.  The copy is named after the
+    profile, not the source file, so two files describing the same project
+    replace rather than duplicate each other.  A warning is issued when a
+    higher-priority directory already defines that name and will shadow it.
+    """
+    profile = read_profile_file(path)
+    dest_dir = dest_dir if dest_dir is not None else user_profile_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / f"{profile.name}.json"
+    warnings: List[str] = []
+    if Path(path).resolve() != target.resolve():
+        if target.exists():
+            warnings.append(f"Replaced the earlier copy at {target}.")
+        shutil.copyfile(path, target)
+    for directory in profile_search_path():
+        if directory.resolve() == dest_dir.resolve():
+            break
+        if directory.is_dir():
+            for other in directory.glob("*.json"):
+                try:
+                    if read_profile_file(str(other)).name == profile.name:
+                        warnings.append(
+                            f"'{profile.name}' is also defined in {other}, which "
+                            f"is searched first and will shadow the imported copy.")
+                except ProfileError:
+                    continue
+    return profile, target, warnings

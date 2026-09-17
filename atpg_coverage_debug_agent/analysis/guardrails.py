@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,8 @@ ELLIPSIS_MARKERS = ("...", "\u2026")
 #: Hyphens are part of a component, not a separator -- splitting on them turned
 #: one real filesystem path into several fragments that were then reported as
 #: invented paths, which is itself a fabrication in the audit output.
-_PATH_TOKEN = re.compile(r"[A-Za-z0-9_$\[\].\\-]+(?:/[A-Za-z0-9_$\[\]./\\-]+)+")
+#: A leading separator is kept: the token must be quotable verbatim.
+_PATH_TOKEN = re.compile(r"/?[A-Za-z0-9_$\[\].\\-]+(?:/[A-Za-z0-9_$\[\]./\\-]+)+")
 
 #: Claims of a coverage gain that has not been measured by a re-run.
 _CLAIM_PATTERNS = (
@@ -290,6 +291,29 @@ def _viewer_paths(config: Dict[str, Any]) -> List[str]:
     return [p for p in found if p]
 
 
+def find_paths(text: str, skip: Iterable[str] = ()) -> List[Tuple[str, int, int]]:
+    """Return the hierarchy-path tokens in *text* as ``(token, start, end)``.
+
+    This is the tokenizer :func:`scan_paths` audits with, exposed so a UI can
+    offer exactly the paths the audit would examine. Placeholders, elided
+    paths and value-code pairs (``sa0/sa1``) are excluded; each distinct token
+    is reported once, at its first occurrence.
+    """
+    found: List[Tuple[str, int, int]] = []
+    seen: Set[str] = set(skip)
+    for match in _PATH_TOKEN.finditer(text):
+        token = match.group(0).rstrip(".,;:)`'\"")
+        if not token or token in seen or _PLACEHOLDER.search(token):
+            continue
+        if any(marker in token for marker in ELLIPSIS_MARKERS):
+            continue
+        if _is_value_code_pair(token):
+            continue
+        seen.add(token)
+        found.append((token, match.start(), match.start() + len(token)))
+    return found
+
+
 def scan_paths(text: str, registry: PathRegistry,
                context: str = "") -> List[Issue]:
     """Return path problems found in *text*.
@@ -314,15 +338,7 @@ def scan_paths(text: str, registry: PathRegistry,
                 seen.add(token)
                 issues.append(Issue("elided_path", token, context))
 
-    for match in _PATH_TOKEN.finditer(text):
-        token = match.group(0).rstrip(".,;:)`'\"")
-        if token in seen or _PLACEHOLDER.search(token):
-            continue
-        if any(marker in token for marker in ELLIPSIS_MARKERS):
-            continue
-        if _is_value_code_pair(token):
-            continue
-        seen.add(token)
+    for token, _start, _end in find_paths(text, skip=seen):
         issue = registry.validate(token, context)
         if issue is not None:
             issues.append(issue)
