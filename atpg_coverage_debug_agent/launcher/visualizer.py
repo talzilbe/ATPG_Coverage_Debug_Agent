@@ -397,6 +397,12 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
     hatch for a user who edited the commands in the preview: their text is used
     as typed, exactly as if they had typed it at the tool's own prompt.
     """
+    if profile.is_template:
+        raise LaunchInputError(
+            f"profile '{profile.title}' is the sanitised template shipped with "
+            "the repository (its executables are /path/to/... placeholders). "
+            "Select a site profile, or copy the template to <site>.json in the "
+            "profiles directory and fill in the real paths.")
     if dest_dir is None:
         from ..session import session_dir  # local import keeps this module standalone
         dest_dir = session_dir(design="visualizer")

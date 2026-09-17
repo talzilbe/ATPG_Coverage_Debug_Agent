@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 #: Environment variable holding extra profile directories.
 PROFILE_PATH_ENV = "ATPG_TOOL_PROFILES"
 
+#: Executable paths starting with this are the shipped template's placeholders.
+TEMPLATE_PATH_PREFIX = "/path/to/"
+
 #: Placeholder a fault-inspection command may use for the fault path.
 FAULT_PLACEHOLDER = "fault"
 
@@ -233,6 +236,18 @@ class ToolProfile:
     def title(self) -> str:
         return self.display_name or self.name
 
+    @property
+    def is_template(self) -> bool:
+        """True for the sanitised template shipped with the repository.
+
+        Its executables are ``/path/to/...`` placeholders, so it can be read
+        and copied but never launched. Detected from the paths rather than
+        the file name, so a copied-and-half-filled profile is caught too.
+        """
+        paths = [getattr(self.psetup, "executable", "") or "",
+                 getattr(self.tool, "executable", "") or ""]
+        return any(p.startswith(TEMPLATE_PATH_PREFIX) for p in paths)
+
     def load_command(self, key: str) -> Optional[LoadCommand]:
         for entry in self.commands.load:
             if entry.key == key:
@@ -335,8 +350,13 @@ def load_profiles(search_path: Optional[Sequence[Path]] = None,
 
 def list_profiles(search_path: Optional[Sequence[Path]] = None,
                   ) -> List[ToolProfile]:
-    """Every readable profile, sorted by display title."""
-    return sorted(load_profiles(search_path).values(), key=lambda p: p.title.lower())
+    """Every readable profile, real ones first, then sorted by title.
+
+    The template sorts last so it can never become the default selection
+    merely by being called 'example'.
+    """
+    return sorted(load_profiles(search_path).values(),
+                  key=lambda p: (p.is_template, p.title.lower()))
 
 
 def get_profile(name: str,

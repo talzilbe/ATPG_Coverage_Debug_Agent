@@ -333,10 +333,17 @@ class VisualizerPanel(QWidget):
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
         for profile in self._profiles:
-            self.profile_combo.addItem(profile.title, profile.name)
+            label = profile.title
+            if profile.is_template:
+                label += "  (template — placeholder paths, cannot launch)"
+            self.profile_combo.addItem(label, profile.name)
         self.profile_combo.blockSignals(False)
         if current:
             self.select_profile(current)
+        elif self._profiles:
+            # Never default to the shipped template just because it sorts
+            # first; a real profile is what the user came here to launch.
+            self.select_profile(self._first_real_profile_name())
         if not self._profiles:
             self.profile_note.setText(
                 "No launch profiles were found. Add a JSON profile to the "
@@ -345,6 +352,21 @@ class VisualizerPanel(QWidget):
             return
         self.launch_btn.setEnabled(True)
         self._on_profile_changed()
+
+    def _first_real_profile_name(self) -> str:
+        """The first non-template profile, else whatever is first."""
+        for profile in self._profiles:
+            if not profile.is_template:
+                return profile.name
+        return self._profiles[0].name if self._profiles else ""
+
+    def _template_message(self, profile: ToolProfile) -> str:
+        real = [p.title for p in self._profiles if not p.is_template]
+        hint = (f"Pick your site profile instead: {', '.join(real)}." if real
+                else "Copy it to <site>.json in the profiles directory and "
+                     "fill in the real executables.")
+        return (f"'{profile.title}' is the sanitised template shipped with "
+                f"the repository; its executables are placeholders. {hint}")
 
     def current_profile(self) -> Optional[ToolProfile]:
         name = self.current_profile_name()
@@ -370,7 +392,12 @@ class VisualizerPanel(QWidget):
         if profile.source_path:
             note = (note + "  ") if note else ""
             note += f"Defined in {profile.source_path}"
+        if profile.is_template:
+            note = self._template_message(profile) + "  " + note
         self.profile_note.setText(note)
+        self.launch_btn.setEnabled(not profile.is_template)
+        self.launch_btn.setToolTip(
+            self._template_message(profile) if profile.is_template else "")
         if not self.proj_edit.text().strip():
             self.proj_edit.setText(profile.psetup.proj)
         if not self.cfg_edit.text().strip():
@@ -538,6 +565,10 @@ class VisualizerPanel(QWidget):
         profile = self.current_profile()
         if profile is None:
             self._set_status("No launch profile is selected.", True)
+            return
+        if profile.is_template:
+            self._set_status("Cannot launch: " + self._template_message(profile),
+                             True)
             return
         inputs = self.current_inputs()
         missing = missing_inputs(profile, inputs)
@@ -807,6 +838,16 @@ class VisualizerPanel(QWidget):
             return
         name = str(cfg.get("profile", ""))
         if name:
+            # A saved selection of the template is a stale default from before
+            # templates were told apart; fall back to the real profile.
+            chosen = next((p for p in self._profiles if p.name == name), None)
+            if chosen is not None and chosen.is_template:
+                real = self._first_real_profile_name()
+                if real and real != name:
+                    name = real
+                    self._set_status(
+                        f"The saved profile was the template; switched to "
+                        f"'{real}'.")
             # Selecting the profile rebuilds the path rows, so it must happen
             # before the saved paths are written into them.
             self.select_profile(name)

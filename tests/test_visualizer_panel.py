@@ -90,6 +90,88 @@ def test_the_analysis_fault_list_is_adopted_and_locked(panel, files):
     assert not row.isEnabled(), "the linked row must not be editable"
 
 
+# ---------------------------------------------------------------------------
+# The shipped template must never become the launch profile
+# ---------------------------------------------------------------------------
+def _add_template(tmp_path, name="example", title="Example (template)"):
+    """A copy of the repository's sanitised template, with placeholder paths."""
+    template = dict(PROFILE_DATA, name=name, display_name=title)
+    template["psetup"] = dict(PROFILE_DATA["psetup"],
+                              executable="/path/to/your/project/setup/wrapper")
+    template["tool"] = {"executable": "/path/to/tessent"}
+    (tmp_path / "profiles" / f"{name}.json").write_text(json.dumps(template),
+                                                        encoding="utf-8")
+
+
+def test_a_placeholder_profile_is_recognised_as_a_template(tmp_path, panel):
+    from atpg_coverage_debug_agent.launcher.profiles import list_profiles
+    _add_template(tmp_path)
+    profiles = list_profiles()
+    by_name = {p.name: p for p in profiles}
+    assert by_name["example"].is_template
+    assert not by_name["demo"].is_template
+    # "Aaa" would sort before "Demo Project" by title alone.
+    _add_template(tmp_path, name="aaa", title="Aaa")
+    assert [p.name for p in list_profiles()][0] == "demo", \
+        "a template must never sort ahead of a real profile"
+
+
+def test_the_default_selection_skips_the_template(tmp_path, qapp, monkeypatch):
+    directory = tmp_path / "profiles"
+    directory.mkdir()
+    (directory / "demo.json").write_text(json.dumps(PROFILE_DATA),
+                                         encoding="utf-8")
+    _add_template(tmp_path, name="aaa", title="Aaa template")
+    monkeypatch.setenv("ATPG_TOOL_PROFILES", str(directory))
+    widget = VisualizerPanel()
+    widget.reload_profiles()
+    assert widget.current_profile_name() == "demo"
+    label = widget.profile_combo.itemText(widget.profile_combo.findData("aaa"))
+    assert "template" in label and "cannot launch" in label
+
+
+def test_launching_the_template_is_refused_with_a_pointer_to_a_real_one(
+        tmp_path, panel, files):
+    _add_template(tmp_path)
+    panel.reload_profiles()
+    panel.select_profile("example")
+    assert not panel.launch_btn.isEnabled()
+    assert "template" in panel.profile_note.text()
+    panel.on_launch()
+    text = panel.status_label.text()
+    assert text.startswith("Cannot launch:")
+    assert "placeholders" in text and "Demo Project" in text
+    assert "/path/to/tessent" not in text, "the placeholder path is not the story"
+
+
+def test_a_saved_template_selection_is_repaired_on_import(tmp_path, panel):
+    """This is the exact failure the user hit: the template, sorting first,
+    had become the saved default, so Launch tried /path/to/tessent."""
+    _add_template(tmp_path)
+    panel.reload_profiles()
+    panel.import_settings({"profile": "example", "proj": "p", "cfg": "c"})
+    assert panel.current_profile_name() == "demo"
+    assert "switched to 'demo'" in panel.status_label.text()
+    assert panel.launch_btn.isEnabled()
+
+
+def test_write_launch_bundle_refuses_a_template(tmp_path):
+    from atpg_coverage_debug_agent.launcher.profiles import ToolProfile
+    from atpg_coverage_debug_agent.launcher.visualizer import (
+        LaunchInputError,
+        VisualizerInputs,
+        write_launch_bundle,
+    )
+    template = dict(PROFILE_DATA, name="example")
+    template["tool"] = {"executable": "/path/to/tessent"}
+    profile = ToolProfile.from_dict(template)
+    assert profile.is_template
+    with pytest.raises(LaunchInputError) as info:
+        write_launch_bundle(profile, VisualizerInputs(proj="p", cfg="c"),
+                            dest_dir=str(tmp_path / "out"))
+    assert "template" in str(info.value)
+
+
 def test_unlinking_the_fault_list_re_enables_the_row(panel, files):
     panel.set_analysis_faults(files["faults"])
     panel.use_analysis_faults.setChecked(False)
