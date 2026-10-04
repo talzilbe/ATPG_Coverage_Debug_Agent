@@ -54,6 +54,8 @@ class AppSettings:
     auto_save_report: bool = False
     #: Tessent Visualizer launch form (profile, project, design paths).
     visualizer: Dict[str, Any] = field(default_factory=dict)
+    #: Show the Logs / Skills / Custom Skills tabs (hidden for new users).
+    show_advanced_tabs: bool = False
 
     # ------------------------------------------------------------------
     # persistence

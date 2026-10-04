@@ -37,12 +37,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
     QTabWidget,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -473,7 +475,9 @@ class AgentPanel(QWidget):
             "their findings are folded into a single prompt, and the model "
             "gets one pass with no way to ask for anything further.")
         self.cli_mcp_check.toggled.connect(self._notify_config_changed)
-        form.addRow("Agentic tools:", self.cli_mcp_check)
+        # Driven by the Mode selector; kept as state, not shown.
+        self.cli_mcp_check.setParent(self)
+        self.cli_mcp_check.setVisible(False)
 
         # -- HTTP endpoint fields --
         self.base_url_edit = QLineEdit()
@@ -541,17 +545,63 @@ class AgentPanel(QWidget):
         knobs.addStretch(1)
         form.addRow("", self._wrap(knobs))
 
+        hide_row = QHBoxLayout()
+        hide_row.addStretch(1)
+        self.hide_connection_btn = QPushButton("Done — hide these settings \u25b4")
+        self.hide_connection_btn.setToolTip(
+            "Fold the connection settings into one line. 'Edit connection' "
+            "brings them back.")
+        self.hide_connection_btn.clicked.connect(
+            lambda: self.set_connection_collapsed(True))
+        hide_row.addWidget(self.hide_connection_btn)
+        form.addRow("", self._wrap(hide_row))
+
         layout.addWidget(cfg_box)
+        self._cfg_box = cfg_box
+
+        self.connection_summary = QWidget()
+        conn_row = QHBoxLayout(self.connection_summary)
+        conn_row.setContentsMargins(0, 0, 0, 0)
+        self.connection_label = QLabel("")
+        self.connection_label.setStyleSheet("color: #333;")
+        conn_row.addWidget(self.connection_label, 1)
+        self.edit_connection_btn = QPushButton("Edit connection \u25be")
+        self.edit_connection_btn.setToolTip(
+            "Show the LLM backend settings (CLI path, model, endpoint, "
+            "limits).")
+        self.edit_connection_btn.clicked.connect(
+            lambda: self.set_connection_collapsed(False))
+        conn_row.addWidget(self.edit_connection_btn)
+        self.connection_summary.setVisible(False)
+        layout.addWidget(self.connection_summary)
+        self._connection_collapsed = False
 
         # --- Mode selector ---
         mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(
+            "Investigate — the agent calls analysis tools itself "
+            "(recommended)", "agentic")
+        self.mode_combo.addItem(
+            "Quick diagnosis — one answer from the report, no tools", "quick")
+        self.mode_combo.setToolTip(
+            "Investigate: the model decides which deterministic analysis tools "
+            "to call, reads their results and iterates; follow-up questions "
+            "keep the tools (and Tessent commands, with the Copilot CLI).\n"
+            "Quick diagnosis: one pass over the report with no way to fetch "
+            "more evidence.")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_combo_changed)
+        mode_row.addWidget(self.mode_combo)
         self.agentic_check = QCheckBox("Agentic mode (let the agent call skills as tools)")
         self.agentic_check.setToolTip(
             "When on, the LLM decides which analysis skills to invoke, sees "
             "their findings, and iterates before writing its diagnosis.\n"
             "Requires an LLM endpoint that supports tool/function calling.")
         self.agentic_check.toggled.connect(self._on_mode_toggled)
-        mode_row.addWidget(self.agentic_check)
+        # Driven by the Mode selector; kept as state, not shown.
+        self.agentic_check.setParent(self)
+        self.agentic_check.setVisible(False)
         mode_row.addStretch(1)
         layout.addLayout(mode_row)
 
@@ -566,32 +616,52 @@ class AgentPanel(QWidget):
             "you can ask a follow-up or run again.")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
-        self.build_btn = QPushButton("Build Prompt Only")
-        self.build_btn.clicked.connect(self.on_build_prompt)
-        self.copy_prompt_btn = QPushButton("Copy Prompt")
-        self.copy_prompt_btn.clicked.connect(self.on_copy_prompt)
-        self.save_prompt_btn = QPushButton("Save Prompt…")
-        self.save_prompt_btn.clicked.connect(self.on_save_prompt)
-        self.copy_resp_btn = QPushButton("Copy Response")
-        self.copy_resp_btn.clicked.connect(self.on_copy_response)
-        self.save_resp_btn = QPushButton("Save Response…")
-        self.save_resp_btn.clicked.connect(self.on_save_response)
+        self.build_btn = QAction("Build Prompt Only", self)
+        self.build_btn.triggered.connect(self.on_build_prompt)
+        self.copy_prompt_btn = QAction("Copy Prompt", self)
+        self.copy_prompt_btn.triggered.connect(self.on_copy_prompt)
+        self.save_prompt_btn = QAction("Save Prompt…", self)
+        self.save_prompt_btn.triggered.connect(self.on_save_prompt)
+        self.copy_resp_btn = QAction("Copy Response", self)
+        self.copy_resp_btn.triggered.connect(self.on_copy_response)
+        self.save_resp_btn = QAction("Save Response…", self)
+        self.save_resp_btn.triggered.connect(self.on_save_response)
         self.verify_btn = QPushButton("Verify")
         self.verify_btn.setToolTip(
             "Cross-check the agent's answer against the deterministic report: "
             "confirm every fault it references exists and show its true "
             "class / root-cause, and flag any invented fault paths.")
         self.verify_btn.clicked.connect(self.on_verify)
-        self.suggest_btn = QPushButton("Suggest Fixes")
+        self.suggest_btn = QAction("Suggest Fixes (no LLM)", self)
         self.suggest_btn.setToolTip(
             "Deterministically rank coverage-loss faults by impact and propose "
             "concrete DFT fixes (observation/control points, constraint "
             "relaxation, scan insertion) — no LLM used.")
-        self.suggest_btn.clicked.connect(self.on_suggest_fixes)
-        for b in (self.run_btn, self.stop_btn, self.build_btn,
-                  self.copy_prompt_btn, self.save_prompt_btn,
-                  self.copy_resp_btn, self.save_resp_btn,
-                  self.verify_btn, self.suggest_btn):
+        self.suggest_btn.triggered.connect(self.on_suggest_fixes)
+        self.agent_more_btn = QToolButton()
+        self.agent_more_btn.setText("\u22ef More")
+        self.agent_more_btn.setToolTip(
+            "Preview, copy or save the prompt and the answer, or get "
+            "deterministic fix suggestions.")
+        self.agent_more_btn.setPopupMode(QToolButton.InstantPopup)
+        more_menu = QMenu(self.agent_more_btn)
+        more_menu.setToolTipsVisible(True)
+        for act in (self.suggest_btn, None, self.build_btn,
+                    self.copy_prompt_btn, self.save_prompt_btn, None,
+                    self.copy_resp_btn, self.save_resp_btn):
+            if act is None:
+                more_menu.addSeparator()
+            else:
+                more_menu.addAction(act)
+        self.agent_more_btn.setMenu(more_menu)
+        self.details_btn = QPushButton("Show prompt && tool trace")
+        self.details_btn.setCheckable(True)
+        self.details_btn.setToolTip(
+            "Show the two expert panes: the exact prompt sent to the model and "
+            "the log of every tool the agent called.")
+        self.details_btn.toggled.connect(self._set_details_visible)
+        for b in (self.run_btn, self.stop_btn, self.verify_btn,
+                  self.agent_more_btn, self.details_btn):
             btns.addWidget(b)
         btns.addStretch(1)
         layout.addLayout(btns)
@@ -746,6 +816,9 @@ class AgentPanel(QWidget):
         self._set_chat_enabled(False)
         self._update_button_state()
         self._on_backend_changed()
+        self._on_mode_combo_changed()
+        self._set_details_visible(False)
+        self.status_label.setText("Run an analysis first, then run the AI agent.")
 
         self.tabs.addTab(agent_tab, "Debug Agent")
         self.tabs.addTab(self._build_auth_tab(), "Authentication")
@@ -824,6 +897,8 @@ class AgentPanel(QWidget):
             if self._splitter.indexOf(w) != -1:
                 pos += 1
         self._splitter.insertWidget(pos, box)
+        if box in self._splitter_boxes[:2] and not self.details_visible():
+            box.setVisible(False)
         for i, w in enumerate(order):
             idx = self._splitter.indexOf(w)
             if idx != -1:
@@ -1056,7 +1131,7 @@ class AgentPanel(QWidget):
         """Show only the fields relevant to the selected backend."""
         is_cli = self._current_backend() == "cli"
         for w in (self.cli_path_row_widget, self.cli_home_edit,
-                  self.cli_model_row_widget, self.cli_mcp_check):
+                  self.cli_model_row_widget):
             self._form.setRowVisible(w, is_cli)
         for w in (self.base_url_edit, self.model_edit, self.api_key_edit):
             self._form.setRowVisible(w, not is_cli)
@@ -1191,6 +1266,11 @@ class AgentPanel(QWidget):
                 "to continue the conversation on this report.")
 
     def _on_mode_toggled(self, checked: bool) -> None:
+        idx = self.mode_combo.findData("agentic" if checked else "quick")
+        if idx >= 0 and idx != self.mode_combo.currentIndex():
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(idx)
+            self.mode_combo.blockSignals(False)
         self.run_btn.setText(
             "Run Agentic Agent" if checked else "Run AI Debug Agent")
         if checked:
@@ -1213,6 +1293,50 @@ class AgentPanel(QWidget):
         has_report = self._report is not None
         for b in (self.run_btn, self.build_btn):
             b.setEnabled(has_report)
+
+    # -- layout: mode, connection box, detail panes --------------------------
+
+    def _on_mode_combo_changed(self, *args) -> None:
+        agentic = self.mode_combo.currentData() == "agentic"
+        if agentic:
+            self.cli_mcp_check.setChecked(True)
+        if self.agentic_check.isChecked() != agentic:
+            self.agentic_check.setChecked(agentic)
+        self.config_changed.emit()
+
+    def set_connection_collapsed(self, collapsed: bool) -> None:
+        """Fold the LLM backend box into one summary line, or show it again."""
+        self._connection_collapsed = collapsed
+        self._cfg_box.setVisible(not collapsed)
+        self.connection_summary.setVisible(collapsed)
+        self._update_connection_summary()
+        self.config_changed.emit()
+
+    def _update_connection_summary(self) -> None:
+        if self._current_backend() == "cli":
+            model = self.cli_model_combo.currentText().strip() or "auto"
+            text = f"Connection: GitHub Copilot CLI · model {model}"
+        else:
+            model = self.model_edit.text().strip() or "(unset)"
+            url = self.base_url_edit.text().strip() or "(no URL)"
+            text = f"Connection: HTTP endpoint {url} · model {model}"
+        self.connection_label.setText(text)
+
+    def _set_details_visible(self, visible: bool) -> None:
+        """Show or hide the Assembled Prompt and Agent Tool Trace panes."""
+        self._details_visible = visible
+        for box in self._splitter_boxes[:2]:
+            if box not in self._popouts:
+                box.setVisible(visible)
+        if self.details_btn.isChecked() != visible:
+            self.details_btn.setChecked(visible)
+        self.details_btn.setText(
+            "Hide prompt && tool trace" if visible
+            else "Show prompt && tool trace")
+        self.config_changed.emit()
+
+    def details_visible(self) -> bool:
+        return getattr(self, "_details_visible", False)
 
     def current_config(self) -> AgentConfig:
         return AgentConfig(
@@ -1246,6 +1370,9 @@ class AgentPanel(QWidget):
             "max_tokens": int(self.maxtok_spin.value()),
             "max_faults": int(self.maxfaults_spin.value()),
             "remember_token": self.auth_remember_check.isChecked(),
+            "agent_mode": self.mode_combo.currentData(),
+            "connection_collapsed": self._connection_collapsed,
+            "show_details": self.details_visible(),
         }
 
     def import_settings(self, cfg: dict) -> None:
@@ -1271,12 +1398,19 @@ class AgentPanel(QWidget):
             self.auth_remember_check.setChecked(bool(cfg["remember_token"]))
             self.auth_remember_check.blockSignals(False)
         self._on_backend_changed()
+        mode_idx = self.mode_combo.findData(cfg.get("agent_mode", "agentic"))
+        if mode_idx >= 0:
+            self.mode_combo.setCurrentIndex(mode_idx)
+        self._on_mode_combo_changed()
+        self.set_connection_collapsed(bool(cfg.get("connection_collapsed")))
+        self._set_details_visible(bool(cfg.get("show_details")))
 
     # -- actions -------------------------------------------------------------
 
     def on_build_prompt(self) -> None:
         if self._report is None:
             return
+        self._set_details_visible(True)
         config = self.current_config()
         agentic = self.agentic_check.isChecked()
         system = AGENTIC_SYSTEM_PROMPT if agentic else SYSTEM_PROMPT
@@ -2012,6 +2146,9 @@ class AgentPanel(QWidget):
             "click a fault to focus it, or Verify." + tools_note)
         self.run_btn.setEnabled(True)
         self._set_stop_enabled(False)
+        # The backend works now; give its settings' space to the answer.
+        if not self._connection_collapsed:
+            self.set_connection_collapsed(True)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
         self._append_chat("Agent", final)
@@ -2406,6 +2543,7 @@ class AgentPanel(QWidget):
                                 text))
         grounded = sorted(t for t in tokens if t in lookup)
         ungrounded = sorted(t for t in tokens if t not in lookup)
+        self._set_details_visible(True)
 
         lines = ["=== VERIFICATION (deterministic ground-truth) ===",
                  f"Fault-path references in answer: {len(tokens)}",

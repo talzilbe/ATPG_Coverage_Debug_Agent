@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv as csv_mod
+import html as html_mod
 import logging
 import os
 import shutil
@@ -26,7 +27,8 @@ from PySide6.QtWidgets import (
     QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTextBrowser, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from ..app import AnalysisInputs, PartitionInputs, _design_name
@@ -53,6 +55,60 @@ _TABLE_HEADERS = [
     "Fault Object", "Class", "Mapped", "Confidence", "Instance", "Cell",
     "Fan-in", "Fan-out", "Ctrl", "Obsv", "Constraint", "Scan", "Root Cause",
 ]
+
+_TABLE_HEADER_TIPS = [
+    "The fault site exactly as the fault list names it (hover a cell for the "
+    "full path).",
+    "Fault class from the ATPG tool: AU = ATPG untestable, UO = unobserved, "
+    "UC = uncontrolled.",
+    "The netlist instance the fault was mapped to.",
+    "How sure the mapping is: high / medium / low, or unresolved when the "
+    "object was not found in the netlist.",
+    "Instance name of the mapped cell.",
+    "Library cell type of the mapped instance.",
+    "Number of cells driving this site ('?' = unknown because unmapped).",
+    "Number of cells this site drives ('?' = unknown because unmapped).",
+    "Controllability problem found at the site (yes/no).",
+    "Observability problem found at the site (yes/no).",
+    "A constraint in the dofile touches this site (yes/no).",
+    "Whether the site sits on a scan boundary (yes / no / unknown).",
+    "The structural root cause this tool derived for the fault.",
+]
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+
+def _html_escape(text) -> str:
+    return html_mod.escape(str(text))
+
+
+def _demo_inputs() -> Optional[tuple]:
+    """(netlist, faults, constraints) of the bundled demo, if it is present."""
+    base = os.path.join(_REPO_ROOT, "sample_data")
+    paths = tuple(os.path.join(base, n) for n in (
+        "demo_netlist.v", "demo_faults.mtfi", "demo_constraints.do"))
+    return paths if all(os.path.isfile(p) for p in paths) else None
+
+
+_WELCOME_HTML = """
+<body style="font-family: Segoe UI, sans-serif; padding: 30px; color: #333;">
+<h2 style="color:#0b5394;">ATPG Coverage Debug &mdash; getting started</h2>
+<ol style="font-size: 14px; line-height: 1.7;">
+  <li>Pick a <b>Netlist</b> and a <b>Fault list</b> at the top
+      (constraints are optional).</li>
+  <li>Click the blue <b>&#9654; Analyze</b> button.</li>
+  <li>Read this <b>Summary</b> tab: the box at the top shows the coverage and
+      where to start.</li>
+  <li>Work the <b>Triage &amp; Fix Plan</b> tab, then drill into single
+      faults in the <b>Coverage Loss Table</b>.</li>
+  <li>Optionally ask the <b>AI Debug Agent</b> for an explanation.</li>
+</ol>
+<p style="color:#555;">New here? Click <b>Try the demo data</b> above to load
+a small example design. <b>Help &rarr; User Guide</b> explains every screen;
+<b>View</b> brings back the advanced tabs (Logs, Skills, Custom Skills).</p>
+</body>
+"""
 
 
 _HELP_HTML = """
@@ -87,10 +143,61 @@ results. Everything below is organised in the order you would normally use
 it.</p>
 
 <div class="tip"><b>Quick start:</b> 1) pick a <b>Netlist</b> and a
-<b>Fault list</b> (constraints optional) &rarr; 2) click <b>Analyze</b> &rarr;
-3) read the <b>Summary</b>, then work the <b>Triage &amp; Fix Plan</b> tab
+<b>Fault list</b> (constraints optional) &rarr; 2) click the blue
+<b>&#9654; Analyze</b> button &rarr; 3) read the box at the top of the
+<b>Summary</b> tab, then work the <b>Triage &amp; Fix Plan</b> tab
 &rarr; 4) drill into individual faults in the <b>Coverage Loss Table</b>
-&rarr; 5) optionally run the <b>AI Debug Agent</b> for an explanation.</div>
+&rarr; 5) optionally run the <b>AI Debug Agent</b> for an explanation.
+First time? <b>Try the demo data</b> (Summary tab, or <b>Help</b> menu) loads
+a small example design so you can explore before using your own files.</div>
+
+<h2>Finding your way around &mdash; and getting things back</h2>
+<p>The window shows only what a first-time user needs. Nothing has been
+removed: everything else is one click away, and this table says where.</p>
+<table>
+<tr><th>If you are looking for&hellip;</th><th>Do this</th></tr>
+<tr><td>The input file rows (they fold away after Analyze)</td>
+    <td>Click <b class="k">Change inputs &#9662;</b> at the right of the
+    one-line design summary. <b class="k">Hide inputs &#9652;</b> folds
+    them again.</td></tr>
+<tr><td>The partition queue</td>
+    <td>Click <b class="k">+ Analyze several partitions&hellip;</b> under the
+    input rows (see section&nbsp;1).</td></tr>
+<tr><td>Export Markdown / CSV</td>
+    <td>The <b class="k">Export &#9662;</b> button.</td></tr>
+<tr><td>Compare Report, Edit Report, Clear</td>
+    <td>The <b class="k">More &#9662;</b> button.</td></tr>
+<tr><td>The <b>Logs / Warnings</b>, <b>Skills</b> and <b>Custom Skills</b>
+    tabs</td>
+    <td><b>View &rarr; Open Logs / Warnings</b> (or Skills, Custom Skills)
+    opens one; <b>View &rarr; Show Advanced Tabs</b> keeps all three on the tab
+    bar (remembered next time). The warnings count on the Summary box also
+    opens the Logs tab.</td></tr>
+<tr><td>Jumping between the main tabs</td>
+    <td><b>View &rarr; Go to Tab</b>, or <code>Ctrl+1</code> Summary,
+    <code>Ctrl+2</code> Triage &amp; Fix Plan, <code>Ctrl+3</code> Coverage
+    Loss Table, <code>Ctrl+4</code> AI Debug Agent, <code>Ctrl+5</code>
+    Tessent Visualizer.</td></tr>
+<tr><td>The AI agent's connection settings (they fold away after the first
+    successful run)</td>
+    <td><b class="k">Edit connection &#9662;</b> on the AI Debug Agent tab.
+    <b class="k">Done &mdash; hide these settings</b> folds them again.</td></tr>
+<tr><td>The <b>Assembled Prompt</b> and <b>Agent Tool Trace</b> panes</td>
+    <td><b class="k">Show prompt &amp; tool trace</b> on the AI Debug Agent
+    tab. They also open by themselves when <b>Verify</b> or <b>Build Prompt
+    Only</b> writes into them.</td></tr>
+<tr><td>Build Prompt Only, Copy / Save Prompt, Copy / Save Response,
+    Suggest Fixes</td>
+    <td>The <b class="k">&#8943; More</b> button next to <b>Verify</b>.</td></tr>
+<tr><td>A panel you popped out into its own window</td>
+    <td>Close that window, or click <b class="k">Dock back</b>.</td></tr>
+<tr><td>The full report in a browser</td>
+    <td><b class="k">Open Report in Browser</b> (Summary tab) or the link in
+    the Summary box.</td></tr>
+<tr><td>This guide</td><td><b>Help &rarr; User Guide</b>, or <code>F1</code>.</td></tr>
+</table>
+<p>Hover any column header in the tables, or any button, for a one-line
+explanation.</p>
 
 <h2>1. Input files (top of the window)</h2>
 <table>
@@ -108,10 +215,18 @@ it.</p>
 <tr><td><b class="k">Output dir</b></td>
     <td>Default folder for exported Markdown / CSV / JSON reports.</td></tr>
 </table>
+<p>Once a report is shown, these rows fold into one line naming the design and
+the files that were analysed, so the results get the screen. Click
+<b class="k">Change inputs &#9662;</b> on that line to show them again; a new
+<b>Analyze</b> or <b>Load Report</b> folds them back. <b>More &#9662; &rarr;
+Clear results</b> brings the full input area back too.</p>
 
 <h3>Analyzing several partitions at once</h3>
 <p>You can queue multiple partitions (each its own netlist + fault list +
-optional constraints) and analyze them together:</p>
+optional constraints) and analyze them together. The queue is hidden until you
+need it: click <b class="k">+ Analyze several partitions&hellip;</b> under the
+input rows to show it (<b class="k">&minus; Hide the partition queue</b>
+hides it again; a queued partition stays queued).</p>
 <ul>
   <li class="step">Set the files above, click <b class="k">Add Partition</b>
       &mdash; it is queued with a name derived from the netlist. Repeat for
@@ -139,35 +254,41 @@ derived name. The saved file is a full report you can re-open with
 <b>Load Report</b>.</p>
 
 <h2>2. Action buttons</h2>
+<p>One row under the inputs. The less common actions sit behind the two
+<b>&#9662;</b> drop-down buttons so the row stays short.</p>
 <table>
 <tr><th>Button</th><th>Use</th></tr>
-<tr><td><b class="k">Analyze</b></td><td>Parse the inputs and build the report.
-    Runs in the background; watch the progress bar and status bar.</td></tr>
+<tr><td><b class="k">&#9654; Analyze</b> (blue)</td><td>Parse the inputs and
+    build the report. Runs in the background; watch the progress bar and
+    status bar. This is where every session starts.</td></tr>
 <tr><td><b class="k">Cancel</b></td><td>Abort a running analysis.</td></tr>
 <tr><td><b class="k">Add Partition / Remove / Clear Queue</b></td>
     <td>Build a queue of partitions to analyze together (see section 1).</td></tr>
-<tr><td><b class="k">Export Markdown / Export CSV</b></td>
+<tr><td><b class="k">Export &#9662;</b> &rarr; Markdown report / CSV table</td>
     <td>Save the report as Markdown &mdash; including the coverage triage,
     hierarchy hotspots, blocking sources and the ranked fix plan &mdash; or
     the coverage-loss table as CSV. Exporting Markdown also writes a
     <code>&lt;name&gt;_categories</code> folder beside it holding every fault
-    of each selected category, and links to it.</td></tr>
+    of each selected category, and links to it. The same two entries are in
+    the <b>File</b> menu.</td></tr>
 <tr><td><b class="k">Save Report / Load Report</b></td>
     <td>Save the full analysis (including the AI investigation) to JSON and
     reload it later &mdash; no need to re-run Analyze. The per-category fault
     files are written into a folder beside the JSON, so the saved session is
     self-contained and can be handed to someone else. A reloaded session
     remembers which files it wrote.</td></tr>
-<tr><td><b class="k">Compare Report</b></td>
+<tr><td><b class="k">More &#9662;</b> &rarr; Compare with a previous
+    report</td>
     <td>Load a previous (baseline) JSON report and diff it against the current
     one: <b>regressed</b> (new loss), <b>fixed</b>, and <b>changed</b> faults.
     You can then ask the AI agent &ldquo;what changed vs the baseline?&rdquo;</td></tr>
-<tr><td><b class="k">Edit Report</b></td>
+<tr><td><b class="k">More &#9662;</b> &rarr; Edit report (waive faults)</td>
     <td>Waive faults and recompute coverage &mdash; see section 4.</td></tr>
 <tr><td><b class="k">Auto-save report</b> (checkbox)</td>
     <td>Auto-save the JSON report to the Output dir after Analyze (see
     section 1).</td></tr>
-<tr><td><b class="k">Clear</b></td><td>Reset the views to start fresh.</td></tr>
+<tr><td><b class="k">More &#9662;</b> &rarr; Clear results</td><td>Reset the
+    views to start fresh; the input rows are shown again.</td></tr>
 </table>
 
 <h3>Window size &mdash; the View menu</h3>
@@ -180,11 +301,27 @@ rather than the title bar:</p>
 <tr><td><b class="k">Restore Down</b></td><td><code>Ctrl+Shift+M</code></td></tr>
 </table>
 <p>These drive the window through Qt directly, so they work even on remote X
-sessions whose window manager ignores the title-bar maximize button.</p>
+sessions whose window manager ignores the title-bar maximize button. The same
+<b>View</b> menu also holds <b>Go to Tab</b> (<code>Ctrl+1</code>&hellip;<code>Ctrl+5</code>)
+and the advanced tabs (see <i>Finding your way around</i> above).</p>
 
 <h2>3. Result tabs</h2>
+<p>Five tabs are always shown: <b>Summary</b>, <b>Triage &amp; Fix Plan</b>,
+<b>Coverage Loss Table</b>, <b>AI Debug Agent</b> and <b>Tessent
+Visualizer</b>. <b>Logs / Warnings</b>, <b>Skills</b> and <b>Custom
+Skills</b> are advanced tabs, hidden until you open them from the
+<b>View</b> menu.</p>
 <h3>Summary</h3>
-<p>A full HTML report: coverage metric, fault-class / subtype breakdown, top
+<p><b>The box at the top</b> is the place to start. It shows the test and
+fault coverage, how many faults lose coverage, how many of those are
+<i>actionable</i> (mapped onto the netlist and not tied off), and any
+warnings (click the count to read them). Under <b>Where to start</b> it lists
+the biggest coverage-loss categories with the first fix the Fix Plan proposes
+for each; click a category to open it on the Triage tab. The <b>Next</b>
+links jump to the Triage tab, the fault table, the AI agent or the full
+report in a browser.</p>
+<p>Below the box is the full HTML report: coverage metric, fault-class /
+subtype breakdown, top
 root causes, module and instance hotspots, and any analyst note. Click
 <b>Open Report in Browser</b> for the full-fidelity version (and a shareable
 local link).</p>
@@ -258,16 +395,20 @@ scan-boundary flags, and the diagnosed root cause.</p>
 </ul>
 
 <h3>Logs / Warnings</h3>
-<p>Parser and skill warnings (unrecognised lines, unresolved mappings, etc.).
-Check here first if a result looks incomplete.</p>
+<p>Advanced tab (<b>View &rarr; Open Logs / Warnings</b>, or the warnings count
+on the Summary box). Parser and skill warnings (unrecognised lines,
+unresolved mappings, etc.). Check here first if a result looks
+incomplete.</p>
 
 <h3>Skills</h3>
-<p>Toggle and configure the deterministic analysis skills (coverage hotspots,
+<p>Advanced tab (<b>View &rarr; Open Skills</b>). Toggle and configure the
+deterministic analysis skills (coverage hotspots,
 constraint impact, fault-cone summary, scan-boundary, DFT/ATPG debug…). Each
 card has an enable checkbox and tunable parameters; changes persist.</p>
 
 <h3>Custom Skills</h3>
-<p>Load your own Python skills from a directory, or write one in the built-in
+<p>Advanced tab (<b>View &rarr; Open Custom Skills</b>). Load your own Python
+skills from a directory, or write one in the built-in
 editor from the provided template, to add project-specific detectors. Loaded
 custom skills appear on the Skills tab and become AI agent tools.</p>
 
@@ -277,7 +418,7 @@ conclusion can be confirmed in the tool that owns the authoritative answer.
 Fully described in section&nbsp;7.</p>
 
 <h2>4. Edit Report &mdash; waiving faults &amp; recomputing coverage</h2>
-<p>Open with <b>Edit Report</b>. Excluded faults are removed from the totals so
+<p>Open with <b>More &#9662; &rarr; Edit report (waive faults)</b>. Excluded faults are removed from the totals so
 the coverage metric rises, while the report <b>layout stays identical</b>.
 Edits are reversible (they apply to a pristine base report) and are saved with
 the JSON report. You can waive at four levels:</p>
@@ -477,6 +618,10 @@ It reads only the deterministic report, so it cannot invent faults. Run an
 Analyze first, then open the <b>AI Debug Agent</b> tab.</p>
 
 <h3>Step 1 &mdash; choose a backend (LLM Backend box)</h3>
+<p>Fill this box in once. After the first successful run it folds into a
+single <i>Connection: &hellip;</i> line; click <b class="k">Edit connection
+&#9662;</b> to change it, or <b class="k">Done &mdash; hide these
+settings</b> to fold it yourself. The choice is remembered.</p>
 <ul>
   <li class="step"><b>GitHub Copilot CLI (local subprocess)</b> &mdash; the
       default. Uses the bundled <code>copilot</code> CLI; data stays in the
@@ -517,13 +662,16 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
 <b>Check authentication</b> to confirm you are signed in.</div>
 
 <h3>Step 3 &mdash; pick a mode</h3>
+<p>One <b class="k">Mode</b> drop-down above the Run button:</p>
 <ul>
-  <li class="step"><b>Standard</b> (agentic off): the enabled skills run
-      locally and their findings are folded into a single prompt.</li>
-  <li class="step"><b>Agentic mode</b>: the model itself decides which
+  <li class="step"><b>Quick diagnosis</b>: the enabled skills run
+      locally and their findings are folded into a single prompt. One answer,
+      no way to fetch more evidence.</li>
+  <li class="step"><b>Investigate</b> (recommended, the default): the model
+      itself decides which
       investigative tools to call and iterates. For the CLI backend this is
-      driven through a local <b>MCP</b> server (&ldquo;Agentic tools
-      (MCP)&rdquo; checkbox). The HTTP backend needs an endpoint that supports
+      driven through a local <b>MCP</b> server, switched on automatically by
+      this mode. The HTTP backend needs an endpoint that supports
       tool/function calling. The available tools are:
       <table>
       <tr><th>Tool</th><th>Answers</th></tr>
@@ -658,9 +806,17 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
 </ul>
 
 <h3>Step 4 &mdash; run &amp; review</h3>
+<p>The row under the Mode drop-down holds <b>Run</b>, <b>Stop</b>,
+<b>Verify</b>, a <b class="k">&#8943; More</b> menu and
+<b class="k">Show prompt &amp; tool trace</b>. The two expert panes &mdash;
+<b>Assembled Prompt</b> and <b>Agent Tool Trace</b> &mdash; are hidden at
+first so the answer and the chat get the room; that button shows them, and
+they open by themselves when Verify or Build Prompt Only writes into
+them.</p>
 <table>
 <tr><th>Button</th><th>Use</th></tr>
-<tr><td><b class="k">Run AI Debug Agent</b></td><td>Generate the A&ndash;F
+<tr><td><b class="k">Run AI Debug Agent</b> / <b class="k">Run Agentic
+    Agent</b></td><td>Generate the A&ndash;F
     diagnosis. Output streams into the Agent Response pane; fault ids are
     clickable and focus the row in the table.</td></tr>
 <tr><td><b class="k">Stop</b></td><td>Stop the turn in progress (a run or a
@@ -668,18 +824,22 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
     <i>partial</i>; the conversation, its session and its tools survive, so
     you can ask a follow-up or run again. A second Stop sits in the chat row
     so it is reachable from a popped-out chat window.</td></tr>
-<tr><td><b class="k">Build Prompt Only</b></td><td>Preview exactly what would be
+<tr><td><b class="k">&#8943; More &rarr; Build Prompt Only</b></td><td>Preview exactly what would be
     sent to the LLM, without calling it.</td></tr>
 <tr><td><b class="k">Verify</b></td><td>Cross-check the answer against the
     report &mdash; confirms every referenced fault exists and flags invented
-    paths.</td></tr>
-<tr><td><b class="k">Suggest Fixes</b></td><td>Deterministically rank faults by
+    paths. The result appears in the Agent Tool Trace pane.</td></tr>
+<tr><td><b class="k">&#8943; More &rarr; Suggest Fixes</b></td><td>Deterministically rank faults by
     impact and propose concrete DFT fixes (observation/control points,
     constraint relaxation, scan insertion). No LLM used. For fixes tied to a
     specific fault <i>category</i>, use the <b>Fix Plan</b> view on the
     Triage tab instead.</td></tr>
-<tr><td>Copy / Save Prompt &amp; Response</td><td>Export the prompt or the
+<tr><td><b class="k">&#8943; More</b> &rarr; Copy / Save Prompt &amp;
+    Response</td><td>Export the prompt or the
     agent's answer.</td></tr>
+<tr><td><b class="k">Show prompt &amp; tool trace</b></td><td>Show or hide
+    the Assembled Prompt and Agent Tool Trace panes. Remembered next
+    time.</td></tr>
 </table>
 <p>Every answer is also checked automatically against the guardrails described
 in section&nbsp;5 &mdash; the first answer and every follow-up alike. If the
@@ -687,11 +847,13 @@ model shortens a hierarchy path, quotes one that is not in your inputs, or
 predicts a coverage gain, it is asked once to correct the answer; anything
 still unsupported afterwards appears as a <b>Guardrail check</b> note beneath
 it. Treat anything listed there as unverified.</p>
-<p><b>Agentic mode needs the tools.</b> With the Copilot CLI backend, leaving
-<b>Agentic tools</b> unticked is <i>not</i> an agentic run: the enabled skills
+<p><b>Investigate mode is what gives the agent its tools.</b> In <b>Quick
+diagnosis</b> the enabled skills
 execute once locally, their findings are folded into a single prompt, and the
-model gets one pass with no way to ask for anything further. Tick it (or use
-the HTTP backend) for a real investigation loop.</p>
+model gets one pass with no way to ask for anything further. Choose
+<b>Investigate</b> for a real investigation loop &mdash; and for follow-up
+questions that can still call tools (and, with the Copilot CLI, Tessent
+commands).</p>
 <p><b>What the agent will and will not say.</b> It is told that you are already
 looking at the report, so it does not restate fault counts, hotspots, the
 per-fault table or the fix plan &mdash; those are computed exactly and
@@ -741,7 +903,7 @@ tells you when rows are being left out.</p>
 <p>It caps the <i>table only</i>. The summary, the evidence basis and the whole
 triage &mdash; categories, hotspots, blocking sources, fix plan &mdash; are
 computed over <b>every</b> fault and are always sent in full, so the agent
-always reasons about the complete population. In <b>Agentic</b> mode it can
+always reasons about the complete population. In <b>Investigate</b> mode it can
 also pull any individual fault on demand with the <code>list_faults</code> and
 <code>get_fault_detail</code> tools, so the cap hides nothing from it. Raise it
 when you want the model to eyeball raw rows for a pattern the clustering
@@ -750,7 +912,8 @@ missed; lower it for a small-context endpoint or to cut cost.</p>
 <h3>Bigger, easier-to-read panels &mdash; pop-out windows</h3>
 <p>Each of the four panels &mdash; <b>Assembled Prompt</b>, <b>Agent Tool
 Trace</b>, <b>Agent Response</b> and <b>Follow-up Chat</b> &mdash; has an
-<b class="k">&#10530; Open in window</b> button in its top-right corner. Click it
+<b class="k">&#10530; Open in window</b> button in its top-right corner (the
+first two are visible once <b>Show prompt &amp; tool trace</b> is on). Click it
 to detach that panel into a large, resizable window that is easier to read and
 type in. Live streaming, clickable fault ids, and the chat input all keep
 working in the pop-out. Close the window (or click <b>Dock back</b>) to return
@@ -770,10 +933,11 @@ up &mdash; for example <code>/&nbsp;&nbsp;Agent running, calling tools&hellip;
 1m&nbsp;24s</code> &mdash; for as long as a run or a chat reply is in flight,
 and reports the total time when the answer arrives.</p>
 
-<div class="tip"><b>Recommended flow:</b> Analyze &rarr; skim Summary &rarr;
-work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in Agentic mode
+<div class="tip"><b>Recommended flow:</b> Analyze &rarr; read the Summary box
+&rarr; work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in
+<b>Investigate</b> mode
 &rarr; <b>Verify</b> the answer &rarr; ask follow-ups &rarr; waive legitimate
-faults via <b>Edit Report</b> &rarr; <b>Save Report</b>.</div>
+faults via <b>More &#9662; &rarr; Edit report</b> &rarr; <b>Save Report</b>.</div>
 
 <h2>7. Tessent Visualizer &mdash; opening the real tool</h2>
 <p>Everything this application concludes is <i>structural</i>: it is read off
@@ -901,7 +1065,7 @@ the channel off entirely; the launch then works exactly as before, and the
 signal action reports that the profile disables it.</p>
 
 <h3>Letting the AI agent run commands in the session</h3>
-<p>With the Copilot CLI backend and <b class="k">Agentic tools</b> on, the agent
+<p>With the Copilot CLI backend in <b class="k">Investigate</b> mode, the agent
 can ask to run a Tcl script in the running session &mdash; to check something
 the offline analysis cannot see, or because you asked it to. This needs the
 profile to set <code>control.allow_agent_eval</code> to <code>true</code>
@@ -1058,16 +1222,36 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         outer = QVBoxLayout(central)
 
+        # Inputs: shown in full until a report exists, then folded into one
+        # summary line so the results get the screen.
+        self.inputs_box = QWidget()
+        inputs_layout = QVBoxLayout(self.inputs_box)
+        inputs_layout.setContentsMargins(0, 0, 0, 0)
         self.netlist_picker = _FilePicker("Netlist (.v / .v.gz):")
         self.faults_picker = _FilePicker("Fault list (.mtfi / .mtfi.gz / flat):")
         self.constraints_picker = _FilePicker("Constraints (optional .do):")
         self.outdir_picker = _FilePicker("Output dir:", directory=True)
         for picker in (self.netlist_picker, self.faults_picker,
                        self.constraints_picker, self.outdir_picker):
-            outer.addWidget(picker)
+            inputs_layout.addWidget(picker)
+
+        toggle_row = QHBoxLayout()
+        self.partitions_toggle = QPushButton("+ Analyze several partitions…")
+        self.partitions_toggle.setFlat(True)
+        self.partitions_toggle.setCheckable(True)
+        self.partitions_toggle.setStyleSheet("color: #0b5394; text-align: left;")
+        self.partitions_toggle.setToolTip(
+            "Show the partition queue, to analyze several netlist / fault-list "
+            "sets in one run. Not needed for a single design.")
+        self.partitions_toggle.toggled.connect(self._set_partitions_visible)
+        toggle_row.addWidget(self.partitions_toggle)
+        toggle_row.addStretch(1)
+        inputs_layout.addLayout(toggle_row)
 
         # --- Partition queue (analyze several partitions together) ---
-        part_bar = QHBoxLayout()
+        self.partition_box = QWidget()
+        part_bar = QHBoxLayout(self.partition_box)
+        part_bar.setContentsMargins(0, 0, 0, 0)
         part_bar.addWidget(QLabel("Partitions:"))
         self.partition_list = QListWidget()
         self.partition_list.setMaximumHeight(78)
@@ -1094,18 +1278,40 @@ class MainWindow(QMainWindow):
             part_btns.addWidget(b)
         part_btns.addStretch(1)
         part_bar.addLayout(part_btns)
-        outer.addLayout(part_bar)
+        self.partition_box.setVisible(False)
+        inputs_layout.addWidget(self.partition_box)
+        outer.addWidget(self.inputs_box)
+
+        # The one-line stand-in for the inputs once a report is shown.
+        self.inputs_summary = QWidget()
+        summary_row = QHBoxLayout(self.inputs_summary)
+        summary_row.setContentsMargins(0, 0, 0, 0)
+        self.inputs_summary_label = QLabel("")
+        self.inputs_summary_label.setStyleSheet("color: #333;")
+        self.inputs_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        summary_row.addWidget(self.inputs_summary_label, 1)
+        self.change_inputs_btn = QPushButton("Change inputs \u25be")
+        self.change_inputs_btn.setToolTip(
+            "Show the input files again, to pick different ones and re-run "
+            "Analyze.")
+        self.change_inputs_btn.clicked.connect(self._toggle_inputs)
+        summary_row.addWidget(self.change_inputs_btn)
+        self.inputs_summary.setVisible(False)
+        outer.addWidget(self.inputs_summary)
+        self._inputs_expanded = False
 
         btn_row = QHBoxLayout()
-        self.analyze_btn = QPushButton("Analyze")
+        self.analyze_btn = QPushButton("\u25b6  Analyze")
+        self.analyze_btn.setToolTip(
+            "Parse the inputs above and build the report. Start here.")
+        self.analyze_btn.setStyleSheet(
+            "QPushButton { background: #0b5394; color: white; font-weight: bold;"
+            " padding: 5px 18px; border-radius: 4px; }"
+            "QPushButton:disabled { background: #9fb6cc; }")
         self.analyze_btn.clicked.connect(self.on_analyze)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self.on_cancel)
         self.cancel_btn.setEnabled(False)
-        self.md_btn = QPushButton("Export Markdown")
-        self.md_btn.clicked.connect(self.on_export_md)
-        self.csv_btn = QPushButton("Export CSV")
-        self.csv_btn.clicked.connect(self.on_export_csv)
         self.save_report_btn = QPushButton("Save Report")
         self.save_report_btn.setToolTip(
             "Save the full analysis to a JSON file you can reload later "
@@ -1118,23 +1324,45 @@ class MainWindow(QMainWindow):
             "Load a previously saved report and work on it (tables + AI agent) "
             "without re-analyzing.")
         self.load_report_btn.clicked.connect(self.on_load_report)
-        self.compare_btn = QPushButton("Compare Report")
-        self.compare_btn.setToolTip(
+
+        self.export_btn = QToolButton()
+        self.export_btn.setText("Export \u25be")
+        self.export_btn.setToolTip("Write the report as Markdown or CSV.")
+        self.export_btn.setPopupMode(QToolButton.InstantPopup)
+        export_menu = QMenu(self.export_btn)
+        self.md_action = export_menu.addAction("Markdown report…")
+        self.md_action.triggered.connect(self.on_export_md)
+        self.csv_action = export_menu.addAction("CSV table…")
+        self.csv_action.triggered.connect(self.on_export_csv)
+        self.export_btn.setMenu(export_menu)
+
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More \u25be")
+        self.more_btn.setToolTip(
+            "Compare with a previous report, waive faults, or clear the "
+            "results.")
+        self.more_btn.setPopupMode(QToolButton.InstantPopup)
+        more_menu = QMenu(self.more_btn)
+        self.compare_action = more_menu.addAction("Compare with a previous report…")
+        self.compare_action.setToolTip(
             "Load a baseline report (a previous run) and diff it against the "
             "current one — regressed / fixed / changed faults — then ask the AI "
             "agent what changed.")
-        self.compare_btn.clicked.connect(self.on_compare_report)
-        self.edit_btn = QPushButton("Edit Report")
-        self.edit_btn.setToolTip(
+        self.compare_action.triggered.connect(self.on_compare_report)
+        self.edit_action = more_menu.addAction("Edit report (waive faults)…")
+        self.edit_action.setToolTip(
             "Waive whole classes (AU/UO/UC), specific subtypes (e.g. "
             "AU.NOFAULTS), or individual faults; coverage recomputes and the "
             "layout is unchanged. Reversible and saved with the report.")
-        self.edit_btn.clicked.connect(self.on_edit_report)
-        self.clear_btn = QPushButton("Clear")
-        self.clear_btn.clicked.connect(self.on_clear)
-        for b in (self.analyze_btn, self.cancel_btn, self.md_btn,
-                  self.csv_btn, self.save_report_btn, self.load_report_btn,
-                  self.compare_btn, self.edit_btn, self.clear_btn):
+        self.edit_action.triggered.connect(self.on_edit_report)
+        more_menu.addSeparator()
+        self.clear_action = more_menu.addAction("Clear results")
+        self.clear_action.triggered.connect(self.on_clear)
+        more_menu.setToolTipsVisible(True)
+        self.more_btn.setMenu(more_menu)
+
+        for b in (self.analyze_btn, self.cancel_btn, self.load_report_btn,
+                  self.save_report_btn, self.export_btn, self.more_btn):
             btn_row.addWidget(b)
         self.autosave_check = QCheckBox("Auto-save report")
         self.autosave_check.setToolTip(
@@ -1174,12 +1402,14 @@ class MainWindow(QMainWindow):
         self.triage_panel.fault_referenced.connect(self._focus_fault_in_table)
         self.triage_panel.export_categories_requested.connect(
             self.on_export_category_faults)
-        self.tabs.addTab(self.triage_panel, "Triage & Fix Plan")
-        self.tabs.addTab(self._build_table_tab(), "Coverage Loss Table")
+        self.tabs.addTab(self.triage_panel, "Triage && Fix Plan")
+        self._table_tab = self._build_table_tab()
+        self.tabs.addTab(self._table_tab, "Coverage Loss Table")
         # The "Repeated Patterns" tab is intentionally not shown; the backing
         # widget is still built so the populate/reset logic keeps working.
         self._build_patterns_tab()
-        self.tabs.addTab(self._build_logs_tab(), "Logs / Warnings")
+        self._logs_tab = self._build_logs_tab()
+        self.tabs.addTab(self._logs_tab, "Logs / Warnings")
 
         self.skills_panel = SkillsPanel(self._skill_manager)
         self.skills_panel.settings_changed.connect(self._save_settings)
@@ -1204,6 +1434,7 @@ class MainWindow(QMainWindow):
         agent_scroll.setWidgetResizable(True)
         agent_scroll.setFrameShape(QFrame.NoFrame)
         agent_scroll.setWidget(self.agent_panel)
+        self._agent_tab = agent_scroll
         self.tabs.addTab(agent_scroll, "AI Debug Agent")
 
         self.visualizer_panel = VisualizerPanel()
@@ -1222,6 +1453,10 @@ class MainWindow(QMainWindow):
         self.triage_panel.signal_inspect_requested.connect(
             self._show_signal_in_visualizer)
         self.agent_panel.set_tessent_provider(self.visualizer_panel.agent_target)
+        self._advanced_tabs = [self._logs_tab, self.skills_panel,
+                               self.custom_skills_panel]
+        self._set_advanced_tabs_visible(
+            bool(getattr(self._settings, "show_advanced_tabs", False)))
 
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -1234,6 +1469,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
 
         bar = QHBoxLayout()
+        self.demo_btn = QPushButton("Try the demo data")
+        self.demo_btn.setToolTip(
+            "Fill in the bundled example design (netlist, fault list and "
+            "constraints) and analyze it, to explore the tool before using "
+            "your own files.")
+        self.demo_btn.clicked.connect(self.on_try_demo)
+        self.demo_btn.setVisible(_demo_inputs() is not None)
+        bar.addWidget(self.demo_btn)
         bar.addStretch(1)
         self.open_browser_btn = QPushButton("Open Report in Browser")
         self.open_browser_btn.setToolTip(
@@ -1243,24 +1486,30 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.open_browser_btn)
         layout.addLayout(bar)
 
+        # At-a-glance results above the full report.
+        self.dashboard = QLabel("")
+        self.dashboard.setWordWrap(True)
+        self.dashboard.setTextFormat(Qt.RichText)
+        self.dashboard.setOpenExternalLinks(False)
+        self.dashboard.linkActivated.connect(self._on_dashboard_link)
+        self.dashboard.setStyleSheet(
+            "QLabel { background: #f4f8fc; border: 1px solid #d0e2f2;"
+            " border-radius: 6px; padding: 10px; }")
+        self.dashboard.setVisible(False)
+        layout.addWidget(self.dashboard)
+
         self.summary_view = QTextBrowser()
         self.summary_view.setOpenExternalLinks(True)
         layout.addWidget(self.summary_view, 1)
-        self._set_summary_html(
-            "<body style='font-family: Segoe UI, sans-serif; padding: 40px; "
-            "color: #6c757d;'><h2>ATPG Coverage Debug Report</h2>"
-            "<p>Load a netlist, fault list and (optionally) constraints, then "
-            "click <b>Analyze</b> to generate the report.</p></body>")
+        self._set_summary_html(_WELCOME_HTML)
         return widget
 
     def _set_summary_html(self, html: str) -> None:
         self.summary_view.setHtml(html)
 
     def _clear_summary(self) -> None:
-        self._set_summary_html(
-            "<body style='font-family: Segoe UI, sans-serif; padding: 40px; "
-            "color: #6c757d;'><p>Cleared. Run an analysis to generate a new "
-            "report.</p></body>")
+        self.dashboard.setVisible(False)
+        self._set_summary_html(_WELCOME_HTML)
 
 
     def _build_table_tab(self) -> QWidget:
@@ -1294,6 +1543,11 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        # The end of a hierarchy path is the part that identifies the site.
+        self.table.setTextElideMode(Qt.ElideMiddle)
+        self.table.setColumnWidth(0, 420)
+        for col, tip in enumerate(_TABLE_HEADER_TIPS):
+            self.table.horizontalHeaderItem(col).setToolTip(tip)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
@@ -1364,8 +1618,13 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("&Help")
         user_guide = QAction("User Guide…", self)
+        user_guide.setShortcut(QKeySequence("F1"))
         user_guide.triggered.connect(self._show_help)
         help_menu.addAction(user_guide)
+        demo = QAction("Try the Demo Data", self)
+        demo.setEnabled(_demo_inputs() is not None)
+        demo.triggered.connect(self.on_try_demo)
+        help_menu.addAction(demo)
 
     def _build_view_menu(self) -> None:
         """Add window-sizing actions that do not rely on the title bar.
@@ -1376,6 +1635,27 @@ class MainWindow(QMainWindow):
         """
         view_menu = self.menuBar().addMenu("&View")
 
+        goto = view_menu.addMenu("Go to Tab")
+        for n, title in enumerate(("Summary", "Triage & Fix Plan",
+                                   "Coverage Loss Table", "AI Debug Agent",
+                                   "Tessent Visualizer"), start=1):
+            act = QAction(title.replace("&", "&&"), self)
+            act.setShortcut(QKeySequence(f"Ctrl+{n}"))
+            act.triggered.connect(partial(self._switch_to_tab, title))
+            goto.addAction(act)
+
+        self.advanced_tabs_action = QAction(
+            "Show Advanced Tabs (Logs, Skills, Custom Skills)", self)
+        self.advanced_tabs_action.setCheckable(True)
+        self.advanced_tabs_action.setChecked(
+            bool(getattr(self._settings, "show_advanced_tabs", False)))
+        self.advanced_tabs_action.toggled.connect(self._on_advanced_tabs_toggled)
+        view_menu.addAction(self.advanced_tabs_action)
+        for title in ("Logs / Warnings", "Skills", "Custom Skills"):
+            act = QAction(f"Open {title}", self)
+            act.triggered.connect(partial(self._switch_to_tab, title))
+            view_menu.addAction(act)
+        view_menu.addSeparator()
         maximize = QAction("Maximize", self)
         maximize.setShortcut(QKeySequence("Ctrl+M"))
         maximize.triggered.connect(self.showMaximized)
@@ -1618,6 +1898,7 @@ class MainWindow(QMainWindow):
         self._reset_partitions()
         self._base_report = report
         self._apply_report(report)
+        self._after_new_report()
         n_skills = len(report.skill_results) if report.skill_results else 0
         msg = (f"Done. {report.summary.coverage_loss_count} coverage-loss "
                f"faults. {n_skills} skill(s) ran.")
@@ -1639,6 +1920,7 @@ class MainWindow(QMainWindow):
         self._populate_partition_selector()
         if self._partitions:
             self._set_active_partition(0)
+            self._after_new_report()
         total_loss = sum(
             rep.summary.coverage_loss_count for _, rep in results)
         msg = (f"Done. {len(results)} partition(s), {total_loss} total "
@@ -1779,6 +2061,13 @@ class MainWindow(QMainWindow):
         self._report_html = html
         self._set_summary_html(html)
         self.open_browser_btn.setEnabled(True)
+        try:
+            self.dashboard.setText(self._dashboard_html(report))
+            self.dashboard.setVisible(True)
+        except Exception:  # noqa: BLE001 - the full report is still shown
+            logger.exception("Could not build the summary dashboard")
+            self.dashboard.setVisible(False)
+        self._update_inputs_summary(report)
 
     def _build_report_html(self, report: AnalysisReport,
                            category_dumps=None) -> str:
@@ -1851,6 +2140,7 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(val)
                 if col == 0:
                     item.setData(Qt.UserRole, row)
+                    item.setToolTip(val)
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
         self._apply_filter()
@@ -1973,8 +2263,188 @@ class MainWindow(QMainWindow):
 
     def _switch_to_tab(self, title: str) -> None:
         for i in range(self.tabs.count()):
-            if self.tabs.tabText(i) == title:
+            if self.tabs.tabText(i).replace("&&", "&") == title:
+                self.tabs.setTabVisible(i, True)
                 self.tabs.setCurrentIndex(i)
+                return
+
+    # ------------------------------------------------------------------
+    # Layout: inputs, partitions, advanced tabs, dashboard
+    # ------------------------------------------------------------------
+    def _set_partitions_visible(self, visible: bool) -> None:
+        self.partition_box.setVisible(visible)
+        self.partitions_toggle.setText(
+            "− Hide the partition queue" if visible
+            else "+ Analyze several partitions…")
+
+    def _set_inputs_collapsed(self, collapsed: bool) -> None:
+        """Fold the input files into one summary line (or show them again)."""
+        self._inputs_expanded = not collapsed
+        has_report = self._report is not None
+        self.inputs_summary.setVisible(has_report)
+        self.inputs_box.setVisible(not (collapsed and has_report))
+        self.change_inputs_btn.setText(
+            "Hide inputs \u25b4" if self._inputs_expanded
+            else "Change inputs \u25be")
+
+    def _toggle_inputs(self) -> None:
+        self._set_inputs_collapsed(self._inputs_expanded)
+
+    def _update_inputs_summary(self, report: AnalysisReport) -> None:
+        sources = getattr(report, "sources", None) or {}
+        netlist = sources.get("netlist") or self.netlist_picker.path() or ""
+        faults = sources.get("faults") or self.faults_picker.path() or ""
+        constraints = (sources.get("constraints")
+                       or self.constraints_picker.path() or "")
+        design = sources.get("design") or _design_name(netlist) or "design"
+        parts = [f"<b>{_html_escape(design)}</b>"]
+        if netlist:
+            parts.append("netlist: " + _html_escape(os.path.basename(netlist)))
+        if faults:
+            parts.append("faults: " + _html_escape(os.path.basename(faults)))
+        parts.append("constraints: " + (
+            _html_escape(os.path.basename(constraints)) if constraints
+            else "<i>none</i>"))
+        parts.append(f"{report.summary.total_faults:,} faults analysed")
+        self.inputs_summary_label.setText("  ·  ".join(parts))
+        self.inputs_summary_label.setToolTip(
+            "\n".join(p for p in (netlist, faults, constraints) if p))
+
+    def _after_new_report(self) -> None:
+        """A fresh analysis or a loaded report: give the results the screen."""
+        self._set_inputs_collapsed(True)
+        self.demo_btn.setVisible(False)
+        self._switch_to_tab("Summary")
+
+    def _set_advanced_tabs_visible(self, visible: bool) -> None:
+        for widget in self._advanced_tabs:
+            idx = self.tabs.indexOf(widget)
+            if idx >= 0:
+                self.tabs.setTabVisible(idx, visible)
+        action = getattr(self, "advanced_tabs_action", None)
+        if action is not None and action.isChecked() != visible:
+            action.setChecked(visible)
+
+    def _on_advanced_tabs_toggled(self, visible: bool) -> None:
+        self._set_advanced_tabs_visible(visible)
+        self._save_settings()
+
+    def on_try_demo(self) -> None:
+        """Fill in the bundled example design and analyze it."""
+        demo = self.load_demo_inputs()
+        if demo is None:
+            self._error("The demo data is not installed with this copy.")
+            return
+        self._queued = []
+        self.partition_list.clear()
+        self.on_analyze()
+
+    def load_demo_inputs(self) -> Optional[tuple]:
+        demo = _demo_inputs()
+        if demo is None:
+            return None
+        netlist, faults, constraints = demo
+        self.netlist_picker.set_path(netlist)
+        self.faults_picker.set_path(faults)
+        self.constraints_picker.set_path(constraints)
+        self.statusBar().showMessage("Demo inputs filled in.")
+        return demo
+
+    def _dashboard_html(self, report: AnalysisReport) -> str:
+        """The at-a-glance box at the top of the Summary tab."""
+        summary = report.summary
+        stats = getattr(report, "statistics", None)
+        metrics = stats.metrics() if stats is not None else {}
+
+        def _pct(value) -> str:
+            return "n/a" if value is None else f"{value:.2f}%"
+
+        def _card(value: str, label: str) -> str:
+            return ("<td style='padding:2px 22px 2px 0;'>"
+                    f"<span style='font-size:20px; font-weight:bold; "
+                    f"color:#0b5394;'>{value}</span><br>"
+                    f"<span style='color:#555;'>{label}</span></td>")
+
+        loss = summary.coverage_loss_count
+        cards = [
+            _card(_pct(metrics.get("test_coverage")), "Test coverage"),
+            _card(_pct(metrics.get("fault_coverage")), "Fault coverage"),
+            _card(f"{loss:,}", f"Coverage-loss faults (of "
+                  f"{summary.total_faults:,})"),
+            _card(f"{summary.actionable_loss_count:,}",
+                  "Actionable loss (mapped, not tied off)"),
+        ]
+        warnings = len(report.warnings or [])
+        if warnings:
+            cards.append(_card(
+                f"<a href='tab:logs' style='color:#b35900;'>{warnings}</a>",
+                "<a href='tab:logs'>warnings &mdash; view</a>"))
+        html = ["<table cellspacing='0'><tr>" + "".join(cards) + "</tr></table>"]
+
+        try:
+            from ..analysis.fix_plan_edits import effective_plan
+            plan, seen = [], set()
+            for rec in effective_plan(report):
+                if getattr(rec, "superseded", False) or rec.subclass_id in seen:
+                    continue
+                seen.add(rec.subclass_id)
+                plan.append(rec)
+                if len(plan) == 3:
+                    break
+        except Exception:  # noqa: BLE001 - the dashboard must never break a load
+            plan = []
+        if plan:
+            html.append("<p style='margin:10px 0 2px;'><b>Where to start</b> "
+                        "&mdash; the biggest categories and the first fix "
+                        "the Fix Plan proposes for each:</p><ol "
+                        "style='margin:0;'>")
+            for rec in plan:
+                sub = _html_escape(rec.subclass_id)
+                title = _html_escape(getattr(rec.fix, "title", "") or "")
+                html.append(
+                    f"<li><a href='cat:{sub}'><b>{sub}</b></a> &mdash; "
+                    f"{rec.fault_count:,} faults ({rec.pct:.1f}%): {title} "
+                    f"<span style='color:#666;'>(worth acting on: "
+                    f"{_html_escape(rec.actionable)})</span></li>")
+            html.append("</ol>")
+        elif loss == 0:
+            html.append("<p style='margin:10px 0 2px;'><b>No coverage-loss "
+                        "faults</b> in this fault list.</p>")
+        html.append(
+            "<p style='margin:10px 0 0;'><b>Next:</b> "
+            "<a href='tab:triage'>Open Triage &amp; Fix Plan</a> &nbsp;·&nbsp; "
+            "<a href='tab:table'>Browse every fault</a> &nbsp;·&nbsp; "
+            "<a href='tab:agent'>Ask the AI agent</a> &nbsp;·&nbsp; "
+            "<a href='browser'>Full report in the browser</a>"
+            "<br><span style='color:#666;'>The complete report follows "
+            "below.</span></p>")
+        return "".join(html)
+
+    def _on_dashboard_link(self, href: str) -> None:
+        if href == "browser":
+            self.on_open_report_in_browser()
+            return
+        if href.startswith("cat:"):
+            self._show_category(href[4:])
+            return
+        target = {"tab:triage": self.triage_panel, "tab:table": self._table_tab,
+                  "tab:agent": self._agent_tab,
+                  "tab:logs": self._logs_tab}.get(href)
+        if target is not None:
+            idx = self.tabs.indexOf(target)
+            self.tabs.setTabVisible(idx, True)
+            self.tabs.setCurrentIndex(idx)
+
+    def _show_category(self, subclass: str) -> None:
+        """Open the Triage tab on *subclass*'s row."""
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.triage_panel))
+        self.triage_panel.tabs.setCurrentIndex(0)
+        table = self.triage_panel.category_table
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is not None and item.text() == subclass:
+                table.selectRow(row)
+                table.scrollToItem(item)
                 return
 
     def _focus_fault_in_table(self, fault_object: str) -> None:
@@ -2254,6 +2724,7 @@ class MainWindow(QMainWindow):
         self.skills_panel.clear_results()
         self.agent_panel.clear()
         self._set_export_enabled(False)
+        self._set_inputs_collapsed(False)
         self.statusBar().showMessage("Cleared.")
 
     def _save_settings(self) -> None:
@@ -2271,6 +2742,9 @@ class MainWindow(QMainWindow):
         self._sync_visualizer_config()
         s.custom_skills_dir = self.custom_skills_panel.custom_dir()
         s.auto_save_report = self.autosave_check.isChecked()
+        s.show_advanced_tabs = bool(
+            getattr(self, "advanced_tabs_action", None)
+            and self.advanced_tabs_action.isChecked())
         s.save()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -2283,11 +2757,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _set_export_enabled(self, enabled: bool) -> None:
-        self.md_btn.setEnabled(enabled)
-        self.csv_btn.setEnabled(enabled)
+        self.md_action.setEnabled(enabled)
+        self.csv_action.setEnabled(enabled)
+        self.export_btn.setEnabled(enabled)
         self.save_report_btn.setEnabled(enabled)
-        self.compare_btn.setEnabled(enabled)
-        self.edit_btn.setEnabled(enabled)
+        self.compare_action.setEnabled(enabled)
+        self.edit_action.setEnabled(enabled)
 
     def on_edit_report(self) -> None:
         if not self._base_report:
@@ -2498,6 +2973,7 @@ class MainWindow(QMainWindow):
         self._reset_partitions()
         self._base_report = report
         self._apply_report(report)
+        self._after_new_report()
         self.statusBar().showMessage(
             f"Report loaded: {path} — "
             f"{report.summary.coverage_loss_count} coverage-loss faults. "

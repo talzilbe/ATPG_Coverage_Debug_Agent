@@ -44,6 +44,22 @@ logger = logging.getLogger(__name__)
 _CATEGORY_HEADERS = ["Category", "Faults", "% of all", "sa0", "sa1",
                      "Imbalance", "Worth acting on", "Confidence"]
 
+_CATEGORY_HEADER_TIPS = [
+    "The ATPG tool's fault class, with its subclass when the fault list "
+    "gives one (e.g. AU.TC = ATPG untestable, tied constant).",
+    "How many faults are in this category.",
+    "This category's share of every fault in the list.",
+    "Faults that are stuck-at-0.",
+    "Faults that are stuck-at-1.",
+    "How lopsided the stuck-at-0 / stuck-at-1 split is (0 = even, 1 = all "
+    "one value). A strong imbalance usually points at one constant or "
+    "constraint.",
+    "Whether fixing this category looks practical: true / partial / false. "
+    "Select the row for the reasoning.",
+    "How much weight the verdict carries (high / medium / reduced / "
+    "insufficient).",
+]
+
 _EMPTY_HTML = (
     "<body style='font-family: Segoe UI, sans-serif; padding: 30px; "
     "color: #6c757d;'><p>Run an analysis to see the coverage triage.</p>"
@@ -116,6 +132,8 @@ class TriagePanel(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         self.category_table = QTableWidget(0, len(_CATEGORY_HEADERS))
         self.category_table.setHorizontalHeaderLabels(_CATEGORY_HEADERS)
+        for col, tip in enumerate(_CATEGORY_HEADER_TIPS):
+            self.category_table.horizontalHeaderItem(col).setToolTip(tip)
         self.category_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.category_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.category_table.setSelectionMode(QAbstractItemView.SingleSelection)
