@@ -68,6 +68,7 @@ default action.
 | `enabled` | Set `false` to launch without a live channel. |
 | `allowed_commands` | Verbs the listener will run. **Enforced inside the tool** — this is the last line of defence, so keep it to viewing commands. |
 | `allowed_options` | Option names the listener will pass through. |
+| `allow_agent_eval` | `true` lets the AI agent ask to run free-form Tcl in the session. Every script is shown in the GUI and runs only after the user approves it; the agent never holds the token. Default `false`. |
 
 The listener binds loopback only, on an OS-assigned port, and every request
 carries a per-session token. Widening `allowed_commands` is a deliberate,

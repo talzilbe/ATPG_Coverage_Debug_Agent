@@ -27,6 +27,7 @@ from . import session
 from .analysis import investigate
 from .analysis.findings import FINDINGS_FILE, FindingsSink
 from .analysis.fix_plan_edits import FIX_EDITS_FILE, FixEditsSink
+from .launcher import agent_bridge
 from .parser import netlist_cache
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -126,6 +127,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
             os.path.join(work_dir, FIX_EDITS_FILE) if work_dir else None),
         "tool_log_path": (os.path.join(work_dir, TOOL_LOG_FILE)
                           if work_dir else ""),
+        "work_dir": work_dir,
     }
 
 
@@ -346,7 +348,9 @@ def shrink_payload(data: Dict[str, Any], limit: int,
 def build_tools_list() -> List[Dict[str, Any]]:
     """Build MCP tool definitions from the shared TOOL_SPECS."""
     tools: List[Dict[str, Any]] = []
-    for name, spec in investigate.TOOL_SPECS.items():
+    specs = list(investigate.TOOL_SPECS.items())
+    specs += list(agent_bridge.TESSENT_TOOL_SPECS.items())
+    for name, spec in specs:
         properties: Dict[str, Any] = {}
         for pname, pspec in spec.get("params", {}).items():
             prop = {
@@ -409,6 +413,8 @@ def handle_message(msg: Dict[str, Any],
     if method == "tools/call":
         name = params.get("name", "")
         arguments = params.get("arguments") or {}
+        if name in agent_bridge.TESSENT_TOOL_SPECS:
+            return _call_tessent_tool(msg_id, name, arguments, params, state)
         if name not in investigate.TOOL_SPECS:
             return _error(msg_id, -32602, f"Unknown tool '{name}'.")
         started = time.monotonic()
@@ -453,12 +459,54 @@ def handle_message(msg: Dict[str, Any],
     return _error(msg_id, -32601, f"Method not found: {method}")
 
 
+def _call_tessent_tool(msg_id: Any, name: str, arguments: Dict[str, Any],
+                       params: Dict[str, Any],
+                       state: Dict[str, Any]) -> Dict[str, Any]:
+    """Hand a ``tessent_*`` call to the GUI through the bridge and wait."""
+    started = time.monotonic()
+    token = (params.get("_meta") or {}).get("progressToken")
+    notify = state.get("notify")
+
+    # Waiting for a person can take minutes; progress keeps the client from
+    # treating the call as hung.
+    def _tick(elapsed: float) -> None:
+        if token is None or notify is None:
+            return
+        notify({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": token,
+                           "progress": round(elapsed, 1),
+                           "message": "waiting for the user in the GUI"}})
+
+    try:
+        data = agent_bridge.call_tool(name, arguments,
+                                      state.get("work_dir") or "",
+                                      on_tick=_tick)
+    except Exception as exc:  # noqa: BLE001
+        log_tool_call(state, name, arguments, False, 0, False,
+                      (time.monotonic() - started) * 1000)
+        return _result(msg_id, {
+            "content": [{"type": "text", "text": f"ERROR: {exc}"}],
+            "isError": True,
+        })
+    text = _encode(data)
+    ok = data.get("status") in ("ok", "completed")
+    log_tool_call(state, name, arguments, ok, len(text), False,
+                  (time.monotonic() - started) * 1000)
+    return _result(msg_id, {"content": [{"type": "text", "text": text}]})
+
+
 def serve(stdin=None, stdout=None, state: Optional[Dict[str, Any]] = None) -> int:
     """Run the newline-delimited JSON-RPC stdio loop until stdin closes."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     if state is None:
         state = load_state()
+
+    def _notify(message: Dict[str, Any]) -> None:
+        stdout.write(json.dumps(message) + "\n")
+        stdout.flush()
+
+    state.setdefault("notify", _notify)
     for line in stdin:
         line = line.strip()
         if not line:

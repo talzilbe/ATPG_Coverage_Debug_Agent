@@ -71,6 +71,7 @@
   },
   "control": {
     "enabled": true,
+    "allow_agent_eval": true,
     "allowed_commands": [
       "add_schematic_objects",
       "add_schematic_path",

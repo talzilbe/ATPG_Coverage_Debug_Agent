@@ -21,15 +21,27 @@ closed rather than open:
   anything. A bracket or ``$`` in an object name is data, never code;
 * the verb must appear in the profile's allow-list, and option names and values
   are checked against patterns on both sides.
+
+Agent scripts
+-------------
+A profile may additionally set ``control.allow_agent_eval``. That enables one
+more request, :data:`EVAL_VERB`, which runs a free-form script. It is meant
+only for the GUI's approval flow: the token never leaves the GUI, so a script
+reaches the tool only after a person approved it there. The script and the
+reply travel base64-encoded, and the tool brackets the script's transcript
+with ``ATPG_BEGIN <id>`` / ``ATPG_END <id>`` markers so the output that was
+printed rather than returned can be cut out of the log file.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
 import secrets
 import socket
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -58,6 +70,22 @@ _OPTION_NAME_RE = re.compile(r"^-[A-Za-z][A-Za-z0-9_]*$")
 #: A vendor command name.
 _VERB_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
+#: The request that runs an approved agent script. Not a valid Tcl command
+#: name for the allow-list, so it can never be confused with one.
+EVAL_VERB = "@atpg_eval"
+
+#: Request ids travel on the wire and appear in the transcript markers.
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+#: Largest script accepted from the agent.
+MAX_SCRIPT_CHARS = 20000
+
+#: Seconds an approved script may run. Reports on a large flat model are slow.
+DEFAULT_SCRIPT_TIMEOUT = 300.0
+
+#: Seconds to wait for the end marker to reach the log after the reply.
+TRANSCRIPT_WAIT = 3.0
+
 
 class LiveSessionError(Exception):
     """The live session could not be reached, or refused the request."""
@@ -78,12 +106,15 @@ def _tcl_literal(value: str) -> str:
 
 def build_listener_tcl(port_file: str, token: str,
                        allowed_commands: Sequence[str],
-                       allowed_options: Sequence[str]) -> str:
+                       allowed_options: Sequence[str],
+                       allow_eval: bool = False) -> str:
     """Return the Tcl that serves the control channel inside the tool.
 
     Placed at the top of the dofile so the channel exists before the design
     starts loading; a request that arrives during the load simply does not get
     serviced until the tool is back at its prompt.
+
+    *allow_eval* enables :data:`EVAL_VERB` (approved agent scripts).
     """
     for verb in allowed_commands:
         if not _VERB_RE.match(verb):
@@ -99,9 +130,37 @@ def build_listener_tcl(port_file: str, token: str,
 set ::atpg_token @@TOKEN@@
 set ::atpg_allowed_cmds @@CMDS@@
 set ::atpg_allowed_opts @@OPTS@@
+set ::atpg_allow_eval @@EVAL@@
 
 proc ::atpg_reply {chan status text} {
     catch {puts $chan "$status $text" ; flush $chan}
+}
+
+# An approved agent script: decoded, run at global level, transcript bracketed.
+proc ::atpg_eval {chan id payload} {
+    if {!$::atpg_allow_eval} {
+        ::atpg_reply $chan ERR "agent scripts are disabled in this profile"
+        return
+    }
+    if {![regexp {^[A-Za-z0-9_-]+$} $id]} {
+        ::atpg_reply $chan ERR "malformed request id"
+        return
+    }
+    if {[catch {encoding convertfrom utf-8 [binary decode base64 $payload]} script]} {
+        ::atpg_reply $chan ERR "malformed script"
+        return
+    }
+    puts "ATPG_BEGIN $id"
+    catch {flush stdout}
+    set rc [catch {uplevel #0 $script} result]
+    puts "ATPG_END $id rc=$rc"
+    catch {flush stdout}
+    set enc [binary encode base64 [encoding convertto utf-8 $result]]
+    if {$rc == 0 || $rc == 2} {
+        ::atpg_reply $chan OK64 $enc
+    } else {
+        ::atpg_reply $chan ERR64 $enc
+    }
 }
 
 proc ::atpg_serve {chan} {
@@ -120,6 +179,10 @@ proc ::atpg_serve {chan} {
         return
     }
     set verb [lindex $parts 1]
+    if {[string equal $verb "@@EVALVERB@@"]} {
+        ::atpg_eval $chan [lindex $parts 2] [lindex $parts 3]
+        return
+    }
     set object [lindex $parts 2]
     if {[lsearch -exact $::atpg_allowed_cmds $verb] < 0} {
         ::atpg_reply $chan ERR "command not permitted: $verb"
@@ -174,7 +237,79 @@ if {[catch {
             .replace("@@TOKEN@@", _tcl_literal(token))
             .replace("@@CMDS@@", _tcl_literal(" ".join(allowed_commands)))
             .replace("@@OPTS@@", _tcl_literal(" ".join(allowed_options)))
+            .replace("@@EVAL@@", "1" if allow_eval else "0")
+            .replace("@@EVALVERB@@", EVAL_VERB)
             .replace("@@PORTFILE@@", _tcl_literal(port_file)))
+
+
+@dataclass
+class ScriptResult:
+    """What one approved script produced in the tool."""
+
+    ok: bool
+    result: str
+    transcript: str = ""
+    transcript_complete: bool = False
+
+    def as_dict(self) -> Dict[str, object]:
+        return {"ok": self.ok, "result": self.result,
+                "transcript": self.transcript,
+                "transcript_complete": self.transcript_complete}
+
+
+def validate_script(script: str) -> str:
+    """Check an agent script before it goes on the wire."""
+    script = (script or "").strip()
+    if not script:
+        raise LiveSessionError("no script given")
+    if "\0" in script:
+        raise LiveSessionError("script contains a NUL character")
+    if len(script) > MAX_SCRIPT_CHARS:
+        raise LiveSessionError(
+            f"script is {len(script)} characters; the limit is "
+            f"{MAX_SCRIPT_CHARS}")
+    return script
+
+
+def log_size(log_path: str) -> int:
+    """Current size of the tool's log, so a later read starts after it."""
+    try:
+        return os.path.getsize(log_path)
+    except OSError:
+        return 0
+
+
+def slice_transcript(log_path: str, request_id: str, offset: int = 0,
+                     wait: float = TRANSCRIPT_WAIT) -> Tuple[str, bool]:
+    """Text the tool logged between the markers of *request_id*.
+
+    Returns ``(text, complete)``; *complete* is False when the end marker had
+    not reached the log within *wait* seconds (what was there is returned).
+    """
+    begin = f"ATPG_BEGIN {request_id}"
+    end = f"ATPG_END {request_id}"
+    deadline = time.monotonic() + max(0.0, wait)
+    text = ""
+    while True:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(offset)
+                text = fh.read()
+        except OSError:
+            text = ""
+        if end in text or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if begin in ln), None)
+    if start is None:
+        return "", False
+    body: List[str] = []
+    for ln in lines[start + 1:]:
+        if end in ln:
+            return "\n".join(body).strip("\n"), True
+        body.append(ln)
+    return "\n".join(body).strip("\n"), False
 
 
 @dataclass
@@ -303,6 +438,55 @@ class LiveSession:
         if status == "OK":
             return text.strip()
         raise LiveSessionError(text.strip() or "the tool refused the request")
+
+    def run_script(self, script: str, request_id: str, log_path: str = "",
+                   timeout: float = DEFAULT_SCRIPT_TIMEOUT) -> ScriptResult:
+        """Run an approved script; return its result and logged transcript.
+
+        A script that raised in the tool is a normal result (``ok`` False),
+        not an exception; only a refused or unreachable channel raises.
+        """
+        port = self.port
+        if port is None:
+            raise LiveSessionError(
+                "no control channel for this session. It may still be "
+                "starting, or it was launched without one.")
+        script = validate_script(script)
+        if not _REQUEST_ID_RE.match(request_id or ""):
+            raise LiveSessionError(f"not a valid request id: {request_id!r}")
+        encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        payload = (SEP.join([self.token, EVAL_VERB, request_id, encoded])
+                   + "\n").encode("utf-8")
+        offset = log_size(log_path) if log_path else 0
+
+        try:
+            with socket.create_connection((self.host, port),
+                                          timeout=self.timeout) as conn:
+                conn.settimeout(timeout)
+                conn.sendall(payload)
+                reply = self._read_line(conn)
+        except socket.timeout as exc:
+            raise LiveSessionError(
+                f"the session did not finish the script within {timeout:.0f} "
+                "s. It may still be running; check the terminal.") from exc
+        except OSError as exc:
+            raise LiveSessionError(
+                f"the session could not be reached on port {port}: {exc}") from exc
+
+        status, _, text = reply.partition(" ")
+        if status not in ("OK64", "ERR64"):
+            raise LiveSessionError(text.strip() or reply
+                                   or "the tool refused the request")
+        try:
+            result = base64.b64decode(text.strip() or "").decode(
+                "utf-8", "replace")
+        except ValueError as exc:
+            raise LiveSessionError(f"unreadable reply from the tool: {exc}") from exc
+        transcript, complete = (slice_transcript(log_path, request_id, offset)
+                                if log_path else ("", False))
+        return ScriptResult(ok=status == "OK64", result=result,
+                            transcript=transcript,
+                            transcript_complete=complete)
 
     @staticmethod
     def _read_line(conn: socket.socket) -> str:

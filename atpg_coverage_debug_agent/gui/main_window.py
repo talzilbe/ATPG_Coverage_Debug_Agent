@@ -597,6 +597,17 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           <b class="k">Tessent Visualizer</b> tab has been filled in &mdash;
           otherwise it says so rather than inventing a project name or a
           path.</td></tr>
+      <tr><td><code>tessent_session_status</code></td><td>Copilot CLI backend
+          only. Tells the agent whether a live Tessent Visualizer session is
+          open in this GUI, whether its profile accepts agent commands, and
+          which design inputs it was launched with. Needs no approval.</td></tr>
+      <tr><td><code>tessent_run</code></td><td>Copilot CLI backend only. The
+          agent asks to run a Tcl script in your <i>live</i> Tessent session.
+          Nothing runs until you press <b class="k">Approve &amp; Run</b> in
+          the box under the chat; you may edit the script first or
+          <b class="k">Reject</b> it. The agent gets the return value and the
+          transcript the tool printed, and is told if you edited the
+          script.</td></tr>
       <tr><td><code>list_open_questions</code></td><td>Where the <i>offline</i>
           analysis itself is weakest, as an ordered list of questions each
           naming the tool that would settle it: categories scored with
@@ -888,6 +899,29 @@ this application talks to it. It is deliberately narrow:</p>
 <p>A profile can set <code>control.enabled</code> to <code>false</code> to turn
 the channel off entirely; the launch then works exactly as before, and the
 signal action reports that the profile disables it.</p>
+
+<h3>Letting the AI agent run commands in the session</h3>
+<p>With the Copilot CLI backend and <b class="k">Agentic tools</b> on, the agent
+can ask to run a Tcl script in the running session &mdash; to check something
+the offline analysis cannot see, or because you asked it to. This needs the
+profile to set <code>control.allow_agent_eval</code> to <code>true</code>
+(the shipped profile does) and a session launched from this tab.</p>
+<ul>
+  <li>Every script appears in a purple <b>The agent wants to run this in
+      Tessent</b> box under the chat, with the agent's reason. Nothing reaches
+      the tool until you press <b class="k">Approve &amp; Run</b>; you can
+      edit the script first, or <b class="k">Reject</b> it.</li>
+  <li>The agent never holds the session token &mdash; only this GUI does &mdash;
+      so it cannot bypass the approval.</li>
+  <li>The result and the transcript the tool printed (cut out of the tool log
+      between markers) go back to the agent and are shown in the chat.</li>
+  <li><b class="k">Stop</b> rejects anything still waiting. A request nobody
+      answers within 10 minutes is withdrawn and does not run.</li>
+  <li><b class="k">Allow all Tessent commands</b> (in the chat row) skips the
+      approval: every script the agent sends runs at once and is still logged
+      in the chat. It is off at start-up; untick it to approve one by one
+      again.</li>
+</ul>
 
 <h3>What it refuses to do</h3>
 <ul>
@@ -1187,6 +1221,7 @@ class MainWindow(QMainWindow):
             self.visualizer_panel.set_analysis_faults)
         self.triage_panel.signal_inspect_requested.connect(
             self._show_signal_in_visualizer)
+        self.agent_panel.set_tessent_provider(self.visualizer_panel.agent_target)
 
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(central)

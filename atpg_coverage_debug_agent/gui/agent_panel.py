@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -59,6 +60,8 @@ from ..agent.debug_agent import (
 from ..agent import cli_models
 from ..analysis import investigate
 from ..config import credentials
+from ..launcher import agent_bridge
+from ..launcher.live_session import LiveSessionError
 from ..skills.base import AnalysisContext
 
 logger = logging.getLogger(__name__)
@@ -88,6 +91,12 @@ _CLI_MODEL_CHOICES = ["auto"]
 # the system locale (an RTL locale would otherwise mirror "You: question"
 # into "question :You").
 _LTR_STYLE = "margin:6px 0; text-align:left; direction:ltr;"
+
+#: How often the agent's Tessent requests are looked for while it works.
+_BRIDGE_POLL_MS = 400
+
+#: Characters of a Tessent result shown in the chat (the agent gets it all).
+_CHAT_OUTPUT_CHARS = 4000
 
 
 class _ModelListWorker(QObject):
@@ -337,6 +346,9 @@ class AgentPanel(QWidget):
     #: text and asked to see in the running Tessent Visualizer session.
     signal_inspect_requested = Signal(str)
 
+    #: Internal: a Tessent script finished on its worker thread.
+    _tessent_done = Signal(dict)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._report = None
@@ -374,6 +386,13 @@ class AgentPanel(QWidget):
         self._tool_log_calls: int = 0
         self._live_agent = None
         self._busy_chat: bool = False
+        # Tessent bridge: who provides the live session, requests already
+        # handled, those waiting for the user, and the one on screen.
+        self._tessent_provider = None
+        self._bridge_seen: set = set()
+        self._bridge_queue: list = []
+        self._bridge_current = None
+        self._bridge_running: Optional[str] = None
         # Pop-out ("open in window") state: maps a docked panel box to its open
         # dialog + header button, so the same widget can be detached/re-docked.
         self._popouts: dict = {}
@@ -591,6 +610,11 @@ class AgentPanel(QWidget):
         self._busy_message = ""
         self._busy_frame = 0
 
+        self._bridge_timer = QTimer(self)
+        self._bridge_timer.setInterval(_BRIDGE_POLL_MS)
+        self._bridge_timer.timeout.connect(self._poll_bridge)
+        self._tessent_done.connect(self._on_tessent_done)
+
         # --- Prompt / response split ---
         splitter = QSplitter(Qt.Horizontal)
 
@@ -659,6 +683,8 @@ class AgentPanel(QWidget):
             "Tessent Visualizer.")
         chat_layout.addWidget(self.chat_view, 1)
 
+        chat_layout.addWidget(self._build_tessent_box())
+
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit()
         self.chat_input.setPlaceholderText(
@@ -685,6 +711,13 @@ class AgentPanel(QWidget):
         chat_row.addWidget(self.chat_stop_btn)
         chat_row.addWidget(self.chat_clear_btn)
         chat_row.addWidget(self.chat_save_btn)
+        self.tessent_allow_all_check = QCheckBox("Allow all Tessent commands")
+        self.tessent_allow_all_check.setToolTip(
+            "Run every script the agent sends to the live Tessent session "
+            "without asking. Each one is still logged in the chat. Turn it "
+            "off at any time to go back to approving one by one.")
+        self.tessent_allow_all_check.toggled.connect(self._on_allow_all_toggled)
+        chat_row.addWidget(self.tessent_allow_all_check)
         chat_layout.addLayout(chat_row)
 
         # The chat box can be popped out into its own window, where the main
@@ -1407,6 +1440,7 @@ class AgentPanel(QWidget):
         self.chat_status_label.setVisible(chat)
         self._tick_busy()
         self._busy_timer.start()
+        self._bridge_timer.start()
 
     def _tick_busy(self) -> None:
         frame = _BUSY_FRAMES[self._busy_frame % len(_BUSY_FRAMES)]
@@ -1424,6 +1458,8 @@ class AgentPanel(QWidget):
         """Stop the animation and return how long the work took, in seconds."""
         self._busy_timer.stop()
         self._poll_tool_log()
+        self._poll_bridge()
+        self._bridge_timer.stop()
         self.chat_status_label.setVisible(False)
         self.chat_status_label.setText("")
         self._busy_chat = False
@@ -1477,6 +1513,290 @@ class AgentPanel(QWidget):
                 f"→ [{row.get('ts', '')}] MCP tool call #{self._tool_log_calls}: "
                 f"{row.get('tool')}({args}) — {row.get('chars', 0)} chars, "
                 f"{row.get('ms', 0)} ms{flags}")
+
+    # -- Tessent bridge: agent scripts, approved by the user -----------------
+
+    def _build_tessent_box(self) -> QWidget:
+        box = QGroupBox("The agent wants to run this in Tessent")
+        box.setStyleSheet("QGroupBox { color: #8e44ad; font-weight: bold; }")
+        lay = QVBoxLayout(box)
+        self.tessent_reason_label = QLabel("")
+        self.tessent_reason_label.setWordWrap(True)
+        self.tessent_reason_label.setStyleSheet("color: #333; font-weight: normal;")
+        lay.addWidget(self.tessent_reason_label)
+        self.tessent_script_edit = QPlainTextEdit()
+        self.tessent_script_edit.setStyleSheet(
+            "font-family: monospace; font-weight: normal;")
+        self.tessent_script_edit.setMaximumHeight(140)
+        self.tessent_script_edit.setToolTip(
+            "You may edit the script before running it. The agent is told "
+            "exactly what ran.")
+        lay.addWidget(self.tessent_script_edit)
+        row = QHBoxLayout()
+        self.tessent_queue_label = QLabel("")
+        self.tessent_queue_label.setStyleSheet("color: #555; font-weight: normal;")
+        self.tessent_approve_btn = QPushButton("Approve && Run")
+        self.tessent_approve_btn.setToolTip(
+            "Send the script above to the running Tessent session and return "
+            "its result and transcript to the agent.")
+        self.tessent_approve_btn.clicked.connect(lambda: self.approve_tessent())
+        self.tessent_reject_btn = QPushButton("Reject")
+        self.tessent_reject_btn.setToolTip(
+            "Do not run it. The agent is told you rejected it.")
+        self.tessent_reject_btn.clicked.connect(self.reject_tessent)
+        row.addWidget(self.tessent_queue_label, 1)
+        row.addWidget(self.tessent_approve_btn)
+        row.addWidget(self.tessent_reject_btn)
+        lay.addLayout(row)
+        box.setVisible(False)
+        self.tessent_box = box
+        return box
+
+    def set_tessent_provider(self, provider) -> None:
+        """*provider()* returns the Visualizer tab's agent target, or None."""
+        self._tessent_provider = provider
+
+    def _tessent_target(self) -> Optional[dict]:
+        if self._tessent_provider is None:
+            return None
+        try:
+            return self._tessent_provider()
+        except Exception:  # noqa: BLE001 - a broken provider means "no session"
+            logger.exception("Tessent provider failed")
+            return None
+
+    def _tessent_refusal(self, target: Optional[dict]) -> Optional[Tuple[str, str]]:
+        """Why a script cannot run right now, or None when it can."""
+        if target is None:
+            return ("no_session",
+                    "No Tessent Visualizer session is open in the GUI. The "
+                    "user must launch one from the Tessent Visualizer tab.")
+        if not target.get("live"):
+            return ("no_session",
+                    "The Tessent session is still starting (its control "
+                    "channel is not up yet). Try again once the design has "
+                    "loaded.")
+        if not target.get("agent_eval"):
+            return ("disabled",
+                    f"The profile '{target.get('profile', '')}' does not allow "
+                    "agent commands (control.allow_agent_eval is false). The "
+                    "user must relaunch with a profile that allows them.")
+        return None
+
+    def _bridge_path(self) -> str:
+        sess = self._current_mcp_session()
+        work = getattr(sess, "work_dir", "") if sess is not None else ""
+        if not work or not os.path.isdir(work):
+            return ""
+        return agent_bridge.bridge_dir(work)
+
+    def _poll_bridge(self) -> None:
+        """Answer status requests and queue script requests for approval."""
+        bridge = self._bridge_path()
+        if not bridge:
+            return
+        cur = self._bridge_current
+        if (cur is not None and self._bridge_running is None
+                and agent_bridge.is_withdrawn(bridge, cur.id)):
+            self._append_chat(
+                "Tessent", "The agent stopped waiting for this request; it "
+                "did not run:\n" + cur.script)
+            self._bridge_current = None
+        self._bridge_queue = [r for r in self._bridge_queue
+                              if not agent_bridge.is_withdrawn(bridge, r.id)]
+        for req in agent_bridge.pending(bridge):
+            if req.id in self._bridge_seen:
+                continue
+            self._bridge_seen.add(req.id)
+            target = self._tessent_target()
+            refusal = self._tessent_refusal(target)
+            if req.kind == agent_bridge.KIND_STATUS:
+                self._answer_status(bridge, req, target, refusal)
+                continue
+            if refusal is not None:
+                agent_bridge.respond(bridge, req.id, {
+                    "status": refusal[0], "message": refusal[1],
+                    "script_ran": ""})
+                self._append_chat(
+                    "Tessent", f"The agent asked to run a script, but "
+                    f"{refusal[1]}\n{req.script}")
+                continue
+            self._bridge_queue.append(req)
+        self._show_next_tessent(bridge)
+
+    def _answer_status(self, bridge: str, req, target, refusal) -> None:
+        data = {
+            "status": "ok",
+            "live": bool(target and target.get("live")),
+            "accepts_agent_commands": refusal is None,
+            "profile": (target or {}).get("profile", ""),
+            "design_inputs": (target or {}).get("design_inputs", {}),
+            "message": (refusal[1] if refusal else
+                        "Ready. Every tessent_run script is shown to the user "
+                        "for approval before it runs."),
+        }
+        agent_bridge.respond(bridge, req.id, data)
+
+    def _show_next_tessent(self, bridge: str = "") -> None:
+        if self._bridge_current is None and self._bridge_queue:
+            req = self._bridge_queue.pop(0)
+            self._bridge_current = req
+            self._bridge_current_dir = bridge or self._bridge_path()
+            self.tessent_reason_label.setText(
+                "Reason: " + (req.reason or "(the agent gave no reason)"))
+            self.tessent_script_edit.setPlainText(req.script)
+            self.tessent_approve_btn.setEnabled(True)
+            self.tessent_reject_btn.setEnabled(True)
+            self.status_label.setText(
+                "The agent wants to run a command in Tessent — approve or "
+                "reject it under the chat.")
+        waiting = len(self._bridge_queue)
+        self.tessent_queue_label.setText(
+            f"{waiting} more request(s) waiting" if waiting else "")
+        self.tessent_box.setVisible(self._bridge_current is not None)
+        if (self._bridge_current is not None and self._bridge_running is None
+                and self.tessent_allow_all_check.isChecked()):
+            self.approve_tessent(auto=True)
+
+    def _on_allow_all_toggled(self, checked: bool) -> None:
+        self.tessent_allow_all_check.setStyleSheet(
+            "color: #c0392b; font-weight: bold;" if checked else "")
+        self.status_label.setText(
+            "Tessent commands from the agent now run WITHOUT approval."
+            if checked else "Tessent commands from the agent need approval again.")
+        if checked:
+            self._show_next_tessent()
+
+    def pending_tessent_request(self):
+        """The request on screen, or None."""
+        return self._bridge_current
+
+    def approve_tessent(self, auto: bool = False) -> None:
+        req = self._bridge_current
+        if req is None or self._bridge_running is not None:
+            return
+        script = self.tessent_script_edit.toPlainText().strip()
+        if not script:
+            self.status_label.setText("The script is empty — edit it or reject.")
+            return
+        bridge = getattr(self, "_bridge_current_dir", "") or self._bridge_path()
+        target = self._tessent_target()
+        refusal = self._tessent_refusal(target)
+        if refusal is not None:
+            agent_bridge.respond(bridge, req.id, {
+                "status": refusal[0], "message": refusal[1], "script_ran": ""})
+            self._append_chat("Tessent", "Could not run: " + refusal[1])
+            self._bridge_current = None
+            self._show_next_tessent(bridge)
+            return
+        assert target is not None
+        edited = script != req.script.strip()
+        self._bridge_running = req.id
+        self.tessent_approve_btn.setEnabled(False)
+        self.tessent_reject_btn.setEnabled(False)
+        self.tessent_queue_label.setText("Running in Tessent…")
+        self._append_chat(
+            "Tessent", ("Auto-approved (Allow all) — running:\n" if auto
+                        else "Approved (edited by you) — running:\n" if edited
+                        else "Approved — running:\n") + script)
+        session = target["session"]
+        log_path = target.get("log_path", "")
+
+        def _work() -> None:
+            payload = {"script_ran": script, "edited": edited,
+                       "original_script": req.script, "auto_approved": auto}
+            if agent_bridge.is_withdrawn(bridge, req.id):
+                payload.update(status="timeout",
+                               message="The agent stopped waiting before the "
+                                       "approval; nothing ran.")
+            else:
+                try:
+                    res = session.run_script(script, req.id, log_path)
+                    payload.update(status="completed", ok=res.ok,
+                                   result=res.result,
+                                   transcript_complete=res.transcript_complete)
+                    payload.update(agent_bridge.cap_transcript(
+                        res.transcript,
+                        os.path.join(bridge, f"transcript_{req.id}.txt")))
+                except LiveSessionError as exc:
+                    payload.update(status="error", message=str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Tessent script failed")
+                    payload.update(status="error", message=f"unexpected: {exc}")
+            try:
+                agent_bridge.respond(bridge, req.id, payload)
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not answer the Tessent request")
+            self._tessent_done.emit(payload)
+
+        self._start_tessent_worker(_work)
+
+    @staticmethod
+    def _start_tessent_worker(fn) -> None:
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _on_tessent_done(self, payload: dict) -> None:
+        self._bridge_running = None
+        status = payload.get("status")
+        if status == "completed":
+            parts = [("Tessent returned OK." if payload.get("ok")
+                      else "Tessent reported an error.")]
+            result = (payload.get("result") or "").strip()
+            if result:
+                parts.append("Result:\n" + result[:_CHAT_OUTPUT_CHARS])
+            transcript = (payload.get("transcript") or "").strip()
+            if transcript:
+                parts.append("Transcript:\n" + transcript[:_CHAT_OUTPUT_CHARS])
+            if (len(result) > _CHAT_OUTPUT_CHARS
+                    or len(transcript) > _CHAT_OUTPUT_CHARS):
+                parts.append("(shortened here; the agent received the full text)")
+            if not result and not transcript:
+                parts.append("(no output)")
+            self._append_chat("Tessent", "\n".join(parts))
+        else:
+            self._append_chat("Tessent", "Did not run: "
+                              + str(payload.get("message", status)))
+        self._bridge_current = None
+        self._show_next_tessent()
+
+    def reject_tessent(self) -> None:
+        req = self._bridge_current
+        if req is None or self._bridge_running is not None:
+            return
+        bridge = getattr(self, "_bridge_current_dir", "") or self._bridge_path()
+        try:
+            agent_bridge.respond(bridge, req.id, {
+                "status": "rejected", "script_ran": "",
+                "message": "The user rejected this script; it did not run. "
+                           "Do not resubmit it unchanged."})
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not answer the Tessent request")
+        self._append_chat("Tessent", "Rejected by you:\n" + req.script)
+        self._bridge_current = None
+        self._show_next_tessent(bridge)
+
+    def _reject_all_tessent(self, message: str, status: str) -> None:
+        bridge = getattr(self, "_bridge_current_dir", "") or self._bridge_path()
+        reqs = list(self._bridge_queue)
+        if self._bridge_current is not None and self._bridge_running is None:
+            reqs.insert(0, self._bridge_current)
+            self._bridge_current = None
+        self._bridge_queue = []
+        for req in reqs:
+            try:
+                agent_bridge.respond(bridge, req.id, {
+                    "status": status, "message": message, "script_ran": ""})
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "tessent_box"):
+            self._show_next_tessent(bridge)
+
+    def _reset_tessent_bridge(self) -> None:
+        self._bridge_seen = set()
+        self._bridge_queue = []
+        self._bridge_current = None
+        self._bridge_running = None
+        self.tessent_box.setVisible(False)
 
     def _collect_findings(self) -> None:
         """Pull the structured findings recorded so far into the panel."""
@@ -1579,6 +1899,7 @@ class AgentPanel(QWidget):
             return
         self._set_stop_enabled(False)
         self._busy_message = "Stopping"
+        self._reject_all_tessent("The user stopped the turn.", "cancelled")
         try:
             worker.cancel()
         except Exception:  # noqa: BLE001 - a stop must never raise into Qt
@@ -1735,6 +2056,7 @@ class AgentPanel(QWidget):
         left to interpreter shutdown.
         """
         self._busy_timer.stop()
+        self._reject_all_tessent("The GUI is closing.", "cancelled")
         # Stop a turn in flight first, so the wait below is short.
         for worker in (self._worker, self._chat_worker):
             if worker is not None:
@@ -1768,6 +2090,7 @@ class AgentPanel(QWidget):
         self._close_mcp_session()
         self._findings_sink = FindingsSink()
         self._fix_edits_sink = FixEditsSink()
+        self._reset_tessent_bridge()
         self._findings = []
         self._fix_edits = []
         self._tool_log_offset = 0
@@ -1804,10 +2127,14 @@ class AgentPanel(QWidget):
         """Render one chat turn into the view (no bookkeeping)."""
         if role == "Agent":
             body = self._to_html(text)
+        elif role == "Tessent":
+            body = ('<span style="font-family:monospace;">'
+                    + html.escape((text or "").strip()).replace("\n", "<br>")
+                    + "</span>")
         else:
             body = html.escape((text or "").strip()).replace("\n", "<br>")
-        colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b"}.get(
-            role, "#555")
+        colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b",
+                  "Tessent": "#8e44ad"}.get(role, "#555")
         block = (f'<p dir="ltr" style="{_LTR_STYLE}">'
                  f'<b style="color:{colour};">{html.escape(role)}:</b> '
                  f'{body}</p>')

@@ -172,6 +172,8 @@ class ControlSpec:
     enabled: bool = True
     allowed_commands: List[str] = field(default_factory=list)
     allowed_options: List[str] = field(default_factory=list)
+    #: Lets the AI agent run free-form scripts, each one approved in the GUI.
+    allow_agent_eval: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ControlSpec":
@@ -179,6 +181,7 @@ class ControlSpec:
             enabled=bool(data.get("enabled", True)),
             allowed_commands=[str(c) for c in data.get("allowed_commands", [])],
             allowed_options=[str(o) for o in data.get("allowed_options", [])],
+            allow_agent_eval=bool(data.get("allow_agent_eval", False)),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -186,6 +189,7 @@ class ControlSpec:
             "enabled": self.enabled,
             "allowed_commands": list(self.allowed_commands),
             "allowed_options": list(self.allowed_options),
+            "allow_agent_eval": self.allow_agent_eval,
         }
 
 

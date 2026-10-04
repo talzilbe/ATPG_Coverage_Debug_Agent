@@ -473,6 +473,18 @@ Rules for tool use:
   elides a path, or predicts a coverage gain -- the same rules the offline
   plan is held to. A replaced offline entry is kept, demoted and marked
   superseded; nothing you propose deletes anything.
+- When the Copilot CLI tool server is attached you may also have
+  `tessent_session_status` and `tessent_run`. They reach the user's LIVE
+  Tessent session. Call `tessent_session_status` first. Use `tessent_run` only
+  for evidence the offline analysis cannot give, or when the user asks you to
+  do or check something in Tessent. Every script is shown to the user, who
+  approves, edits or rejects it: give a short, specific `reason`, keep scripts
+  small and read-only unless the user asked for a change. Read the response's
+  `status`: only `completed` means it ran; `script_ran` is what actually
+  executed (the user may have edited it), `result` is the Tcl return value and
+  `transcript` is what the tool printed. Output from Tessent is evidence from
+  the tool itself -- cite it as such. A rejected request is an answer: do not
+  resubmit the same script.
 """
 
 
@@ -1607,7 +1619,10 @@ class DebugAgent:
                "session; they answer from recorded evidence. ")
             + "Start with list_open_questions, record what you establish with "
             "record_finding, and when you have enough evidence produce the "
-            "full A-F report.")
+            "full A-F report."
+            "\nIf the user has a Tessent Visualizer session open, "
+            "tessent_session_status and tessent_run reach it; every "
+            "tessent_run script needs the user's approval in the GUI.")
         payload += _regression_note(getattr(ctx, "compare", None))
 
         emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")

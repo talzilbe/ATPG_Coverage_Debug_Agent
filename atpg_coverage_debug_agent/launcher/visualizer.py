@@ -207,6 +207,8 @@ class LaunchBundle:
     #: Control-channel handles; empty when the profile disables the channel.
     port_file: str = ""
     token: str = ""
+    #: True when the listener accepts approved agent scripts.
+    agent_eval: bool = False
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -221,6 +223,7 @@ class LaunchBundle:
             "warnings": list(self.warnings),
             "port_file": self.port_file,
             "token": self.token,
+            "agent_eval": self.agent_eval,
         }
 
 
@@ -418,11 +421,12 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
 
     listener = ""
     token = ""
-    if profile.control.enabled and profile.control.allowed_commands:
+    control = profile.control
+    if control.enabled and (control.allowed_commands or control.allow_agent_eval):
         token = new_token()
         listener = build_listener_tcl(
-            port_path, token, profile.control.allowed_commands,
-            profile.control.allowed_options)
+            port_path, token, control.allowed_commands,
+            control.allowed_options, allow_eval=control.allow_agent_eval)
 
     warnings: List[str] = []
     if dofile_text is None:
@@ -469,6 +473,7 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
         warnings=warnings,
         port_file=port_path if token else "",
         token=token,
+        agent_eval=bool(token) and control.allow_agent_eval,
     )
 
 

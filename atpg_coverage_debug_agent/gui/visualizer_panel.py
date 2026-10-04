@@ -660,6 +660,8 @@ class VisualizerPanel(QWidget):
     # ------------------------------------------------------------------
     def _begin_session(self, bundle) -> None:
         self._session_ready = False
+        self._bundle = bundle
+        self._launch_form = self._form_config()
         if not bundle.token or not bundle.port_file:
             self._session = None
             self._set_session_label(
@@ -686,6 +688,22 @@ class VisualizerPanel(QWidget):
 
     def has_live_session(self) -> bool:
         return self._session is not None and self._session.port is not None
+
+    def agent_target(self) -> Optional[Dict[str, Any]]:
+        """What the AI agent may reach: the session, its log and its inputs."""
+        if self._session is None:
+            return None
+        bundle = getattr(self, "_bundle", None)
+        form = getattr(self, "_launch_form", None) or {}
+        return {
+            "session": self._session,
+            "live": self._session.port is not None,
+            "agent_eval": bool(getattr(bundle, "agent_eval", False)),
+            "log_path": getattr(bundle, "log_path", "") or "",
+            "profile": form.get("profile", ""),
+            "design_inputs": {k: v for k, v in (form.get("paths") or {}).items()
+                              if v},
+        }
 
     def signal_actions(self) -> List[InspectAction]:
         """The profile's 'show this object' actions, for building a menu."""
