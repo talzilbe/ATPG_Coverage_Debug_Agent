@@ -59,6 +59,7 @@ from ..agent.debug_agent import (
     build_user_payload,
     is_cli_auth_error,
 )
+from ..agent import answer_format
 from ..agent import cli_models
 from ..analysis import investigate
 from ..config import credentials
@@ -368,6 +369,11 @@ class AgentPanel(QWidget):
         self._model_thread: Optional[QThread] = None
         self._model_worker = None
         self._last_response: str = ""
+        self._answer: Optional[answer_format.StructuredAnswer] = None
+        self._answer_expanded: set = set()
+        self._answer_raw: bool = False
+        # The chat points at the response pane instead of repeating the diagnosis.
+        self._chat_stub: bool = False
         self._chat_turns: list = []
         self._compare = None
         self._stream_buf: str = ""
@@ -720,9 +726,11 @@ class AgentPanel(QWidget):
         self.response_view.customContextMenuRequested.connect(
             lambda pos: self._on_text_context_menu(self.response_view, pos))
         self.response_view.setPlaceholderText(
-            "The agent's evidence-driven A–F diagnosis appears here. Fault ids "
-            "are clickable; right-click a hierarchy path to open it in the "
-            "running Tessent Visualizer.")
+            "The agent's diagnosis appears here: the verdict and next actions "
+            "first, then one line per section — click ▸ to unfold findings, "
+            "corrections and their evidence. Fault ids are clickable; "
+            "right-click a hierarchy path to open it in the running Tessent "
+            "Visualizer.")
         resp_layout.addWidget(self.response_view)
         splitter.addWidget(resp_box)
 
@@ -1205,6 +1213,8 @@ class AgentPanel(QWidget):
         self.response_view.clear()
         self.chat_view.clear()
         self._last_response = ""
+        self._answer = None
+        self._chat_stub = False
         self._chat_turns = []
         self._compare = None
         self._session_id = None
@@ -1240,7 +1250,9 @@ class AgentPanel(QWidget):
         self.chat_view.clear()
         self.trace_view.clear()
         self._chat_turns = []
+        self._chat_stub = False
         self._last_response = ""
+        self._answer = None
         self._findings = []
         self._fix_edits = []
         self._set_chat_enabled(False)
@@ -1451,6 +1463,9 @@ class AgentPanel(QWidget):
             design=investigate.serialize_design(getattr(r, "netlist", None), r),
             findings=self._findings_sink,
             fix_edits=self._fix_edits_sink,
+            skills=investigate.serialize_skills(
+                getattr(r, "skill_results", None),
+                self._skill_manager.skills if self._skill_manager else None),
         )
 
     def on_run(self) -> None:
@@ -2151,7 +2166,8 @@ class AgentPanel(QWidget):
             self.set_connection_collapsed(True)
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
-        self._append_chat("Agent", final)
+        self._chat_stub = True
+        self._rebuild_chat_view()
         if self._chat_backend != "cli":
             # HTTP backend: keep a running messages list for follow-ups.
             self._chat_messages.append({"role": "assistant", "content": text})
@@ -2238,6 +2254,7 @@ class AgentPanel(QWidget):
         self._chat_backend = config.backend
         self.chat_view.clear()
         self._chat_turns = []
+        self._chat_stub = False
         self._set_chat_enabled(False)
         if config.backend == "cli":
             self._chat_messages = []
@@ -2262,19 +2279,27 @@ class AgentPanel(QWidget):
 
     def _render_turn(self, role: str, text: str) -> None:
         """Render one chat turn into the view (no bookkeeping)."""
+        colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b",
+                  "Tessent": "#8e44ad"}.get(role, "#555")
+        label = f'<b style="color:{colour};">{html.escape(role)}:</b>'
+        if role == "Agent" and not answer_format.is_single_paragraph(text):
+            # A structured reply (lists, tables, evidence) keeps its layout.
+            self._append_html(self.chat_view,
+                              f'<p dir="ltr" style="{_LTR_STYLE}">{label}</p>')
+            self._append_html(
+                self.chat_view,
+                f'<div dir="ltr" style="{_LTR_STYLE}">'
+                f'{answer_format.markdown_to_html(text, self._linkify)}</div>')
+            return
         if role == "Agent":
-            body = self._to_html(text)
+            body = answer_format.inline_lines(text, self._linkify)
         elif role == "Tessent":
             body = ('<span style="font-family:monospace;">'
                     + html.escape((text or "").strip()).replace("\n", "<br>")
                     + "</span>")
         else:
             body = html.escape((text or "").strip()).replace("\n", "<br>")
-        colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b",
-                  "Tessent": "#8e44ad"}.get(role, "#555")
-        block = (f'<p dir="ltr" style="{_LTR_STYLE}">'
-                 f'<b style="color:{colour};">{html.escape(role)}:</b> '
-                 f'{body}</p>')
+        block = (f'<p dir="ltr" style="{_LTR_STYLE}">{label} {body}</p>')
         self._append_html(self.chat_view, block)
 
     def _append_chat(self, role: str, text: str) -> None:
@@ -2283,6 +2308,12 @@ class AgentPanel(QWidget):
 
     def _rebuild_chat_view(self) -> None:
         self.chat_view.clear()
+        if self._chat_stub:
+            self._append_html(
+                self.chat_view,
+                f'<p dir="ltr" style="{_LTR_STYLE}color:#777;"><i>The '
+                "diagnosis is in the Agent Response pane above. Ask a "
+                "follow-up question below.</i></p>")
         for role, text in self._chat_turns:
             self._render_turn(role, text)
 
@@ -2301,7 +2332,10 @@ class AgentPanel(QWidget):
 
     def _to_html(self, text: str) -> str:
         """HTML-escape *text* and turn known fault ids into clickable links."""
-        esc = html.escape(text or "")
+        return self._linkify(html.escape(text or "")).replace("\n", "<br>")
+
+    def _linkify(self, esc: str) -> str:
+        """Add fault links to already HTML-escaped text."""
         faults = self._known_fault_objects()
         if faults:
             esc_map = {html.escape(fo): fo for fo in faults}
@@ -2315,7 +2349,7 @@ class AgentPanel(QWidget):
                 return (f'<a href="{href}" style="color:#0055aa;">{e}</a>')
 
             esc = pattern.sub(_repl, esc)
-        return esc.replace("\n", "<br>")
+        return esc
 
     def _append_html(self, browser: QTextBrowser, html_str: str) -> None:
         # append() starts a new paragraph; insertHtml would merge the fragment
@@ -2326,15 +2360,60 @@ class AgentPanel(QWidget):
 
     def _set_response(self, text: str) -> None:
         self._last_response = text
+        self._answer = answer_format.parse_answer(text)
+        self._answer_expanded = answer_format.default_expanded(self._answer)
+        self._answer_raw = False
+        self._render_response()
+
+    def _render_response(self, keep_scroll: bool = False) -> None:
+        text = self._last_response
+        answer = self._answer
+        structured = answer is not None and answer.structured
+        link = 'style="text-decoration:none;color:#036;"'
+        if self._answer_raw:
+            tools = f'<a href="view:formatted" {link}>Show formatted view</a>'
+            body = (f'<div style="font-family:monospace;white-space:pre-wrap;">'
+                    f'{self._to_html(text)}</div>')
+        elif structured:
+            tools = (f'<a href="toggle:__all__" {link}>Expand all</a> &middot; '
+                     f'<a href="toggle:__none__" {link}>Collapse all</a> '
+                     f'&middot; <a href="view:raw" {link}>Show plain text</a>')
+            body = answer_format.render_answer_html(
+                answer, self._answer_expanded, self._linkify)
+        else:
+            tools = f'<a href="view:raw" {link}>Show plain text</a>'
+            body = answer_format.markdown_to_html(text, self._linkify)
+        toolbar = (f'<p align="right" style="font-size:small;">{tools}</p>'
+                   if (text or "").strip() else "")
+        bar = self.response_view.verticalScrollBar()
+        pos = bar.value()
         self.response_view.setHtml(
-            f'<div dir="ltr" style="font-family:monospace;'
-            f'white-space:pre-wrap;text-align:left;direction:ltr;">'
-            f'{self._to_html(text)}</div>')
+            f'<div dir="ltr" style="text-align:left;direction:ltr;">'
+            f'{toolbar}{body}</div>')
+        if keep_scroll:
+            bar.setValue(pos)
 
     def _on_anchor_clicked(self, url) -> None:
         s = url.toString()
         if s.startswith("fault:"):
             self.fault_referenced.emit(unquote(s[len("fault:"):]))
+        elif s.startswith("toggle:") and self._answer is not None:
+            key = s[len("toggle:"):]
+            if key == "__all__":
+                self._answer_expanded = answer_format.all_keys(self._answer)
+            elif key == "__none__":
+                self._answer_expanded = {"notes"}
+            else:
+                self._answer_expanded ^= {key}
+            self._render_response(keep_scroll=True)
+        elif s.startswith("goto:") and self._answer is not None:
+            key = s[len("goto:"):]
+            self._answer_expanded.add(key)
+            self._render_response(keep_scroll=True)
+            self.response_view.scrollToAnchor(f"sec-{key}")
+        elif s.startswith("view:"):
+            self._answer_raw = s == "view:raw"
+            self._render_response()
 
     # -- right-click a path in the agent's text -> Tessent Visualizer --------
 

@@ -43,8 +43,8 @@ Root-cause ATPG stuck-at coverage loss from a gate-level netlist, a Tessent
 fault list (AU/UO/UC faults) and the ATPG constraint dofile.
 
 ## Procedure (summary)
-1. Parse the fault list and compute the fault-class statistics (DS/DI vs
-   AU/UO/UC) and the estimated structural coverage.
+1. Parse the fault list and compute the fault-class census (DS/DI vs
+   AU/UO/UC) with the coverage metrics and their formulas.
 2. Map each coverage-loss fault object to its netlist instance and cell type.
 3. Build the fan-in / fan-out cone for each fault site.
 4. Correlate against the ATPG constraints (forced / disabled / tied signals).
@@ -60,7 +60,8 @@ fault list (AU/UO/UC faults) and the ATPG constraint dofile.
 A — Executive fault-statistics table.
 B — Coverage-loss summary table (module / classes / count / root cause / fix).
 C — Per-root-cause debug narratives with signal paths.
-D — Final diagnosis with a prioritised action list and projected coverage.
+D — Final diagnosis with a prioritised action list (gains are measured by a
+    re-run, never predicted).
 """
 
 

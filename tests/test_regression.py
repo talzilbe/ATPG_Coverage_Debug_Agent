@@ -80,9 +80,35 @@ def test_run_tool_regression_with_compare(sample_netlist_path,
 def test_regression_skills_registered():
     from atpg_coverage_debug_agent.skills.manager import SkillManager
     ids = {s.skill_id for s in SkillManager().skills}
-    for name in ("regression_summary", "list_regressed", "list_fixed",
-                 "list_changed"):
-        assert name in ids
+    assert "regression" in ids
+    for old in ("regression_summary", "list_regressed", "list_fixed",
+                "list_changed"):
+        assert old not in investigate.TOOL_SPECS
+        assert investigate.TOOL_ALIASES[old][0] == "regression"
+
+
+def test_the_merged_regression_tool_pages(sample_netlist_path,
+                                          sample_faults_path,
+                                          sample_constraints_path):
+    rep = run_analysis(sample_netlist_path, sample_faults_path,
+                       sample_constraints_path)
+    compare = {"label": "base", "faults": [], "summary": {}, "constraints": []}
+    first = investigate.run_tool(
+        "regression", {"mode": "regressed", "limit": 1},
+        fault_results=rep.fault_results, constraints=rep.constraints,
+        netlist=rep.netlist, compare=compare)
+    assert first["total"] == len(rep.fault_results) > 1
+    assert first["returned"] == 1 and first["more"] is True
+    second = investigate.run_tool(
+        "regression", {"mode": "regressed", "limit": 1,
+                       "offset": first["next_offset"]},
+        fault_results=rep.fault_results, constraints=rep.constraints,
+        netlist=rep.netlist, compare=compare)
+    assert second["faults"][0] != first["faults"][0]
+    bad = investigate.run_tool(
+        "regression", {"mode": "sideways"}, fault_results=rep.fault_results,
+        constraints=rep.constraints, netlist=rep.netlist, compare=compare)
+    assert "error" in bad and "hint" in bad
 
 
 def test_serialize_report_for_compare(sample_netlist_path, sample_faults_path,

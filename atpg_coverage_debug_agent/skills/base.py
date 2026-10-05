@@ -59,6 +59,9 @@ class SkillResult:
     findings: List[SkillFinding] = field(default_factory=list)
     summary: str = ""
     success: bool = True
+    #: The structured payload of an on-demand query tool -- what the model
+    #: must receive, rather than the findings summarised from it.
+    data: Any = None
 
     def add_info(self, text: str) -> None:
         self.messages.append(SkillMessage("info", text))
@@ -114,6 +117,10 @@ class AnalysisContext:
     #: Sink the ``propose_fix`` tool writes fix-plan edits into
     #: (``analysis.fix_plan_edits.FixEditsSink``), or ``None`` to refuse.
     fix_edits: Any = None
+    #: ``investigate.serialize_skills`` payload: the bulk skills' results and
+    #: the enabled guidance documents, read by ``skill_findings`` and
+    #: ``read_guidance`` so every backend reaches them the same way.
+    skills: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,9 @@ class SkillBase(ABC):
     #: exposed to the agent as callable tools but skipped in the bulk
     #: "run all skills" pass (where they would run with empty arguments).
     on_demand: bool = False
+    #: Guidance skills carry a document for the model to read, not a
+    #: computation; the agent reaches them through ``read_guidance``.
+    guidance: bool = False
 
     def __init__(self) -> None:
         self._params: Dict[str, Any] = {}
@@ -224,6 +234,7 @@ class SkillBase(ABC):
             "float": "number",
             "bool": "boolean",
             "str": "string",
+            "list": "array",
         }
         properties: Dict[str, Any] = {}
         for name, spec in self.parameters_schema().items():
@@ -232,6 +243,8 @@ class SkillBase(ABC):
                 "type": json_type,
                 "description": spec.get("description", ""),
             }
+            if json_type == "array":
+                prop["items"] = {"type": "string"}
             if "default" in spec:
                 prop["description"] += f" (default: {spec['default']})"
             properties[name] = prop

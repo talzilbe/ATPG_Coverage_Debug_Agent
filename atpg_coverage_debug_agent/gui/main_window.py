@@ -801,8 +801,36 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           <code>why_blocked</code>, <code>list_constraints</code>,
           <code>trace_path</code>, <code>suggest_test_points</code></td>
           <td>Per-fault drill-down, constraints and structural path
-          tracing.</td></tr>
-      </table></li>
+          tracing. <code>list_faults</code> filters by one
+          <code>issue</code> (controllability, observability, constraint or
+          scan_boundary); fault rows are compact unless the agent asks for
+          <code>detail=full</code>.</td></tr>
+      <tr><td><code>skill_findings</code></td><td>The results of the analysis
+          skills you enabled on the <b>Skills</b> tab (constraint impact,
+          hotspots, cone summary, scan boundary&hellip;), which ran with the
+          analysis. Each skill card on that tab says how it reaches the
+          agent.</td></tr>
+      <tr><td><code>read_guidance</code></td><td>Your guidance documents
+          &mdash; Markdown skills on the <b>Custom Skills</b> tab and the
+          dft-atpg-debug methodology &mdash; read one section at a time
+          instead of pasted whole. A Markdown skill may open with a
+          <code>---</code> block holding <code>name:</code> and
+          <code>description:</code>; the description is shown in the Skills
+          tab. Guidance tells the agent where to look; it is never treated as
+          evidence.</td></tr>
+      <tr><td><code>regression</code></td><td>After <b>Compare Report</b>:
+          <code>mode=summary</code> for the counts, or
+          <code>regressed</code> / <code>fixed</code> / <code>changed</code>
+          for the faults.</td></tr>
+      <tr><td><code>read_spill</code></td><td>When a tool answer was too
+          large and got shortened, it says so and names a file holding the
+          complete answer; this reads that file page by page, so the agent
+          never has to conclude from a shortened list.</td></tr>
+      </table>
+      <p>Every list the tools return says how many items there are in total
+      and, when it is one page of a longer list, how to fetch the next page
+      (<code>more</code> / <code>next_offset</code>). A shortened list is
+      always marked as such.</p></li>
 </ul>
 
 <h3>Step 4 &mdash; run &amp; review</h3>
@@ -817,7 +845,8 @@ them.</p>
 <tr><th>Button</th><th>Use</th></tr>
 <tr><td><b class="k">Run AI Debug Agent</b> / <b class="k">Run Agentic
     Agent</b></td><td>Generate the A&ndash;F
-    diagnosis. Output streams into the Agent Response pane; fault ids are
+    diagnosis. Output streams into the Agent Response pane and is then laid
+    out for reading (see <i>Reading the answer</i> below); fault ids are
     clickable and focus the row in the table.</td></tr>
 <tr><td><b class="k">Stop</b></td><td>Stop the turn in progress (a run or a
     follow-up reply). Whatever streamed so far is kept and marked
@@ -863,14 +892,39 @@ dominates the <i>actionable</i> loss, <b>B</b> evidence gaps not already
 quantified in &sect;3, <b>C</b> corrections where its reading differs from the
 computed root cause, <b>D</b> patterns that span categories, <b>E</b> detailed
 narratives for the few findings that matter, and <b>F</b> a review of the fix
-plan rather than a second one. If a section has nothing to say it will say so
-in a line.</p>
+plan rather than a second one. A section with nothing to say is left out.</p>
+<p><b>Reading the answer.</b> When the answer has finished streaming, the
+Agent Response pane lays it out in layers so it can be read in a minute and
+audited when needed:</p>
+<ul>
+  <li>a <b>summary card</b> at the top: the <b>Verdict</b> with a confidence
+      badge, at most three <b>Next actions</b>, and a line counting the
+      findings, corrections, evidence gaps and plan-review items &mdash; click
+      a count to jump to it. Sections with nothing to report are named there
+      instead of taking space. Any <b>Guardrail check</b> warning also shows
+      in the card;</li>
+  <li>below it, <b>one line per section</b>. Click <b>&#9656;</b> to unfold
+      it, <b>&#9662;</b> to fold it again. Findings open as one headline each
+      (the first is already unfolded), and every finding keeps its
+      <b>Evidence</b> &mdash; the instantiation lines, corroboration steps
+      and tool results it rests on &mdash; folded underneath;</li>
+  <li><b class="k">Expand all</b> / <b class="k">Collapse all</b> at the top
+      right, and <b class="k">Show plain text</b> to see the answer exactly
+      as the model wrote it (<b class="k">Show formatted view</b> goes
+      back).</li>
+</ul>
+<p>Folding only changes what is on screen: the model is told to keep doing
+every check and to put the depth into the Evidence blocks, and Save chat,
+Copy/Save Response and Verify always use the complete answer.</p>
 
 <h3>Step 5 &mdash; follow-up chat</h3>
 <p>After a run, use <b>Follow-up Chat</b> to ask questions about the diagnosis;
 the conversation keeps the full analysis context (e.g. &ldquo;which module
 contributes the most loss?&rdquo;, &ldquo;how would a control point on X
-help?&rdquo;). <b>Max tokens</b> and <b>Temperature</b> tune size and
+help?&rdquo;). The diagnosis itself stays in the Agent Response pane rather
+than being repeated in the chat, and follow-up answers are short and direct
+&mdash; the answer first, then only the evidence for it &mdash; unless you ask
+for the full report. <b>Max tokens</b> and <b>Temperature</b> tune size and
 determinism (temperature&nbsp;0 is most repeatable).</p>
 <p><b>Keeping the conversation.</b> <b class="k">Save chat&hellip;</b> writes
 the whole session as Markdown &mdash; the initial diagnosis and every

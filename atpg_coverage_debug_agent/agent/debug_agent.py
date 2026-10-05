@@ -209,12 +209,14 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
               the PARENT instance name to its module type, then find that module
               definition, then extract the leaf instantiation from inside that
               module body only.
-          (b) Print the complete instantiation including all continuation lines.
+          (b) Read the complete instantiation including all continuation lines,
+              and quote it once, in the Evidence block of the finding that
+              relies on it.
           (c) Classify pins: scan-data-in (si/sd/ti/scan_in), scan-out
               (so/to/scan_out), shift-enable (se/ssb/sen/scan_enable). A cell is
               SCAN if it has a dedicated scan-data input AND a shift-enable pin.
-          (d) Corroborate all three, and report the corroboration even when (c)
-              already looks conclusive:
+          (d) Corroborate all three, and record the corroboration in that
+              Evidence block even when (c) already looks conclusive:
               - trace shift-enable back to a global test_se/scan_en (through
                 buffers/inverters);
               - confirm scan-out reaches a module output port;
@@ -326,37 +328,66 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
   deterministic pass cannot do: judgement, cross-cutting reasoning, and
   disagreement.
 
-  A. Verdict — 3-6 sentences, no tables. Which mechanism dominates the
+  HOW THE ANSWER IS READ. The engineer's screen shows the Verdict and the
+  Next actions first, then one line per section and one headline per
+  finding, which they unfold on demand. Write for that: a headline that
+  carries the conclusion, the detail underneath it. Use EXACTLY the Markdown
+  headings below, in this order. OMIT a section that would be empty -- an
+  absent section is read as "nothing to report"; do not write "None".
+
+  ## A. Verdict
+     First line: `Confidence: high | medium | reduced | insufficient`.
+     Then 3-5 sentences, no tables. Which mechanism dominates the
      ACTIONABLE coverage loss (the mapped, non-tied population in S3) and the
      specific evidence for that claim. If the actionable population is small
      relative to unmapped + tied faults, say that the headline loss figure is
      dominated by artefacts and that no mechanism can be ranked yet. Never
      compute the ranking from the raw loss total.
-  B. Evidence Gaps That Change The Answer — only limits NOT already quantified
-     in S3. For each: what is missing, which specific conclusion it blocks, and
-     the file or command that would close it. If S3 already states it, skip it.
-  C. Corrections To The Computed Analysis — the rows where your reading differs
-     from the tool's. For each: the fault site (copied verbatim), the computed
-     root cause, your root cause, and the evidence for the change. Say "No
-     corrections" when the computed classification holds. Do NOT restate rows
-     you agree with; the full table is S8.
-  D. Cross-Cutting Patterns — only patterns that span categories or hierarchies
-     and are therefore invisible to the per-category clustering in S4/S6: one
-     structure blocking several unrelated blocks, one constraint reaching
-     several categories, a systematic naming or wiring anomaly. Skip if none.
-  E. Detailed Debug Notes — short narratives for the two or three most
-     important findings, each tracing the mechanism end to end: what is
-     established at the site, what blocks activation or propagation, where the
-     effect dies, and why that yields AU/UO/UC. This is the section with the
-     most value; spend the output budget here.
-  F. Fix Plan Review — do not invent a parallel plan. Take the ranked plan in
-     S5 and, per proposal, state agree / re-rank / reject with the reason.
+  ## Actions
+     1-3 numbered lines, at most 25 words each: what the engineer should do
+     next, most valuable first. Point at a fix-plan entry ("S5 #2") or a
+     finding ("see E1") instead of repeating its commands or reasoning.
+  ## E. Detailed Debug Notes
+     One `### E1: <headline>` per finding, for the two or three most
+     important findings. The headline (at most 20 words) states the
+     conclusion. Under it, at most ~150 words tracing the mechanism end to
+     end: what is established at the site, what blocks activation or
+     propagation, where the effect dies, and why that yields AU/UO/UC. Then
+     `#### Evidence` holding what an auditor needs and nobody else: the
+     instantiation lines read, the corroboration steps, the tool results
+     relied on, each tagged Observed / Derived / Likely / Unresolved. This is
+     the section with the most value; spend the output budget here.
+  ## C. Corrections To The Computed Analysis
+     The rows where your reading differs from the tool's, as one table: fault
+     site (copied verbatim) | computed root cause | your root cause |
+     evidence. Do NOT restate rows you agree with; the full table is S8.
+     Omit the section when the computed classification holds.
+  ## B. Evidence Gaps That Change The Answer
+     Only limits NOT already quantified in S3, one bullet each: what is
+     missing -> which conclusion it blocks -> the file or command that
+     would close it.
+  ## D. Cross-Cutting Patterns
+     Only patterns that span categories or hierarchies and are therefore
+     invisible to the per-category clustering in S4/S6: one structure
+     blocking several unrelated blocks, one constraint reaching several
+     categories, a systematic naming or wiring anomaly. One bullet each.
+  ## F. Fix Plan Review
+     Do not invent a parallel plan. One bullet per S5 proposal you re-rank or
+     reject, with the reason; proposals you simply agree with need no line.
      Add a proposal only for something the plan misses, and say why it is
      missing. When tools are available, PUT the review INTO the plan with
      `propose_fix`: a practical note on an entry you agree with (amend), your
      own proposal for what the plan misses (add), or a better fix in place
      of an offline entry (replace, with the reason). The prose here then
-     summarises what you changed; the engineer reads the plan itself.
+     lists what you changed, one line per change; the engineer reads the
+     plan itself.
+
+  LENGTH. Outside the Evidence blocks the answer should fit on about one
+  screen (~400 words). This budget limits what you WRITE, never what you
+  check: carry out every workflow step, hard rule and self-check in full,
+  then write down only what changes the conclusion or is needed to audit
+  it. Depth goes into Evidence blocks, never into restating the report or
+  narrating the steps you followed.
 
 8. DECISION LOGIC
   PRECEDENCE: before applying any UC/UO/AU rule below, complete Step 5a. If
@@ -384,10 +415,13 @@ Treat AU/UO/UC as coverage-loss faults; DS/DI as detected; TI as tied by hardwar
      constant on the data and enable pins?
   If any check fails, answer 'Unresolved' and state exactly which file or
   command is required. 'Observed' may label ONLY text literally read from a
-  file.
+  file. Run the self-check silently: write down only a check that fails and
+  what it blocks, never the passing checklist.
 
-11. STYLE: technical, concise, explicit, audit-friendly. Prefer tables and bullets.
-   Avoid motivational language, filler, unsupported speculation.
+11. STYLE: technical, concise, explicit, audit-friendly. Headline first, detail
+   underneath. Bullets over paragraphs; a table only where rows really compare
+   (corrections). Do not restate the question, the inputs or the workflow you
+   followed. Avoid motivational language, filler, unsupported speculation.
 
 12. FINAL INSTRUCTION
    Answer with evidence: "Where is coverage lost, and is the loss caused by constraints,
@@ -414,8 +448,10 @@ Rules for tool use:
   different arguments if that sharpens the analysis.
 - Tool findings are Observed/Derived structural facts — treat them as evidence,
   not as final conclusions; you still must reason over them.
-- When you have enough evidence, STOP calling tools and return the full A-F
-  report exactly as specified in the base system prompt.
+- When you have enough evidence, STOP calling tools and return the A-F
+  answer exactly as specified in section 7 of the base system prompt. Do
+  not narrate which tools you called; the engineer sees the tool trace.
+  Cite a tool result in the Evidence block of the finding that relies on it.
 - Never claim a skill returned something it did not. If a tool returns no
   findings, say so.
 - Call `report_context` EARLY. It returns the COMPLETE fault census -- every
@@ -433,9 +469,16 @@ Rules for tool use:
   itself. Never invent a category to absorb a difference.
 - A tool result carrying `_truncation` is NOT a read result. It names the
   fields it dropped and, usually, a `spill_path` holding the complete payload.
-  Read the spill, or re-query more narrowly, before concluding. Counts and the
-  census are never truncated, so a missing count means the tool did not return
-  one -- not that it was cut.
+  Read it with `read_spill(path=<spill_path>)`, or re-query more narrowly
+  (every list tool pages with offset / next_offset), before concluding.
+  Counts and the census are never truncated, so a missing count means the
+  tool did not return one -- not that it was cut. A list with a `*_total`
+  count beside it, or `more: true`, is a page, not the whole set.
+- The analysis skills the engineer enabled in the Skills tab (constraint
+  impact, hotspots, cone summary, scan boundary, ...) already ran; read
+  their results with `skill_findings`. The engineer's guidance documents
+  are available section by section through `read_guidance`; they say where
+  to look and are never evidence on their own.
 - When the evidence does not settle a question, call
   `report_insufficient_evidence` and report that as your answer. It exists so
   that "not determined" is a real, available action rather than something you
@@ -515,6 +558,25 @@ do not add a note about this correction.
 
 Return ONLY the corrected analysis.
 """
+
+
+#: Prefixed to every follow-up question. Section 7 says "always", which made a
+#: one-line question come back as a full A-F report.
+FOLLOW_UP_INSTRUCTION = (
+    "[Follow-up question. Answer it directly: lead with the answer in one or "
+    "two sentences, then only the evidence that supports it. Do not repeat "
+    "the A-F report or any section of it unless the question asks for it. "
+    "Keep it under about 200 words; if a trace is needed, put it under a "
+    "'#### Evidence' heading after the answer. Every evidence rule and "
+    "self-check of the system prompt still applies, and so do the tools.]"
+)
+
+
+def follow_up_message(message: str) -> str:
+    """The text actually sent for a follow-up turn."""
+    if message.startswith(FOLLOW_UP_INSTRUCTION):
+        return message
+    return f"{FOLLOW_UP_INSTRUCTION}\n\n{message}"
 
 
 # ---------------------------------------------------------------------------
@@ -1102,8 +1164,17 @@ def build_user_payload(report: Any, max_faults: int = 200,
         lines.append("## Skill Findings (auxiliary structural skills)")
         for sr in skill_results:
             lines.append(f"### {sr.skill_id}: {sr.summary}")
-            for f in getattr(sr, "findings", [])[:10]:
+            findings = list(getattr(sr, "findings", []) or [])
+            for f in findings[:10]:
                 lines.append(f"- {f.title} [{f.confidence}] — {f.description}")
+                affected = list(getattr(f, "affected_objects", None) or [])
+                if affected:
+                    more = (f" ({min(len(affected), 10)} of {len(affected)} "
+                            "listed)" if len(affected) > 10 else "")
+                    lines.append("  affected: " + ", ".join(affected[:10])
+                                 + more)
+            if len(findings) > 10:
+                lines.append(f"- (10 of {len(findings)} findings listed)")
         lines.append("")
 
     lines.append("## TASK")
@@ -1311,6 +1382,9 @@ class DebugAgent:
                                            agentic=True)
              + _regression_note(getattr(ctx, "compare", None))},
         ]
+        if ctx is not None and getattr(ctx, "skills", None) is None:
+            ctx.skills = investigate.serialize_skills(
+                getattr(report, "skill_results", None), skill_manager.skills)
         answer = self._tool_loop(messages, skill_manager, ctx, emit,
                                  max_iterations=max_iterations)
         return self.correct_guardrail_issues(answer, report, emit)
@@ -1326,7 +1400,11 @@ class DebugAgent:
         owns that message. Shared by the first answer and every follow-up so
         the two cannot drift apart in budget, caching or error handling.
         """
-        enabled = skill_manager.enabled_skills()
+        enabled = [s for s in skill_manager.enabled_skills()
+                   if getattr(s, "on_demand", False)]
+        if ctx is not None and getattr(ctx, "skills", None) is None:
+            ctx.skills = investigate.serialize_skills(
+                None, skill_manager.skills)
         tools = [s.to_tool_schema() for s in enabled]
         skills_by_id = {s.skill_id: s for s in enabled}
         emit(f"Agentic run started with {len(tools)} skill tool(s): "
@@ -1377,9 +1455,14 @@ class DebugAgent:
                     tool_calls_made += 1
                     skill = skills_by_id.get(name)
                     if skill is None:
-                        content = f"ERROR: unknown or disabled skill '{name}'."
-                        emit(f"   ⚠ {content}")
+                        content = json.dumps({
+                            "error": f"Unknown or disabled tool '{name}'.",
+                            "hint": "Available: " + ", ".join(skills_by_id)})
+                        emit(f"   ⚠ unknown or disabled tool '{name}'")
                     else:
+                        # Arguments are per call; never inherit the last call's.
+                        if getattr(skill, "on_demand", False):
+                            skill._params = {}
                         for key, value in args.items():
                             try:
                                 skill.set_param(key, value)
@@ -1456,12 +1539,17 @@ class DebugAgent:
             else:
                 emit("Follow-up turn WITHOUT tools: the model can only recall "
                      "the first answer's evidence.")
-            answer = self._call_cli("", message, session_id=session_id,
+            answer = self._call_cli("", follow_up_message(message),
+                                    session_id=session_id,
                                     resume=True, on_chunk=on_chunk,
                                     extra_args=extra or None)
         else:
             if not history:
                 raise RuntimeError("No conversation history for HTTP chat.")
+            last = history[-1]
+            if last.get("role") == "user" and isinstance(last.get("content"),
+                                                          str):
+                last["content"] = follow_up_message(last["content"])
             if skill_manager is not None and ctx is not None:
                 # history is extended in place with the tool exchange.
                 answer = self._tool_loop(history, skill_manager, ctx, emit,
@@ -1565,7 +1653,9 @@ class DebugAgent:
             context=getattr(ctx, "context", None),
             design=investigate.serialize_design(
                 getattr(ctx, "netlist", None), report),
-            stamp=stamp)
+            stamp=stamp,
+            skills=getattr(ctx, "skills", None) or investigate.serialize_skills(
+                getattr(report, "skill_results", None)))
         ev_path = os.path.join(work_dir, "evidence.json")
         with open(ev_path, "w", encoding="utf-8") as fh:
             json.dump(evidence, fh)
@@ -1619,7 +1709,8 @@ class DebugAgent:
                "session; they answer from recorded evidence. ")
             + "Start with list_open_questions, record what you establish with "
             "record_finding, and when you have enough evidence produce the "
-            "full A-F report."
+            "A-F answer. skill_findings returns the enabled analysis skills' "
+            "results and read_guidance the engineer's guidance documents."
             "\nIf the user has a Tessent Visualizer session open, "
             "tessent_session_status and tessent_run reach it; every "
             "tessent_run script needs the user's approval in the GUI.")
@@ -1897,29 +1988,19 @@ def _regression_note(compare: Optional[dict]) -> str:
 
 
 def _serialize_skill_result(result: Any) -> str:
-    """Render a :class:`SkillResult` into compact text for a tool response."""
-    lines: List[str] = [f"skill: {result.skill_id}"]
-    if getattr(result, "summary", ""):
-        lines.append(f"summary: {result.summary}")
-    lines.append(f"success: {getattr(result, 'success', True)}")
-    findings = getattr(result, "findings", []) or []
-    if not findings:
-        lines.append("findings: none")
-    else:
-        lines.append(f"findings ({len(findings)}):")
-        for i, f in enumerate(findings, 1):
-            lines.append(f"  {i}. [{f.confidence}] {f.title} — {f.description}")
-            if getattr(f, "evidence", None):
-                for ev in f.evidence[:6]:
-                    lines.append(f"       evidence: {ev}")
-            if getattr(f, "affected_objects", None):
-                objs = ", ".join(f.affected_objects[:10])
-                lines.append(f"       affected: {objs}")
-            if getattr(f, "recommendation", ""):
-                lines.append(f"       recommendation: {f.recommendation}")
-    warnings = getattr(result, "warnings", []) or []
-    if warnings:
-        lines.append(f"warnings ({len(warnings)}):")
-        for w in warnings[:10]:
-            lines.append(f"  - {w}")
-    return "\n".join(lines)
+    """Render a :class:`SkillResult` as the JSON a tool response carries.
+
+    A query tool returns its own payload (shrunk with the same
+    self-describing truncation the MCP server applies); a bulk skill returns
+    its findings with every shortened list marked by a ``*_total`` count.
+    """
+    from .. import mcp_server
+
+    data = getattr(result, "data", None)
+    if data is None:
+        data = investigate.skill_result_dict(result)
+    elif isinstance(data, dict):
+        data = mcp_server.shrink_payload(
+            data, mcp_server.max_inline_chars(),
+            tool_name=getattr(result, "skill_id", "tool"))
+    return json.dumps(data, indent=1, default=str)

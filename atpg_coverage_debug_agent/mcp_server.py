@@ -40,7 +40,7 @@ SERVER_VERSION = "1.1.0"
 TOOL_LOG_FILE = "tool_calls.jsonl"
 
 _JSON_TYPES = {"int": "integer", "float": "number", "bool": "boolean",
-               "str": "string"}
+               "str": "string", "list": "array"}
 
 #: Largest tool response, in characters, that is returned inline. Beyond it
 #: the response is shrunk and the complete payload is spilled to a file. The
@@ -83,6 +83,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
     context: Optional[Dict[str, Any]] = None
     design: Optional[Dict[str, Any]] = None
     stamp: Optional[Dict[str, Any]] = None
+    skills: Optional[Dict[str, Any]] = None
     load_error = ""
     if path and os.path.isfile(path):
         try:
@@ -94,6 +95,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
             context = evidence.get("context")
             design = evidence.get("design")
             stamp = evidence.get("stamp")
+            skills = evidence.get("skills")
         except Exception as exc:  # noqa: BLE001
             load_error = f"Failed to load evidence file '{path}': {exc}"
             compare = None
@@ -112,6 +114,7 @@ def load_state(evidence_path: Optional[str] = None) -> Dict[str, Any]:
         "context": context,
         "design": design,
         "stamp": stamp,
+        "skills": skills,
         "evidence_path": path,
         "load_error": load_error,
         "initialized": False,
@@ -327,10 +330,11 @@ def shrink_payload(data: Dict[str, Any], limit: int,
         "counts_preserved": True,
         "spill_path": spill_path or None,
         "retrieval_hint": (
-            f"Read {spill_path} for the complete payload before drawing any "
-            f"conclusion from this response." if spill_path else
-            "The complete payload could not be written to disk. Re-query "
-            "with a narrower filter or a smaller limit."),
+            f"Call read_spill(path='{spill_path}') for the complete payload "
+            f"before drawing any conclusion from this response."
+            if spill_path else
+            "The complete payload was not written to disk. Re-query "
+            "with a narrower filter, or page with offset / next_offset."),
         "warning": (
             "THIS IS A TRUNCATED RESULT, NOT A READ RESULT. Counts, "
             "categories and the census were preserved; samples, prose and "
@@ -357,6 +361,8 @@ def build_tools_list() -> List[Dict[str, Any]]:
                 "type": _JSON_TYPES.get(pspec.get("type", "str"), "string"),
                 "description": pspec.get("description", ""),
             }
+            if prop["type"] == "array":
+                prop["items"] = {"type": "string"}
             if "default" in pspec:
                 prop["description"] += f" (default: {pspec['default']})"
             properties[pname] = prop
@@ -377,6 +383,11 @@ def build_tools_list() -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 def _result(msg_id: Any, result: Any) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _spill_dir(state: Dict[str, Any]) -> str:
+    return os.path.join(session.session_dir(
+        (state.get("stamp") or {}).get("design")), "spill")
 
 
 def _error(msg_id: Any, code: int, message: str) -> Dict[str, Any]:
@@ -415,9 +426,11 @@ def handle_message(msg: Dict[str, Any],
         arguments = params.get("arguments") or {}
         if name in agent_bridge.TESSENT_TOOL_SPECS:
             return _call_tessent_tool(msg_id, name, arguments, params, state)
-        if name not in investigate.TOOL_SPECS:
+        if (name not in investigate.TOOL_SPECS
+                and name not in investigate.TOOL_ALIASES):
             return _error(msg_id, -32602, f"Unknown tool '{name}'.")
         started = time.monotonic()
+        spill_dir = _spill_dir(state)
         netlist = (ensure_netlist(state) if name in investigate.NETLIST_TOOLS
                    else state.get("netlist"))
         try:
@@ -433,6 +446,8 @@ def handle_message(msg: Dict[str, Any],
                 design=state.get("design"),
                 findings=state.get("findings"),
                 fix_edits=state.get("fix_edits"),
+                skills=state.get("skills"),
+                spill_dir=spill_dir,
             )
         except Exception as exc:  # noqa: BLE001
             log_tool_call(state, name, arguments, False, 0, False,
@@ -445,8 +460,8 @@ def handle_message(msg: Dict[str, Any],
             data.setdefault("netlist_origin", state.get("netlist_origin"))
         data = shrink_payload(
             data, max_inline_chars(),
-            spill_dir=os.path.join(session.session_dir(
-                (state.get("stamp") or {}).get("design")), "spill"),
+            # A spill page must never itself be spilled again.
+            spill_dir=None if name == "read_spill" else spill_dir,
             tool_name=name)
         text = _encode(data)
         log_tool_call(state, name, arguments, True, len(text),

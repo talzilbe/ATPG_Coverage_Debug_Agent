@@ -12,8 +12,9 @@ mutates its inputs.
 
 from __future__ import annotations
 
+import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import regression
 from ..models import VerdictConfidence
@@ -320,6 +321,45 @@ def _matches_fault(fr: Any, query: str) -> bool:
     )
 
 
+def _error(message: str, hint: str = "") -> Dict[str, Any]:
+    """Every tool error has this shape; *hint* says what to call instead."""
+    out: Dict[str, Any] = {"error": message}
+    if hint:
+        out["hint"] = hint
+    return out
+
+
+def _page(items: List[Any], offset: Any = 0,
+          limit: Any = 50) -> Tuple[List[Any], Dict[str, Any]]:
+    """One page of *items* plus the paging fields every list tool returns."""
+    start = max(0, int(offset or 0))
+    page = items[start: start + max(1, int(limit or 1))]
+    meta: Dict[str, Any] = {"total_matched": len(items), "offset": start,
+                            "returned": len(page)}
+    if start + len(page) < len(items):
+        meta["more"] = True
+        meta["next_offset"] = start + len(page)
+    return page, meta
+
+
+def _wants_full(detail: Any, default: bool) -> bool:
+    value = str(detail or "").strip().lower()
+    if value == "full":
+        return True
+    if value == "summary":
+        return False
+    return default
+
+
+#: ``list_faults(issue=...)`` -> the result flag it filters on.
+ISSUE_FILTERS = {
+    "controllability": "controllability_issue",
+    "observability": "observability_issue",
+    "constraint": "constraint_related",
+    "scan_boundary": "scan_boundary_involved",
+}
+
+
 # ---------------------------------------------------------------------------
 # Query functions (each returns JSON-serialisable data)
 # ---------------------------------------------------------------------------
@@ -329,14 +369,26 @@ def list_faults(fault_results: Any, fault_class: Optional[str] = None,
                 observability_only: bool = False,
                 constraint_related_only: bool = False,
                 scan_boundary_only: bool = False,
-                limit: int = 50) -> Dict[str, Any]:
-    """Return coverage-loss faults matching the given filters (compact rows)."""
+                limit: int = 50, offset: int = 0, issue: str = "",
+                detail: str = "summary") -> Dict[str, Any]:
+    """Return coverage-loss faults matching the given filters, paged."""
     results = fault_results or []
     fc = (fault_class or "").strip().upper()
     rc = (root_cause or "").strip().lower()
     inst = (instance or "").strip().lower()
+    wanted_issue = (issue or "").strip().lower()
+    if wanted_issue and wanted_issue not in ISSUE_FILTERS:
+        return _error(f"Unknown issue '{issue}'.",
+                      "Use one of: " + ", ".join(ISSUE_FILTERS) + ".")
+    flags = {ISSUE_FILTERS[wanted_issue]} if wanted_issue else set()
+    for on, flag in ((controllability_only, "controllability_issue"),
+                     (observability_only, "observability_issue"),
+                     (constraint_related_only, "constraint_related"),
+                     (scan_boundary_only, "scan_boundary_involved")):
+        if on:
+            flags.add(flag)
 
-    matched: List[Dict[str, Any]] = []
+    matched: List[Any] = []
     for fr in results:
         if fc and _enum_value(fr.fault.fault_class).upper() != fc:
             continue
@@ -344,37 +396,28 @@ def list_faults(fault_results: Any, fault_class: Optional[str] = None,
             continue
         if rc and rc not in _enum_value(fr.root_cause).lower():
             continue
-        if controllability_only and not fr.controllability_issue:
+        if any(not getattr(fr, flag, False) for flag in flags):
             continue
-        if observability_only and not fr.observability_issue:
-            continue
-        if constraint_related_only and not fr.constraint_related:
-            continue
-        if scan_boundary_only and not fr.scan_boundary_involved:
-            continue
-        matched.append(serialize_fault_result(fr, full=False))
+        matched.append(fr)
 
-    total = len(matched)
-    capped = matched[: max(1, int(limit))]
+    page, meta = _page(matched, offset, limit)
+    full = _wants_full(detail, False)
     return {
-        "total_matched": total,
-        "returned": len(capped),
-        "faults": capped,
+        **meta,
+        "faults": [serialize_fault_result(fr, full=full) for fr in page],
         "filters": {
             "fault_class": fc or None,
             "instance": instance or None,
             "root_cause": rc or None,
-            "controllability_only": controllability_only,
-            "observability_only": observability_only,
-            "constraint_related_only": constraint_related_only,
-            "scan_boundary_only": scan_boundary_only,
+            "issue": sorted(flags) or None,
         },
     }
 
 
 def list_category_faults(fault_results: Any, subclass: str,
                          limit: int = 50, offset: int = 0,
-                         full: bool = False) -> Dict[str, Any]:
+                         full: bool = False,
+                         detail: str = "") -> Dict[str, Any]:
     """Return every analysed fault in one dotted coverage-loss category.
 
     The triage names the categories worth debugging but reports only their
@@ -398,9 +441,9 @@ def list_category_faults(fault_results: Any, subclass: str,
     """
     wanted = (subclass or "").strip().upper()
     if not wanted:
-        return {"error": ("A dotted 'subclass' is required, for example "
-                          "'AU.TC'. Call coverage_triage to see which "
-                          "categories this run has.")}
+        return _error("A dotted 'subclass' is required, for example 'AU.TC'.",
+                      "Call coverage_triage to see which categories this "
+                      "run has.")
 
     results = list(fault_results or [])
     matched = [fr for fr in results
@@ -418,41 +461,37 @@ def list_category_faults(fault_results: Any, subclass: str,
                      "exact, so 'AU' and 'AU.TC' are different categories."),
         }
 
-    start = max(0, int(offset))
-    page = matched[start: start + max(1, int(limit))]
-    payload: Dict[str, Any] = {
+    page, meta = _page(matched, offset, limit)
+    full = _wants_full(detail, bool(full))
+    return {
         "subclass": subclass,
-        "total_matched": len(matched),
-        "offset": start,
-        "returned": len(page),
-        "faults": [serialize_fault_result(fr, full=bool(full)) for fr in page],
+        **meta,
+        "faults": [serialize_fault_result(fr, full=full) for fr in page],
     }
-    if start + len(page) < len(matched):
-        payload["more"] = True
-        payload["next_offset"] = start + len(page)
-    return payload
 
 
 def get_fault_detail(fault_results: Any, fault: str,
-                     max_matches: int = 5) -> Dict[str, Any]:
-    """Return full structural evidence for the fault(s) matching *fault*."""
+                     max_matches: int = 5, offset: int = 0,
+                     detail: str = "full") -> Dict[str, Any]:
+    """Return structural evidence for the fault(s) matching *fault*, paged."""
     if not fault or not fault.strip():
-        return {"error": "A 'fault' identifier (or substring) is required."}
+        return _error("A 'fault' identifier (or substring) is required.",
+                      "Use list_faults or list_category_faults to find one.")
     matches = [fr for fr in (fault_results or []) if _matches_fault(fr, fault)]
-    detail = [serialize_fault_result(fr, full=True)
-              for fr in matches[: max(1, int(max_matches))]]
+    page, meta = _page(matches, offset, max_matches)
+    full = _wants_full(detail, True)
     return {
         "query": fault,
-        "total_matched": len(matches),
-        "returned": len(detail),
-        "faults": detail,
+        **meta,
+        "faults": [serialize_fault_result(fr, full=full) for fr in page],
     }
 
 
 def why_blocked(fault_results: Any, fault: str) -> Dict[str, Any]:
     """Explain, per matching fault, whether loss is controllability/observability."""
     if not fault or not fault.strip():
-        return {"error": "A 'fault' identifier (or substring) is required."}
+        return _error("A 'fault' identifier (or substring) is required.",
+                      "Use list_faults or list_category_faults to find one.")
     out: List[Dict[str, Any]] = []
     for fr in (fault_results or []):
         if not _matches_fault(fr, fault):
@@ -486,7 +525,7 @@ def why_blocked(fault_results: Any, fault: str) -> Dict[str, Any]:
 
 def suggest_test_points(fault_results: Any, limit: int = 20,
                         min_fanout: int = 0,
-                        focus: str = "all") -> Dict[str, Any]:
+                        focus: str = "all", offset: int = 0) -> Dict[str, Any]:
     """Rank coverage-loss faults by impact and propose a concrete DFT fix.
 
     Each coverage-loss fault is assigned a primary *lever* (observability,
@@ -559,17 +598,17 @@ def suggest_test_points(fault_results: Any, limit: int = 20,
         })
 
     items.sort(key=lambda x: x["score"], reverse=True)
-    total = len(items)
+    page, meta = _page(items, offset, limit)
     return {
-        "total": total,
-        "returned": min(total, int(limit)),
-        "suggestions": items[: max(1, int(limit))],
+        "total": meta["total_matched"],
+        **meta,
+        "suggestions": page,
     }
 
 
 def list_constraints(constraints: Any, name: Optional[str] = None,
                      kind: Optional[str] = None,
-                     limit: int = 100) -> Dict[str, Any]:
+                     limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     """Return parsed constraints, optionally filtered by signal name / kind."""
     items = constraints or []
     nm = (name or "").strip().lower()
@@ -582,11 +621,8 @@ def list_constraints(constraints: Any, name: Optional[str] = None,
         if kd and kd != (getattr(c, "kind", "") or "").lower():
             continue
         matched.append(serialize_constraint(c))
-    return {
-        "total_matched": len(matched),
-        "returned": min(len(matched), int(limit)),
-        "constraints": matched[: max(1, int(limit))],
-    }
+    page, meta = _page(matched, offset, limit)
+    return {**meta, "constraints": page}
 
 
 def trace_path(netlist: Any, from_instance: str, to_instance: str,
@@ -743,7 +779,8 @@ def export_evidence(fault_results: Any, constraints: Any,
                     triage: Optional[Dict[str, Any]] = None,
                     context: Optional[Dict[str, Any]] = None,
                     design: Optional[Dict[str, Any]] = None,
-                    stamp: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    stamp: Optional[Dict[str, Any]] = None,
+                    skills: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Serialise everything the investigative tools need into a plain dict.
 
     The result is JSON-serialisable so it can be written to a file and read by a
@@ -777,6 +814,8 @@ def export_evidence(fault_results: Any, constraints: Any,
         evidence["context"] = context
     if design:
         evidence["design"] = design
+    if skills:
+        evidence["skills"] = skills
     return evidence
 
 
@@ -1493,6 +1532,158 @@ def verify_paths(fault_results: Any, constraints: Any, netlist: Any = None,
     }
 
 
+# ---------------------------------------------------------------------------
+# Skills and guidance, reached the same way by every backend
+# ---------------------------------------------------------------------------
+#: Items listed per finding before a "(N of M)" marker is added.
+SKILL_LIST_CAP = 10
+
+
+def skill_result_dict(result: Any) -> Dict[str, Any]:
+    """A bulk skill's result as JSON, with every shortened list marked."""
+    findings = []
+    for f in (getattr(result, "findings", None) or []):
+        evidence = list(getattr(f, "evidence", None) or [])
+        affected = list(getattr(f, "affected_objects", None) or [])
+        entry: Dict[str, Any] = {
+            "title": f.title,
+            "description": f.description,
+            "confidence": f.confidence,
+            "recommendation": getattr(f, "recommendation", ""),
+            "evidence": evidence[:SKILL_LIST_CAP],
+            "affected_objects": affected[:SKILL_LIST_CAP],
+        }
+        if len(evidence) > SKILL_LIST_CAP:
+            entry["evidence_total"] = len(evidence)
+        if len(affected) > SKILL_LIST_CAP:
+            entry["affected_total"] = len(affected)
+        findings.append(entry)
+    warnings = [str(getattr(m, "text", m))
+                for m in (getattr(result, "warnings", None) or [])]
+    return {
+        "skill_id": getattr(result, "skill_id", ""),
+        "summary": getattr(result, "summary", ""),
+        "success": bool(getattr(result, "success", True)),
+        "findings": findings,
+        "warnings": warnings,
+    }
+
+
+def serialize_skills(skill_results: Any, skills: Any = None) -> Dict[str, Any]:
+    """The bulk skills' results plus the enabled guidance documents.
+
+    *skill_results* are the results the analysis pass produced; *skills* the
+    skill instances, of which every enabled one carrying a document
+    (``_content``) becomes readable through ``read_guidance``.
+    """
+    from ..skills.markdown_skill import guidance_entry
+
+    guidance_ids = {s.skill_id for s in (skills or [])
+                    if getattr(s, "guidance", False)}
+    results = [skill_result_dict(r) for r in (skill_results or [])
+               if getattr(r, "skill_id", "") not in guidance_ids]
+    guidance = [guidance_entry(s) for s in (skills or [])
+                if getattr(s, "enabled", False)
+                and (getattr(s, "_content", "") or "").strip()]
+    return {"results": results, "guidance": guidance}
+
+
+def skill_findings(skills: Optional[Dict[str, Any]], skill: str = "",
+                   offset: int = 0, limit: int = 20) -> Dict[str, Any]:
+    """Findings of the bulk skills that ran with the analysis."""
+    results = list((skills or {}).get("results") or [])
+    if not results:
+        return _error("No bulk skill results were recorded for this analysis.",
+                      "Enable skills in the Skills tab and re-run the "
+                      "analysis; the query tools still work.")
+    if skill:
+        chosen = [r for r in results if r.get("skill_id") == skill]
+        if not chosen:
+            return _error(f"No results for skill '{skill}'.",
+                          "Available: " + ", ".join(
+                              r.get("skill_id", "") for r in results))
+        findings = chosen[0].get("findings") or []
+        page, meta = _page(findings, offset, limit)
+        return {**{k: v for k, v in chosen[0].items() if k != "findings"},
+                **meta, "findings": page}
+    return {
+        "skills": [{"skill_id": r.get("skill_id"), "summary": r.get("summary"),
+                    "success": r.get("success", True),
+                    "findings": len(r.get("findings") or [])}
+                   for r in results],
+        "note": "Call again with skill=<id> for that skill's findings.",
+    }
+
+
+def read_guidance(skills: Optional[Dict[str, Any]], skill: str = "",
+                  section: str = "") -> Dict[str, Any]:
+    """Read an enabled guidance document: its contents list, or one section."""
+    from ..skills.markdown_skill import GUIDANCE_NOTE
+
+    docs = list((skills or {}).get("guidance") or [])
+    if not docs:
+        return _error("No guidance documents are enabled.",
+                      "Guidance comes from enabled Markdown skills in the "
+                      "Skills / Custom Skills tabs.")
+    if not skill:
+        return {"documents": [
+            {"skill_id": d["skill_id"], "title": d.get("title", ""),
+             "description": d.get("description", ""),
+             "sections": [s["title"] for s in d.get("sections", [])]}
+            for d in docs],
+            "note": "Call again with skill=<id> and section=<title>."}
+    doc = next((d for d in docs if d["skill_id"] == skill), None)
+    if doc is None:
+        return _error(f"No enabled guidance '{skill}'.",
+                      "Available: " + ", ".join(d["skill_id"] for d in docs))
+    titles = [s["title"] for s in doc.get("sections", [])]
+    if not section:
+        return {"skill_id": skill, "title": doc.get("title", ""),
+                "description": doc.get("description", ""),
+                "sections": titles}
+    wanted = section.strip().lower()
+    match = next((s for s in doc.get("sections", [])
+                  if s["title"].lower() == wanted), None) or next(
+        (s for s in doc.get("sections", [])
+         if wanted in s["title"].lower()), None)
+    if match is None:
+        return _error(f"No section '{section}' in '{skill}'.",
+                      "Sections: " + "; ".join(titles))
+    return {"skill_id": skill, "section": match["title"],
+            "note": GUIDANCE_NOTE, "text": match["text"]}
+
+
+#: Characters returned per read_spill call.
+SPILL_PAGE_CHARS = 40000
+
+
+def read_spill(path: str, spill_dir: Optional[str], offset: int = 0,
+               limit: int = SPILL_PAGE_CHARS) -> Dict[str, Any]:
+    """Read the complete payload a truncated tool response spilled to disk."""
+    if not spill_dir:
+        return _error("This backend does not spill tool results to disk.",
+                      "Re-query with offset/limit (every list tool pages).")
+    root = os.path.realpath(spill_dir)
+    target = os.path.realpath(path or "")
+    if not path or os.path.commonpath([root, target]) != root:
+        return _error("Only spill files named in a _truncation block can be "
+                      "read.", "Pass the spill_path from that block.")
+    if not os.path.isfile(target):
+        return _error(f"Spill file not found: {path}")
+    with open(target, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    start = max(0, int(offset or 0))
+    size = max(1000, min(int(limit or SPILL_PAGE_CHARS), SPILL_PAGE_CHARS))
+    chunk = text[start: start + size]
+    out: Dict[str, Any] = {"path": path, "offset": start,
+                           "returned_chars": len(chunk),
+                           "total_chars": len(text), "text": chunk}
+    if start + len(chunk) < len(text):
+        out["more"] = True
+        out["next_offset"] = start + len(chunk)
+    return out
+
+
 class _Bag:
     """Minimal attribute container used to rehydrate serialised records."""
 
@@ -1603,17 +1794,12 @@ def rehydrate(evidence: Dict[str, Any]):
 TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "scan_status": {
         "description": (
-            "Decide whether an instance is a SCAN cell by reading its actual "
-            "netlist instantiation. Returns the verbatim instantiation, the "
-            "scan-in / shift-enable / scan-out pins, three corroborating "
-            "checks, and a 'source' field naming the evidence used: the live "
-            "netlist, or the instantiation recorded for that site during the "
-            "analysis pass (the same text get_fault_detail returns). This is "
-            "the ONLY admissible basis for a scan-status claim: when neither "
-            "exists it returns 'Unresolved - scan status cannot be determined "
-            "without netlist pin evidence' and says whether a netlist was "
-            "parsed at all. Fault-table fan-in/fan-out/confidence values "
-            "never decide scan status."),
+            "Decide whether an instance is a SCAN cell from its netlist "
+            "instantiation: returns the verbatim instantiation, the scan-in / "
+            "shift-enable / scan-out pins, three corroborating checks, and "
+            "'source' (live netlist or the instantiation recorded during the "
+            "analysis). The only admissible basis for a scan-status claim; "
+            "without pin evidence it answers 'Unresolved'."),
         "params": {
             "target": {"type": "str",
                        "description": "fault object or hierarchical "
@@ -1636,32 +1822,40 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "list_faults": {
         "description": (
             "List coverage-loss faults matching optional filters (fault class, "
-            "instance substring, root-cause substring, or issue flags)."),        "params": {
+            "instance substring, root-cause substring, issue), paged. Rows "
+            "are compact unless detail='full'. For one dotted category use "
+            "list_category_faults."),
+        "params": {
             "fault_class": {"type": "str", "description": "AU, UO, or UC"},
             "instance": {"type": "str", "description": "instance-name substring"},
             "root_cause": {"type": "str", "description": "root-cause substring"},
-            "controllability_only": {"type": "bool", "default": False,
-                                     "description": "only controllability issues"},
-            "observability_only": {"type": "bool", "default": False,
-                                   "description": "only observability issues"},
-            "constraint_related_only": {"type": "bool", "default": False,
-                                        "description": "only constraint-related"},
-            "scan_boundary_only": {"type": "bool", "default": False,
-                                   "description": "only scan-boundary faults"},
+            "issue": {"type": "str", "default": "",
+                      "description": ("controllability | observability | "
+                                      "constraint | scan_boundary; empty for "
+                                      "any")},
+            "detail": {"type": "str", "default": "summary",
+                       "description": "summary | full"},
             "limit": {"type": "int", "default": 50,
-                      "description": "max rows to return"},
+                      "description": "max rows in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "rows to skip (next_offset of the "
+                                      "previous page)"},
         },
     },
     "get_fault_detail": {
         "description": (
-            "Return full structural evidence (mapping, fan-in/out, observed "
-            "facts, evidence, recommended step) for the fault(s) matching a "
-            "fault-object or instance substring."),
+            "Structural evidence (mapping, fan-in/out, observed facts, "
+            "evidence, recommended step) for the fault(s) matching a "
+            "fault-object or instance substring, paged."),
         "params": {
             "fault": {"type": "str",
                       "description": "fault object / instance substring"},
-            "max_matches": {"type": "int", "default": 5,
-                            "description": "max faults to detail"},
+            "detail": {"type": "str", "default": "full",
+                       "description": "summary | full"},
+            "limit": {"type": "int", "default": 5,
+                      "description": "max faults in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "matches to skip, for paging"},
         },
     },
     "list_category_faults": {
@@ -1679,7 +1873,9 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "offset": {"type": "int", "default": 0,
                        "description": "matches to skip, for paging"},
             "full": {"type": "bool", "default": False,
-                     "description": "include full per-fault evidence"},
+                     "description": "same as detail='full'"},
+            "detail": {"type": "str", "default": "summary",
+                       "description": "summary | full"},
         },
     },
     "why_blocked": {
@@ -1701,7 +1897,9 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "kind": {"type": "str",
                      "description": "constraint kind (force/disable/...)"},
             "limit": {"type": "int", "default": 100,
-                      "description": "max rows to return"},
+                      "description": "max rows in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "rows to skip, for paging"},
         },
     },
     "suggest_test_points": {
@@ -1717,6 +1915,8 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "focus": {"type": "str", "default": "all",
                       "description": ("observability | controllability | "
                                       "constraint | scan | all")},
+            "offset": {"type": "int", "default": 0,
+                       "description": "suggestions to skip, for paging"},
         },
     },
     "trace_path": {
@@ -1733,39 +1933,20 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                           "description": "max hops to search"},
         },
     },
-    "regression_summary": {
+    "regression": {
         "description": (
-            "Summarise the regression vs the loaded baseline report: counts of "
-            "regressed / fixed / changed coverage-loss faults, net delta, and "
-            "per-class deltas. Requires a comparison report to be loaded."),
-        "params": {},
-    },
-    "list_regressed": {
-        "description": (
-            "List faults that are coverage-loss now but were NOT in the "
-            "baseline report (new coverage loss). Requires a comparison "
-            "report."),
+            "Compare against the loaded baseline report. mode=summary: counts "
+            "of regressed / fixed / changed faults, net delta and per-class "
+            "deltas. mode=regressed: loss now but not in the baseline. "
+            "mode=fixed: loss in the baseline but not now. mode=changed: "
+            "class or root cause changed. Requires a comparison report."),
         "params": {
+            "mode": {"type": "str", "default": "summary",
+                     "description": "summary | regressed | fixed | changed"},
             "limit": {"type": "int", "default": 50,
-                      "description": "max rows to return"},
-        },
-    },
-    "list_fixed": {
-        "description": (
-            "List faults that were coverage-loss in the baseline report but no "
-            "longer are (improvements). Requires a comparison report."),
-        "params": {
-            "limit": {"type": "int", "default": 50,
-                      "description": "max rows to return"},
-        },
-    },
-    "list_changed": {
-        "description": (
-            "List faults present in both reports whose fault class or root "
-            "cause changed. Requires a comparison report."),
-        "params": {
-            "limit": {"type": "int", "default": 50,
-                      "description": "max rows to return"},
+                      "description": "max rows in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "rows to skip, for paging"},
         },
     },
     "coverage_triage": {
@@ -1840,32 +2021,67 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "verify_paths": {
         "description": (
             "Check hierarchy paths against the source artefacts before "
-            "quoting them. Use this for any path you are about to put in an "
-            "answer: a shortened or reconstructed path will not resolve when "
-            "pasted into a tool. Also flags coverage-gain claims that have "
-            "not been measured by a re-run."),
+            "quoting them (a shortened or reconstructed path will not "
+            "resolve), and optionally scan prose for bad paths and "
+            "unmeasured coverage-gain claims."),
         "params": {
-            "paths": {"type": "str", "default": "",
-                      "description": "whitespace/comma separated paths"},
+            "paths": {"type": "list", "default": [],
+                      "description": "paths to check, verbatim"},
             "text": {"type": "str", "default": "",
-                     "description": ("optional prose to scan for bad paths "
-                                     "and unmeasured claims")},
+                     "description": ("optional plain or Markdown text to "
+                                     "scan")},
+        },
+    },
+    "skill_findings": {
+        "description": (
+            "Findings of the bulk analysis skills enabled in the Skills tab "
+            "(constraint impact, hotspots, cone summary, scan boundary, ...), "
+            "computed with the analysis. Without 'skill' it lists them with "
+            "finding counts; with 'skill' it returns that skill's findings, "
+            "paged. Shortened lists carry *_total counts."),
+        "params": {
+            "skill": {"type": "str", "default": "",
+                      "description": "skill id; empty to list skills"},
+            "limit": {"type": "int", "default": 20,
+                      "description": "max findings in this page"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "findings to skip, for paging"},
+        },
+    },
+    "read_guidance": {
+        "description": (
+            "Read the engineer's enabled guidance documents (Markdown "
+            "skills and the dft-atpg-debug methodology). No args: list "
+            "documents and their sections. skill only: that document's "
+            "sections. skill + section: that section's text. Guidance says "
+            "where to look; it is not evidence."),
+        "params": {
+            "skill": {"type": "str", "default": "",
+                      "description": "guidance skill id"},
+            "section": {"type": "str", "default": "",
+                        "description": "section title (or part of it)"},
+        },
+    },
+    "read_spill": {
+        "description": (
+            "Read the complete payload of a truncated tool response: pass the "
+            "spill_path from its _truncation block. Returns the JSON text in "
+            "pages; follow next_offset until 'more' is absent."),
+        "params": {
+            "path": {"type": "str",
+                     "description": "spill_path from a _truncation block"},
+            "offset": {"type": "int", "default": 0,
+                       "description": "character offset (next_offset)"},
         },
     },
     "report_context": {
         "description": (
-            "Call this FIRST. Returns the COMPLETE fault census -- every "
-            "class, grouped by coverage role, with the sum check already "
-            "done -- plus the state of the evidence itself: how many faults "
-            "mapped onto the netlist and how many did not (and why), the "
-            "scan-status split, how much of the loss sits on hard constants, "
-            "the coverage metrics with their formulas, WHICH SNAPSHOT of the "
-            "fault population was analysed (pre- or post-disposition), the "
-            "repeated structural patterns, the parser warnings, and any "
-            "analyst waivers in force. The census is always included and is "
-            "never abridged, so no class listing anywhere else can leave you "
-            "with an unexplained residual. Check this BEFORE trusting a "
-            "count."),
+            "Call this FIRST. The COMPLETE fault census (every class, by "
+            "coverage role, sum check done; never abridged) plus the state of "
+            "the evidence: mapped vs unmapped and why, scan-status split, "
+            "loss on hard constants, coverage metrics with formulas, the "
+            "analysed snapshot (pre/post-disposition), patterns, parser "
+            "warnings and analyst waivers."),
         "params": {
             "section": {"type": "str", "default": "",
                         "description": ("census | snapshot | evidence | "
@@ -1938,14 +2154,11 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "list_open_questions": {
         "description": (
-            "The questions the OFFLINE analysis itself left open, ordered by "
-            "priority, each naming the tool that would settle it: categories "
-            "scored with reduced confidence, blockers only partly traced, "
-            "structurally mixed categories, truncated cones, an unreconciled "
-            "census, a pre-disposition snapshot, and every place this tool's "
-            "root cause contradicts the ATPG tool's own subclass. CALL THIS "
-            "EARLY and spend your tool budget here rather than re-checking "
-            "conclusions the analysis is already sure of."),
+            "The questions the offline analysis left open, by priority, each "
+            "naming the tool that would settle it: reduced-confidence "
+            "categories, partly traced blockers, mixed categories, truncated "
+            "cones, census or snapshot doubts, and subclass vs root-cause "
+            "contradictions. Call early; spend the tool budget here."),
         "params": {
             "subject": {"type": "str", "default": "",
                         "description": ("restrict to one subject: a subclass "
@@ -1975,16 +2188,11 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "record_finding": {
         "description": (
-            "Record a STRUCTURED finding about the offline analysis so it "
-            "reaches the report, the GUI and the saved session -- not just "
-            "this transcript. kind: correction (offline value is wrong; give "
-            "agent_value), confirmation (checked with tools and it holds), "
-            "new_lead (something the analysis did not surface), gap (the "
-            "evidence does not settle it). subject is the exact fault path, "
-            "the category id (AU.TC) or the report section. A correction or "
-            "new_lead MUST cite evidence: the tool result or section that "
-            "supports it. Nothing you record overwrites the offline value; "
-            "it is shown beside it, attributed to you."),
+            "Record a structured finding so it reaches the report, GUI and "
+            "saved session. kind: correction (give agent_value), "
+            "confirmation, new_lead, gap. subject: exact fault path, category "
+            "id or report section. correction and new_lead MUST cite "
+            "evidence. Shown beside the offline value, never over it."),
         "params": {
             "kind": {"type": "str",
                      "description": ("correction | confirmation | new_lead "
@@ -2012,20 +2220,14 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "propose_fix": {
         "description": (
-            "Put your fix-plan review INTO the fix plan (Triage > Fix Plan "
-            "tab, report section 5), where the engineer reads it. "
-            "action=amend: attach a practical note to an existing offline "
-            "entry (target_rank + note) -- the offline text stays verbatim. "
-            "action=add: append your own proposal (subclass, title, "
-            "rationale, commands as text, effort, risk, evidence). "
-            "action=replace: you have a better fix than offline entry "
-            "target_rank -- your proposal takes its slot and the offline "
-            "entry is kept, demoted and marked superseded (needs reason + "
-            "evidence). Commands are copyable text for the user; this tool "
-            "RUNS NOTHING. Rejected if any text quotes a hierarchy path not "
-            "in the inputs, elides a path, or predicts a coverage gain -- the "
-            "same rules the offline plan obeys. Returns the plan as the "
-            "reader now sees it."),
+            "Put your fix-plan review INTO the fix plan the engineer reads. "
+            "amend: note on offline entry target_rank. add: your own "
+            "proposal (subclass, title, rationale, commands, evidence). "
+            "replace: your proposal takes target_rank's slot; the offline "
+            "entry is kept, demoted, marked superseded (needs reason + "
+            "evidence). Runs nothing. Rejected if text quotes a path not in "
+            "the inputs, elides one, or predicts a coverage gain. Returns "
+            "the plan as the reader now sees it."),
         "params": {
             "action": {"type": "str",
                        "description": "add | amend | replace"},
@@ -2100,7 +2302,9 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
              context: Optional[Dict[str, Any]] = None,
              design: Optional[Dict[str, Any]] = None,
              findings: Any = None,
-             fix_edits: Any = None) -> Dict[str, Any]:
+             fix_edits: Any = None,
+             skills: Optional[Dict[str, Any]] = None,
+             spill_dir: Optional[str] = None) -> Dict[str, Any]:
     """Dispatch a tool *name* with *args* to its query function.
 
     This is the single entry point used by both the skills and the MCP server.
@@ -2115,6 +2319,19 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
     *fix_edits* the sink ``propose_fix`` writes to.
     """
     args = dict(args or {})
+    if name in TOOL_ALIASES:
+        name, extra = TOOL_ALIASES[name]
+        args = {**extra, **args}
+    if name == "skill_findings":
+        return skill_findings(skills, skill=str(args.get("skill", "") or ""),
+                              offset=int(args.get("offset", 0) or 0),
+                              limit=int(args.get("limit", 20) or 20))
+    if name == "read_guidance":
+        return read_guidance(skills, skill=str(args.get("skill", "") or ""),
+                             section=str(args.get("section", "") or ""))
+    if name == "read_spill":
+        return read_spill(str(args.get("path", "") or ""), spill_dir,
+                          offset=int(args.get("offset", 0) or 0))
     if name == "propose_fix":
         from .fix_plan_edits import propose_fix
         return propose_fix(fix_edits, args, triage=triage,
@@ -2198,11 +2415,17 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
                 args.get("constraint_related_only", False)),
             scan_boundary_only=bool(args.get("scan_boundary_only", False)),
             limit=int(args.get("limit", 50) or 50),
+            offset=int(args.get("offset", 0) or 0),
+            issue=str(args.get("issue", "") or ""),
+            detail=str(args.get("detail", "summary") or "summary"),
         )
     if name == "get_fault_detail":
         return get_fault_detail(
             fault_results, fault=str(args.get("fault", "")),
-            max_matches=int(args.get("max_matches", 5) or 5))
+            max_matches=int(args.get("limit", args.get("max_matches", 5))
+                            or 5),
+            offset=int(args.get("offset", 0) or 0),
+            detail=str(args.get("detail", "full") or "full"))
     if name == "list_category_faults":
         return list_category_faults(
             fault_results,
@@ -2210,19 +2433,22 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
             limit=int(args.get("limit", 50) or 50),
             offset=int(args.get("offset", 0) or 0),
             full=bool(args.get("full", False)),
+            detail=str(args.get("detail", "") or ""),
         )
     if name == "why_blocked":
         return why_blocked(fault_results, fault=str(args.get("fault", "")))
     if name == "list_constraints":
         return list_constraints(
             constraints, name=args.get("name"), kind=args.get("kind"),
-            limit=int(args.get("limit", 100) or 100))
+            limit=int(args.get("limit", 100) or 100),
+            offset=int(args.get("offset", 0) or 0))
     if name == "suggest_test_points":
         return suggest_test_points(
             fault_results,
             limit=int(args.get("limit", 20) or 20),
             min_fanout=int(args.get("min_fanout", 0) or 0),
-            focus=str(args.get("focus", "all") or "all"))
+            focus=str(args.get("focus", "all") or "all"),
+            offset=int(args.get("offset", 0) or 0))
     if name == "trace_path":
         frm = str(args.get("from_instance", ""))
         to = str(args.get("to_instance", ""))
@@ -2231,27 +2457,37 @@ def run_tool(name: str, args: Dict[str, Any], *, fault_results: Any,
             return trace_path_adjacency(adjacency, frm, to, depth)
         return trace_path(netlist, from_instance=frm, to_instance=to,
                           max_depth=depth)
-    if name in ("regression_summary", "list_regressed", "list_fixed",
-                "list_changed"):
+    if name == "regression":
+        mode = str(args.get("mode", "summary") or "summary").strip().lower()
+        if mode not in ("summary", "regressed", "fixed", "changed"):
+            return _error(f"Unknown regression mode '{mode}'.",
+                          "Use summary, regressed, fixed or changed.")
         if not compare:
-            return {"error": ("No baseline/comparison report loaded. Use "
-                              "'Compare Report' to load one first.")}
+            return _error("No baseline/comparison report loaded.",
+                          "Ask the user to load one with 'Compare Report'.")
         current = [serialize_fault_result(fr) for fr in (fault_results or [])]
         baseline = compare.get("faults", [])
-        if name == "regression_summary":
+        if mode == "summary":
             return regression.summary(
                 baseline, current, compare.get("summary"),
                 {"class_counts": _current_class_counts(fault_results)},
                 label=compare.get("label", ""))
         d = regression.diff(baseline, current)
-        limit = max(1, int(args.get("limit", 50) or 50))
-        if name == "list_regressed":
-            return {"total": d["counts"]["regressed"],
-                    "faults": d["regressed"][:limit]}
-        if name == "list_fixed":
-            return {"total": d["counts"]["fixed"], "faults": d["fixed"][:limit]}
-        return {"total": d["counts"]["changed"], "faults": d["changed"][:limit]}
-    return {"error": f"Unknown tool '{name}'."}
+        page, meta = _page(d[mode], args.get("offset", 0),
+                           args.get("limit", 50) or 50)
+        return {"mode": mode, "total": d["counts"][mode], **meta,
+                "faults": page}
+    return _error(f"Unknown tool '{name}'.",
+                  "Available: " + ", ".join(TOOL_SPECS) + ".")
+
+
+#: Former tool names, still answered so saved prompts and old sessions work.
+TOOL_ALIASES: Dict[str, Tuple[str, Dict[str, Any]]] = {
+    "regression_summary": ("regression", {"mode": "summary"}),
+    "list_regressed": ("regression", {"mode": "regressed"}),
+    "list_fixed": ("regression", {"mode": "fixed"}),
+    "list_changed": ("regression", {"mode": "changed"}),
+}
 
 
 def _current_class_counts(fault_results: Any) -> Dict[str, int]:

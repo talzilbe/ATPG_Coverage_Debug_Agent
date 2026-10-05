@@ -63,8 +63,14 @@ class FaultConeSummarySkill(SkillBase):
         zero_fi_faults = []
         zero_fo_faults = []
         large_fo_faults = []
+        unmapped = []
 
         for fr in ctx.fault_results:
+            # An unmapped site has UNKNOWN connectivity, not zero: keep it out
+            # of every cone statistic.
+            if not getattr(fr, "connectivity_known", True):
+                unmapped.append(fr.fault.fault_object)
+                continue
             fi = len(fr.fan_in)
             fo = len(fr.fan_out)
             fan_in_sizes.append(fi)
@@ -84,6 +90,10 @@ class FaultConeSummarySkill(SkillBase):
         max_fo = max(fan_out_sizes, default=0)
 
         result.add_info(
+            f"Cone statistics over {total} mapped site(s); "
+            f"{len(unmapped)} unmapped site(s) excluded (connectivity unknown)."
+        )
+        result.add_info(
             f"Fan-in:  avg={avg_fi:.1f}, max={max_fi}, "
             f"zero={len(zero_fi_faults)} ({100*len(zero_fi_faults)//total if total else 0}%)"
         )
@@ -92,44 +102,62 @@ class FaultConeSummarySkill(SkillBase):
             f"zero={len(zero_fo_faults)} ({100*len(zero_fo_faults)//total if total else 0}%)"
         )
 
-        # Flag zero fan-in
-        if len(zero_fi_faults) > zero_fi_threshold:
+        if unmapped:
             result.add_finding(
-                title=f"{len(zero_fi_faults)} faults have zero fan-in",
+                title=f"{len(unmapped)} site(s) did not map onto the netlist",
                 description=(
-                    f"{len(zero_fi_faults)} coverage-loss faults could not be "
-                    "correlated to any netlist driver. This typically means the "
-                    "fault object path did not match any extracted instance, or "
-                    "the netlist is incomplete."
+                    "These fault objects matched no netlist instance, so their "
+                    "fan-in and fan-out are UNKNOWN (not zero) and they are "
+                    "left out of the cone statistics. No structural claim can "
+                    "be made about them until they map."
                 ),
-                evidence=[
-                    f"Zero fan-in: {len(zero_fi_faults)} faults",
-                    f"Threshold: {zero_fi_threshold}",
-                ],
-                affected_objects=zero_fi_faults[:10],
+                evidence=[f"Unmapped: {len(unmapped)} of "
+                          f"{len(unmapped) + total} loss sites"],
+                affected_objects=_listed(unmapped),
                 confidence="high",
                 recommendation=(
-                    "Check that the netlist file covers the full partition, not "
-                    "just a sub-module extract. Verify fault path hierarchy "
-                    "matches the netlist top-level instance name."
+                    "Run diagnose_unresolved for the cause (missing cell "
+                    "model, ambiguous name, or a netlist covering a different "
+                    "block)."
+                ),
+            )
+
+        # Flag zero fan-in on MAPPED sites only
+        if len(zero_fi_faults) > zero_fi_threshold:
+            result.add_finding(
+                title=f"{len(zero_fi_faults)} mapped site(s) have zero fan-in",
+                description=(
+                    f"{len(zero_fi_faults)} coverage-loss sites mapped onto "
+                    "the netlist but have no driver inside it: an undriven "
+                    "input, a port driven from outside the netlist, or a "
+                    "cell whose pins were not classified."
+                ),
+                evidence=[
+                    f"Zero fan-in (mapped): {len(zero_fi_faults)} sites",
+                    f"Threshold: {zero_fi_threshold}",
+                ],
+                affected_objects=_listed(zero_fi_faults),
+                confidence="medium",
+                recommendation=(
+                    "Check a sample with get_fault_detail / trace_path before "
+                    "treating these as controllability loss."
                 ),
             )
             result.add_warning(
-                f"{len(zero_fi_faults)} fault(s) have zero fan-in — "
-                "netlist coverage may be incomplete."
+                f"{len(zero_fi_faults)} mapped site(s) have zero fan-in."
             )
 
         # Flag zero fan-out
         if len(zero_fo_faults) > zero_fo_threshold:
             result.add_finding(
-                title=f"{len(zero_fo_faults)} faults have zero fan-out",
+                title=f"{len(zero_fo_faults)} mapped site(s) have zero fan-out",
                 description=(
-                    f"{len(zero_fo_faults)} coverage-loss faults have no "
-                    "observable fan-out path. These signals may be dangling "
-                    "or their outputs are not used."
+                    f"{len(zero_fo_faults)} coverage-loss sites mapped onto "
+                    "the netlist but drive nothing inside it. These signals "
+                    "may be dangling or their outputs are not used."
                 ),
-                evidence=[f"Zero fan-out: {len(zero_fo_faults)} faults"],
-                affected_objects=zero_fo_faults[:10],
+                evidence=[f"Zero fan-out (mapped): {len(zero_fo_faults)} sites"],
+                affected_objects=_listed(zero_fo_faults),
                 confidence="medium",
                 recommendation=(
                     "Check if these signals drive off-module outputs or are "
@@ -147,7 +175,7 @@ class FaultConeSummarySkill(SkillBase):
                     "coverage impact is amplified."
                 ),
                 evidence=[f"Large fan-out faults: {len(large_fo_faults)}"],
-                affected_objects=large_fo_faults[:5],
+                affected_objects=_listed(large_fo_faults, 5),
                 confidence="medium",
                 recommendation=(
                     "These high-fan-out nodes may benefit from dedicated "
@@ -156,8 +184,16 @@ class FaultConeSummarySkill(SkillBase):
             )
 
         result.summary = (
-            f"{total} fault(s) — "
+            f"{total} mapped site(s) — "
             f"avg fan-in={avg_fi:.1f}, avg fan-out={avg_fo:.1f}; "
-            f"{len(zero_fi_faults)} zero-fan-in, {len(zero_fo_faults)} zero-fan-out."
+            f"{len(zero_fi_faults)} zero-fan-in, {len(zero_fo_faults)} "
+            f"zero-fan-out; {len(unmapped)} unmapped (excluded)."
         )
         return result
+
+
+def _listed(objects, limit: int = 10):
+    shown = list(objects[:limit])
+    if len(objects) > limit:
+        shown.append(f"... ({limit} of {len(objects)} listed)")
+    return shown

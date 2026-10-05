@@ -25,7 +25,8 @@ class _InvestigativeSkill(SkillBase):
     default_enabled = True
     on_demand = True
 
-    _TYPE_MAP = {"str": "str", "int": "int", "bool": "bool", "float": "float"}
+    _TYPE_MAP = {"str": "str", "int": "int", "bool": "bool", "float": "float",
+                 "list": "list"}
 
     def parameters_schema(self) -> Dict[str, Dict[str, Any]]:
         spec = investigate.TOOL_SPECS.get(self.tool_name, {})
@@ -42,7 +43,7 @@ class _InvestigativeSkill(SkillBase):
     @staticmethod
     def _empty_default(pspec: Dict[str, Any]) -> Any:
         t = pspec.get("type", "str")
-        return {"int": 0, "float": 0.0, "bool": False}.get(t, "")
+        return {"int": 0, "float": 0.0, "bool": False, "list": []}.get(t, "")
 
     def run(self, ctx: AnalysisContext) -> SkillResult:
         result = SkillResult(skill_id=self.skill_id)
@@ -60,6 +61,7 @@ class _InvestigativeSkill(SkillBase):
                 design=getattr(ctx, "design", None),
                 findings=getattr(ctx, "findings", None),
                 fix_edits=getattr(ctx, "fix_edits", None),
+                skills=getattr(ctx, "skills", None),
             )
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -67,6 +69,7 @@ class _InvestigativeSkill(SkillBase):
             result.summary = f"{self.tool_name} error: {exc}"
             return result
 
+        result.data = data
         if isinstance(data, dict) and data.get("error"):
             result.add_warning(str(data["error"]))
             result.summary = str(data["error"])
@@ -262,41 +265,44 @@ class TracePathSkill(_InvestigativeSkill):
 
 
 @register
-class RegressionSummarySkill(_InvestigativeSkill):
-    skill_id = "regression_summary"
-    tool_name = "regression_summary"
-    display_name = "Regression Summary (query)"
-    description = investigate.TOOL_SPECS["regression_summary"]["description"]
+class RegressionSkill(_InvestigativeSkill):
+    skill_id = "regression"
+    tool_name = "regression"
+    display_name = "Regression vs Baseline (query)"
+    description = investigate.TOOL_SPECS["regression"]["description"]
 
     def _summarize(self, data: Dict[str, Any]) -> str:
-        c = data.get("counts", {})
-        return (f"regression: +{c.get('regressed', 0)} regressed, "
-                f"-{c.get('fixed', 0)} fixed, {c.get('changed', 0)} changed "
-                f"(net {c.get('net_delta', 0)}).")
+        c = data.get("counts")
+        if c:
+            return (f"regression: +{c.get('regressed', 0)} regressed, "
+                    f"-{c.get('fixed', 0)} fixed, {c.get('changed', 0)} "
+                    f"changed (net {c.get('net_delta', 0)}).")
+        return (f"regression {data.get('mode', '')}: "
+                f"{data.get('total', 0)} fault(s).")
 
 
 @register
-class ListRegressedSkill(_InvestigativeSkill):
-    skill_id = "list_regressed"
-    tool_name = "list_regressed"
-    display_name = "List Regressed (query)"
-    description = investigate.TOOL_SPECS["list_regressed"]["description"]
+class SkillFindingsSkill(_InvestigativeSkill):
+    skill_id = "skill_findings"
+    tool_name = "skill_findings"
+    display_name = "Skill Findings (query)"
+    description = investigate.TOOL_SPECS["skill_findings"]["description"]
 
 
 @register
-class ListFixedSkill(_InvestigativeSkill):
-    skill_id = "list_fixed"
-    tool_name = "list_fixed"
-    display_name = "List Fixed (query)"
-    description = investigate.TOOL_SPECS["list_fixed"]["description"]
+class ReadGuidanceSkill(_InvestigativeSkill):
+    skill_id = "read_guidance"
+    tool_name = "read_guidance"
+    display_name = "Read Guidance (query)"
+    description = investigate.TOOL_SPECS["read_guidance"]["description"]
 
 
 @register
-class ListChangedSkill(_InvestigativeSkill):
-    skill_id = "list_changed"
-    tool_name = "list_changed"
-    display_name = "List Changed (query)"
-    description = investigate.TOOL_SPECS["list_changed"]["description"]
+class ReadSpillSkill(_InvestigativeSkill):
+    skill_id = "read_spill"
+    tool_name = "read_spill"
+    display_name = "Read Truncated Result (query)"
+    description = investigate.TOOL_SPECS["read_spill"]["description"]
 
 
 @register

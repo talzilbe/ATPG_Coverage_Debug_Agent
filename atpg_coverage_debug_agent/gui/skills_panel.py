@@ -30,6 +30,18 @@ from ..skills.manager import SkillManager
 logger = logging.getLogger(__name__)
 
 
+def agent_reach(skill: SkillBase) -> str:
+    """One line saying how this skill reaches the AI agent, in either mode."""
+    if getattr(skill, "on_demand", False):
+        return ("Agent tool: called with arguments in Investigate mode, on "
+                "both backends.")
+    if getattr(skill, "guidance", False):
+        return ("Guidance: Quick diagnosis gets the whole text; Investigate "
+                "mode reads it section by section (read_guidance).")
+    return ("Runs with the analysis: Quick diagnosis gets its findings in the "
+            "prompt; Investigate mode reads them with skill_findings.")
+
+
 class _SkillCard(QGroupBox):
     """A single card UI for one skill: checkbox + description + parameters."""
 
@@ -69,6 +81,10 @@ class _SkillCard(QGroupBox):
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #555; font-size: 11px;")
         outer.addWidget(desc)
+        reach = QLabel(agent_reach(self._skill))
+        reach.setWordWrap(True)
+        reach.setStyleSheet("color: #036; font-size: 11px;")
+        outer.addWidget(reach)
 
         # --- Parameters (if any) ---
         schema = self._skill.parameters_schema()
@@ -97,6 +113,11 @@ class _SkillCard(QGroupBox):
             w.setValue(int(current))
             w.valueChanged.connect(
                 lambda v, n=name: self._on_param_changed(n, v))
+        elif ptype == "bool":
+            w = QCheckBox()
+            w.setChecked(bool(current) and str(current).lower() != "false")
+            w.toggled.connect(
+                lambda v, n=name: self._on_param_changed(n, bool(v)))
         else:
             w = QLineEdit(str(current))
             w.textChanged.connect(
