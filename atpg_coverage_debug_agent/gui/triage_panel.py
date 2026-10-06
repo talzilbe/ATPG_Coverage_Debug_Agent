@@ -41,12 +41,14 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
-_CATEGORY_HEADERS = ["Category", "Faults", "% of all", "sa0", "sa1",
-                     "Imbalance", "Worth acting on", "Confidence"]
+_CATEGORY_HEADERS = ["Category", "What it means", "Faults", "% of all",
+                     "sa0", "sa1", "Imbalance", "Worth acting on",
+                     "Confidence", "Evidence basis"]
 
 _CATEGORY_HEADER_TIPS = [
     "The ATPG tool's fault class, with its subclass when the fault list "
     "gives one (e.g. AU.TC = ATPG untestable, tied constant).",
+    "The category in plain words. Hover for the full explanation.",
     "How many faults are in this category.",
     "This category's share of every fault in the list.",
     "Faults that are stuck-at-0.",
@@ -58,7 +60,75 @@ _CATEGORY_HEADER_TIPS = [
     "Select the row for the reasoning.",
     "How much weight the verdict carries (high / medium / reduced / "
     "insufficient).",
+    "Where the findings for this category come from, strongest first: "
+    "measured (Tessent's own reports), fault list, structural estimate "
+    "(netlist tracing), naming hint (recognised by a name only), past "
+    "re-runs (recorded fix outcomes). Confirm estimates in Tessent before "
+    "expensive work.",
 ]
+
+#: Evidence tier -> (colour, label, tooltip).
+EVIDENCE_TIERS = {
+    "measured": ("#1a7f37", "measured",
+                 "Measured by Tessent (report_statistics / analyze_fault)."),
+    "fault_list": ("#0b5394", "fault list",
+                   "Read directly from the fault list the tool wrote."),
+    "structural": ("#a05000", "structural estimate",
+                   "Inferred by tracing the netlist; confirm in Tessent."),
+    "naming": ("#8e24aa", "naming hint",
+               "Recognised from a cell or instance name only."),
+    "history": ("#00838f", "past re-runs",
+                "Measured outcome of this fix in earlier re-runs."),
+}
+
+#: Evidence-line source tag -> tier.
+_SOURCE_TIER = {
+    "tool_report": "measured", "fault_list": "fault_list",
+    "constraint_file": "fault_list", "netlist": "structural",
+    "structural_inference": "structural", "clustering_hint": "structural",
+    "fix_history": "history",
+}
+
+
+def badge(tier: str) -> str:
+    """A small coloured label for an evidence tier."""
+    colour, label, tip = EVIDENCE_TIERS.get(tier, ("#777", tier, ""))
+    return (f"<span title='{tip}' style='color:white; background:{colour};"
+            f" border-radius:3px; padding:0 4px; font-size:11px;'>"
+            f"&nbsp;{label}&nbsp;</span>")
+
+
+def evidence_tiers(category: Any, report: Any) -> List[str]:
+    """Which evidence tiers back a category's findings, strongest first."""
+    tiers = []
+    subclass = getattr(category, "subclass_id", "")
+    evidence = getattr(report, "tool_evidence", None)
+    reach = getattr(category, "reachability", None)
+    if evidence is not None and (
+            subclass in (evidence.measured_categories or {})
+            or any(subclass in s.subclasses for s in evidence.statistics)):
+        tiers.append("measured")
+    tiers.append("fault_list")
+    attribution = getattr(category, "attribution", None)
+    if attribution is not None or (reach is not None and not reach.measured):
+        tiers.append("structural")
+    sources = list(getattr(attribution, "tie_sources", None) or [])
+    if any("naming" in s.kind or s.kind == "test_data_register"
+           or s.tie_value for s in sources):
+        tiers.append("naming")
+    if any(getattr(r, "history", None) and r.subclass_id == subclass
+           for r in getattr(report, "recommendations", None) or []):
+        tiers.append("history")
+    return tiers
+
+
+def _evidence_line_html(line: str) -> str:
+    import re
+    match = re.match(r"^\[(\w+)\]\s*(.*)$", line or "", re.S)
+    if not match:
+        return _esc(line)
+    tier = _SOURCE_TIER.get(match.group(1))
+    return (badge(tier) + " " if tier else "") + _esc(match.group(2))
 
 _EMPTY_HTML = (
     "<body style='font-family: Segoe UI, sans-serif; padding: 30px; "
@@ -72,6 +142,19 @@ _ACTIONABLE_COLOURS = {
     "partial": "#8a6d00",
     "false": "#6c757d",
 }
+
+
+#: Column of the actionability verdict, coloured by :data:`_ACTIONABLE_COLOURS`.
+_VERDICT_COL = _CATEGORY_HEADERS.index("Worth acting on")
+
+
+def plain_meaning(subclass_id: str) -> tuple:
+    """(short title, longer meaning) for a fault category, or ('', '')."""
+    from ..knowledge.subclasses import describe_subclass
+    info = describe_subclass(subclass_id or "")
+    if info is None:
+        return "", ""
+    return info.title, info.meaning
 
 
 def _esc(text: Any) -> str:
@@ -101,6 +184,8 @@ class TriagePanel(QWidget):
     export_categories_requested = Signal()
     #: A design object the user asked to see in the vendor viewer.
     signal_inspect_requested = Signal(str)
+    #: An action from the empty state (demo / load / inputs).
+    empty_action_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -114,11 +199,26 @@ class TriagePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        from .empty_state import EmptyState
+        self.empty_state = EmptyState(
+            "No triage yet",
+            "The triage groups the coverage loss into categories, shows where "
+            "in the hierarchy it sits and proposes ranked fixes. It appears "
+            "here after an analysis.")
+        self.empty_state.action_requested.connect(
+            self.empty_action_requested.emit)
+        layout.addWidget(self.empty_state, 1)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_categories_tab(), "Categories")
         self.tabs.addTab(self._build_clusters_tab(), "Where the loss is")
         self.tabs.addTab(self._build_fixes_tab(), "Fix Plan")
         layout.addWidget(self.tabs, 1)
+        self._set_empty(True)
+
+    def _set_empty(self, empty: bool) -> None:
+        self.empty_state.setVisible(empty)
+        self.tabs.setVisible(not empty)
 
     def _build_categories_tab(self) -> QWidget:
         widget = QWidget()
@@ -258,6 +358,7 @@ class TriagePanel(QWidget):
         self._populate_clusters()
         self._populate_fixes()
         self.export_categories_btn.setEnabled(bool(self._categories))
+        self._set_empty(False)
 
     def refresh_fix_plan(self) -> None:
         """Re-read the fix plan (after the agent recorded an edit)."""
@@ -285,6 +386,7 @@ class TriagePanel(QWidget):
         self.fix_detail.setHtml(_EMPTY_HTML)
         self.copy_commands_btn.setEnabled(False)
         self.export_categories_btn.setEnabled(False)
+        self._set_empty(True)
 
     def _populate_totals(self, report: Any) -> None:
         stats = getattr(report, "statistics", None)
@@ -306,8 +408,10 @@ class TriagePanel(QWidget):
         for row, stat in enumerate(rows):
             category = by_id.get(stat.subclass_id)
             verdict = getattr(category, "verdict", None)
+            title, meaning = plain_meaning(stat.subclass_id)
             values = [
                 stat.subclass_id,
+                title or "—",
                 str(stat.count),
                 f"{stat.pct:.2f}%",
                 str(stat.sa0),
@@ -315,13 +419,18 @@ class TriagePanel(QWidget):
                 f"{stat.sa_asymmetry:.2f}",
                 getattr(verdict, "actionable", "—"),
                 getattr(getattr(verdict, "confidence", None), "value", "—"),
+                (" · ".join(EVIDENCE_TIERS[t][1] for t in evidence_tiers(
+                    category, self._report)) if category is not None
+                 else "fault list"),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col == 6 and verdict is not None:
+                if col == _VERDICT_COL and verdict is not None:
                     colour = _ACTIONABLE_COLOURS.get(verdict.actionable)
                     if colour:
                         item.setForeground(QColor(colour))
+                if col in (0, 1) and meaning:
+                    item.setToolTip(f"{stat.subclass_id} — {title}\n\n{meaning}")
                 item.setData(Qt.UserRole, stat.subclass_id)
                 self.category_table.setItem(row, col, item)
 
@@ -354,7 +463,7 @@ class TriagePanel(QWidget):
         if stat is None:
             return "<p>Select a category to see the evidence behind it.</p>"
 
-        parts = [f"<h3>{_esc(stat.subclass_id)}</h3>"]
+        parts = [f"<h3>{_esc(stat.subclass_id)} {badge('fault_list')}</h3>"]
         info = stat.info
         if info is not None:
             parts.append(f"<p><b>{_esc(info.title)}</b> — "
@@ -375,9 +484,13 @@ class TriagePanel(QWidget):
             return "".join(parts)
 
         verdict = getattr(category, "verdict", None)
+        parts.append("<p><b>Evidence basis:</b> " + " ".join(
+            badge(t) for t in evidence_tiers(category, self._report)) + "</p>")
+        parts.append(self._measured_html(subclass_id))
         if verdict is not None:
             parts.append(
-                f"<h4>Scored verdict</h4><p>Worth acting on: "
+                f"<h4>Scored verdict {badge('structural')}</h4><p>Worth "
+                f"acting on: "
                 f"<b>{_esc(verdict.actionable)}</b> "
                 f"({_esc(verdict.confidence.value)} confidence)<br>"
                 f"{_esc(verdict.reason)}</p>")
@@ -387,8 +500,11 @@ class TriagePanel(QWidget):
 
         attribution = getattr(category, "attribution", None)
         if attribution is not None and attribution.note:
-            parts.append(f"<h4>What is blocking them</h4>"
-                         f"<p>{_esc(attribution.note)}</p>")
+            naming = any("naming" in s.kind or s.kind == "test_data_register"
+                         for s in attribution.tie_sources)
+            parts.append(f"<h4>What is blocking them {badge('structural')}"
+                         + (f" {badge('naming')}" if naming else "")
+                         + f"</h4><p>{_esc(attribution.note)}</p>")
             if attribution.tie_sources:
                 parts.append("<ul>")
                 for src in attribution.tie_sources[:5]:
@@ -408,10 +524,38 @@ class TriagePanel(QWidget):
 
         reachability = getattr(category, "reachability", None)
         if reachability is not None and reachability.note:
-            parts.append(f"<h4>Why they were hard to test</h4>"
+            tier = "measured" if reachability.measured else "structural"
+            parts.append(f"<h4>Why they were hard to test {badge(tier)}</h4>"
                          f"<p>{_esc(reachability.note)}</p>")
 
         return "".join(parts)
+
+    def _measured_html(self, subclass_id: str) -> str:
+        """The tool's own numbers for this category, beside ours."""
+        evidence = getattr(self._report, "tool_evidence", None)
+        if evidence is None:
+            return ""
+        rows = [r for r in evidence.class_check
+                if r["class"].upper() == (subclass_id or "").upper()]
+        sites = [r for r in evidence.site_check
+                 if r["subclass"] == subclass_id]
+        if not rows and not sites:
+            return ""
+        out = [f"<h4>Measured by Tessent {badge('measured')}</h4><ul>"]
+        for r in rows:
+            mark = "✓" if r["agree"] else ("✗" if r["agree"] is False else "?")
+            out.append(f"<li>{mark} report_statistics: {r['measured']:,} "
+                       f"faults; this analysis counted "
+                       f"{r['computed'] if r['computed'] is not None else 'n/a'}"
+                       f"</li>")
+        if sites:
+            agree = sum(1 for s in sites if s["agree"])
+            judged = sum(1 for s in sites if s["agree"] is not None)
+            out.append(f"<li>analyze_fault: {len(sites)} sample(s); the "
+                       f"structural verdict matches {agree} of {judged} "
+                       f"judged.</li>")
+        out.append("</ul>")
+        return "".join(out)
 
     def _populate_clusters(self) -> None:
         self.cluster_tree.clear()
@@ -654,7 +798,8 @@ class TriagePanel(QWidget):
             parts.append("</ul>")
         if rec.evidence:
             parts.append("<p><b>Evidence</b></p><ul>")
-            parts.extend(f"<li>{_esc(e)}</li>" for e in rec.evidence)
+            parts.extend(f"<li>{_evidence_line_html(e)}</li>"
+                         for e in rec.evidence)
             parts.append("</ul>")
         if rec.fix.expected_effect:
             parts.append(f"<p><b>Expected outcome:</b> "

@@ -7,10 +7,20 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from ..app import AnalysisInputs, analyze_paths, analyze_partitions
+from ..app import (AnalysisCancelled, AnalysisInputs, analyze_paths,
+                   analyze_partitions)
 from ..models import AnalysisReport
 
 logger = logging.getLogger(__name__)
+
+
+def _progress_or_cancel(signal):
+    """A progress callback that also stops the run once Cancel was pressed."""
+    def _emit(done: int, total: int, msg: str) -> None:
+        if QThread.currentThread().isInterruptionRequested():
+            raise AnalysisCancelled("Analysis cancelled by the user.")
+        signal.emit(done, total, msg)
+    return _emit
 
 
 class AnalysisWorker(QObject):
@@ -20,11 +30,13 @@ class AnalysisWorker(QObject):
         progress: ``(done, total, message)`` progress updates.
         finished: ``(AnalysisReport)`` on success.
         failed: ``(str)`` human-readable error message on failure.
+        cancelled: emitted instead of ``finished`` when Cancel stopped the run.
     """
 
     progress = Signal(int, int, str)
     finished = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, inputs: AnalysisInputs, skill_manager=None) -> None:
         super().__init__()
@@ -36,12 +48,18 @@ class AnalysisWorker(QObject):
         try:
             report: AnalysisReport = analyze_paths(
                 self._inputs,
-                progress=lambda d, t, m: self.progress.emit(d, t, m),
+                progress=_progress_or_cancel(self.progress),
                 skill_manager=self._skill_manager,
             )
+        except AnalysisCancelled:
+            self.cancelled.emit()
+            return
         except Exception as exc:  # report all errors to the UI gracefully
             logger.exception("Analysis failed")
             self.failed.emit(str(exc))
+            return
+        if QThread.currentThread().isInterruptionRequested():
+            self.cancelled.emit()
             return
         self.finished.emit(report)
 
@@ -59,6 +77,7 @@ def start_worker(inputs: AnalysisInputs,
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
+    worker.cancelled.connect(thread.quit)
     return thread, worker
 
 
@@ -74,6 +93,7 @@ class MultiAnalysisWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, partitions, skill_manager=None) -> None:
         super().__init__()
@@ -85,12 +105,18 @@ class MultiAnalysisWorker(QObject):
         try:
             results = analyze_partitions(
                 self._partitions,
-                progress=lambda d, t, m: self.progress.emit(d, t, m),
+                progress=_progress_or_cancel(self.progress),
                 skill_manager=self._skill_manager,
             )
+        except AnalysisCancelled:
+            self.cancelled.emit()
+            return
         except Exception as exc:  # report all errors to the UI gracefully
             logger.exception("Multi-partition analysis failed")
             self.failed.emit(str(exc))
+            return
+        if QThread.currentThread().isInterruptionRequested():
+            self.cancelled.emit()
             return
         self.finished.emit(results)
 
@@ -104,4 +130,5 @@ def start_multi_worker(partitions,
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
+    worker.cancelled.connect(thread.quit)
     return thread, worker

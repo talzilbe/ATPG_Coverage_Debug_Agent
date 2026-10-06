@@ -284,6 +284,6 @@ def test_help_explains_how_to_reopen_everything():
                    "More &#9662;", "Show Advanced Tabs", "Open Logs / Warnings",
                    "Go to Tab", "Ctrl+1", "Edit connection",
                    "Show prompt &amp; tool trace", "&#8943; More",
-                   "Try the demo data", "Dock back", "Investigate",
-                   "Quick diagnosis"):
+                   "Try the demo data", "Dock back", "Deep investigation",
+                   "Quick summary"):
         assert phrase in mw._HELP_HTML, phrase

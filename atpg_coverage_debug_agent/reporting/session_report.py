@@ -189,6 +189,10 @@ def report_to_dict(report: AnalysisReport) -> Dict[str, Any]:
                       if getattr(report, "agreement", None) else None),
         "open_questions": [q.as_dict() for q in
                            (getattr(report, "open_questions", None) or [])],
+        # The tool's own reports are inputs; their parsed form is kept so a
+        # reloaded session still shows the measured-vs-computed comparison.
+        "tool_evidence": (report.tool_evidence.as_dict()
+                          if getattr(report, "tool_evidence", None) else None),
     }
 
 
@@ -410,6 +414,11 @@ def dict_to_report(data: Dict[str, Any]) -> AnalysisReport:
         report.open_questions = oq.build_open_questions(report)
     else:
         report.open_questions = oq.from_dicts(saved_questions)
+
+    evidence = data.get("tool_evidence")
+    if evidence:
+        from ..analysis.tool_evidence import ToolEvidence, apply_tool_evidence
+        apply_tool_evidence(report, ToolEvidence.from_dict(evidence))
     return report
 
 

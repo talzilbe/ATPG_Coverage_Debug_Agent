@@ -74,7 +74,36 @@ TESSENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                        "description": "Why you need it, shown to the user."},
         },
     },
+    "tessent_collect_evidence": {
+        "description": (
+            "Measure, in the user's live Tessent session, what the offline "
+            "analysis could only estimate: runs report_statistics and "
+            "analyze_fault on a spread sample of each selected category (one "
+            "script, one user approval), parses the output, and returns the "
+            "tool's own coverage figures, class counts and per-category "
+            "measured verdict beside the structural estimate. The results are "
+            "also folded into the report in the GUI, where measured verdicts "
+            "replace estimates when fixes are chosen. Call "
+            "tessent_session_status first. Use it before recommending an "
+            "expensive fix that rests on a structural estimate."),
+        "params": {
+            "subclasses": {"type": "list",
+                           "description": ("Categories to sample, e.g. "
+                                           "['UO.AAB']. Empty = the selected "
+                                           "categories that have an estimate.")},
+            "samples": {"type": "int", "default": 5,
+                        "description": "analyze_fault samples per category "
+                                       "(max 20; each one costs tool time)."},
+            "statistics": {"type": "bool", "default": True,
+                           "description": "Also run report_statistics."},
+            "reason": {"type": "str",
+                       "description": "Why you need it, shown to the user."},
+        },
+    },
 }
+
+#: Where a collected measurement is left for the GUI to fold into the report.
+LIVE_EVIDENCE_FILE = "tool_evidence_live.json"
 
 
 class BridgeError(Exception):

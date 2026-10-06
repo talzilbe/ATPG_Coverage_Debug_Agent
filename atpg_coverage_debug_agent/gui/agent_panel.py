@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -345,9 +346,16 @@ class AgentPanel(QWidget):
     #: records one, so the Triage tab and the Summary re-render the plan.
     fix_plan_changed = Signal(list)
 
+    #: Emitted with a ``ToolEvidence`` dict when the agent measured something
+    #: in the live Tessent session (tessent_collect_evidence).
+    tool_evidence_collected = Signal(dict)
+
     #: Emitted with a design object path the user right-clicked in the agent's
     #: text and asked to see in the running Tessent Visualizer session.
     signal_inspect_requested = Signal(str)
+
+    #: The user asked to open the Tessent Visualizer tab (before a run).
+    open_visualizer_requested = Signal()
 
     #: Internal: a Tessent script finished on its worker thread.
     _tessent_done = Signal(dict)
@@ -401,6 +409,7 @@ class AgentPanel(QWidget):
         self._bridge_queue: list = []
         self._bridge_current = None
         self._bridge_running: Optional[str] = None
+        self._skip_visualizer_hint: bool = False
         # Pop-out ("open in window") state: maps a docked panel box to its open
         # dialog + header button, so the same widget can be detached/re-docked.
         self._popouts: dict = {}
@@ -416,6 +425,22 @@ class AgentPanel(QWidget):
 
         agent_tab = QWidget()
         layout = QVBoxLayout(agent_tab)
+
+        # --- One-line readiness check: what is missing before Run works ---
+        ready_row = QHBoxLayout()
+        self.readiness_label = QLabel("")
+        self.readiness_label.setTextFormat(Qt.RichText)
+        self.readiness_label.setWordWrap(True)
+        self.readiness_label.setStyleSheet(
+            "QLabel { background: #f4f8fc; border: 1px solid #d0e2f2;"
+            " border-radius: 4px; padding: 6px; }")
+        ready_row.addWidget(self.readiness_label, 1)
+        self.readiness_btn = QPushButton("Check sign-in")
+        self.readiness_btn.clicked.connect(self._on_readiness_fix)
+        ready_row.addWidget(self.readiness_btn, 0)
+        layout.addLayout(ready_row)
+        self._auth_state = "unknown"
+        self._readiness_action = ""
 
         # --- LLM connection settings ---
         cfg_box = QGroupBox("LLM Backend")
@@ -587,15 +612,17 @@ class AgentPanel(QWidget):
         mode_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItem(
-            "Investigate — the agent calls analysis tools itself "
-            "(recommended)", "agentic")
+            "Deep investigation — the agent queries the design with "
+            "analysis tools (recommended, slower)", "agentic")
         self.mode_combo.addItem(
-            "Quick diagnosis — one answer from the report, no tools", "quick")
+            "Quick summary — one LLM call over the report, no tools "
+            "(faster)", "quick")
         self.mode_combo.setToolTip(
-            "Investigate: the model decides which deterministic analysis tools "
-            "to call, reads their results and iterates; follow-up questions "
-            "keep the tools (and Tessent commands, with the Copilot CLI).\n"
-            "Quick diagnosis: one pass over the report with no way to fetch "
+            "Deep investigation: the model decides which deterministic "
+            "analysis tools to call, reads their results and iterates; "
+            "follow-up questions keep the tools (and Tessent commands, with "
+            "the Copilot CLI).\n"
+            "Quick summary: one pass over the report with no way to fetch "
             "more evidence.")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_combo_changed)
         mode_row.addWidget(self.mode_combo)
@@ -830,6 +857,8 @@ class AgentPanel(QWidget):
 
         self.tabs.addTab(agent_tab, "Debug Agent")
         self.tabs.addTab(self._build_auth_tab(), "Authentication")
+        self._built = True
+        self.refresh_readiness()
 
         # Show the last known models immediately, then go ask the CLI for the
         # current list — models are added and retired between releases, so a
@@ -1131,6 +1160,101 @@ class AgentPanel(QWidget):
     def _notify_config_changed(self, *args) -> None:
         """Zero-arg-safe relay for widget signals to ``config_changed``."""
         self.config_changed.emit()
+        self.refresh_readiness()
+
+    def readiness_items(self) -> list:
+        """[(label, state, detail, fix_action)] with state ok|fail|unknown."""
+        items = []
+        if self._current_backend() == "cli":
+            exe = self.cli_path_edit.text().strip()
+            found = bool(exe) and os.path.isfile(exe) and os.access(exe, os.X_OK)
+            items.append(("Copilot CLI", "ok" if found else "fail",
+                          "found" if found else "not found", "browse_cli"))
+            state = self._auth_state
+            detail = {"ok": "signed in", "fail": "not signed in",
+                      "unknown": "not checked yet"}[state]
+            items.append(("Sign-in", state, detail,
+                          "auth_tab" if state == "fail" else "check_auth"))
+            model = self.cli_model_combo.currentText().strip() or "auto"
+            items.append(("Model", "ok", model, ""))
+        else:
+            for label, widget in (("Endpoint URL", self.base_url_edit),
+                                  ("Model", self.model_edit),
+                                  ("API key", self.api_key_edit)):
+                ok = bool(widget.text().strip())
+                items.append((label, "ok" if ok else "fail",
+                              "set" if ok else "missing", "edit_connection"))
+        has_report = self._report is not None
+        items.append(("Report", "ok" if has_report else "fail",
+                      "loaded" if has_report else "run Analyze first",
+                      "need_report"))
+        if self._can_measure_in_tessent():
+            live = self._tessent_refusal(self._tessent_target()) is None
+            items.append(("Tessent session", "ok" if live else "optional",
+                          "live — the agent can measure" if live else
+                          "not open (optional — lets the agent measure)",
+                          "open_visualizer"))
+        return items
+
+    def _can_measure_in_tessent(self) -> bool:
+        """Only the CLI agent with MCP tools can drive the live session."""
+        return (self._current_backend() == "cli"
+                and self.cli_mcp_check.isChecked()
+                and self.agentic_check.isChecked())
+
+    def refresh_readiness(self) -> None:
+        """Re-render the readiness line and point its button at the first gap."""
+        if not getattr(self, "_built", False):
+            return
+        marks = {"ok": ("&#10003;", "#1a7f37"), "fail": ("&#10007;", "#c62828"),
+                 "unknown": ("?", "#a05000"), "optional": ("&#9675;", "#1565c0")}
+        parts = []
+        first_gap = None
+        first_hint = None
+        for label, state, detail, action in self.readiness_items():
+            sym, colour = marks[state]
+            parts.append(f"<span style='color:{colour}; font-weight:bold;'>"
+                         f"{sym}</span> {html.escape(label)}: "
+                         f"{html.escape(detail)}")
+            if state == "optional":
+                first_hint = first_hint or action
+            elif state != "ok" and first_gap is None and action:
+                first_gap = action
+        head = ("<b style='color:#1a7f37'>Ready to run.</b> " if first_gap is None
+                else "<b>Before you run:</b> ")
+        self.readiness_label.setText(head + " &nbsp;·&nbsp; ".join(parts))
+        labels = {"browse_cli": "Find the CLI…", "check_auth": "Check sign-in",
+                  "auth_tab": "Sign in…", "edit_connection": "Edit connection",
+                  "need_report": "How?",
+                  "open_visualizer": "Open Tessent Visualizer…"}
+        self._readiness_action = first_gap or first_hint or "check_auth"
+        self.readiness_btn.setText(labels.get(self._readiness_action,
+                                              "Check sign-in"))
+        self.readiness_btn.setVisible(
+            first_gap is not None or first_hint is not None
+            or self._current_backend() == "cli")
+
+    def _on_readiness_fix(self) -> None:
+        action = self._readiness_action
+        if action == "browse_cli":
+            self.set_connection_collapsed(False)
+            self._on_browse_cli()
+        elif action == "check_auth":
+            self.on_check_auth()
+            self.status_label.setText(
+                "Checking sign-in with the Copilot CLI… (the Authentication "
+                "tab shows the details)")
+        elif action == "auth_tab":
+            self.tabs.setCurrentIndex(self.tabs.count() - 1)
+        elif action == "edit_connection":
+            self.set_connection_collapsed(False)
+        elif action == "need_report":
+            self.status_label.setText(
+                "Pick a netlist and fault list at the top of the window and "
+                "press ▶ Analyze (or Help → Try the Demo Data). The agent "
+                "works on that report.")
+        elif action == "open_visualizer":
+            self.open_visualizer_requested.emit()
 
     def _current_backend(self) -> str:
         return self.backend_combo.currentData() or "http"
@@ -1151,6 +1275,7 @@ class AgentPanel(QWidget):
             w.setEnabled(not is_cli)
             w.setToolTip(na_tip if is_cli else "")
         self.config_changed.emit()
+        self.refresh_readiness()
 
     def _on_browse_cli(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1168,6 +1293,7 @@ class AgentPanel(QWidget):
             self._skill_manager = skill_manager
         self._update_button_state()
         self._update_maxfaults_hint()
+        self.refresh_readiness()
         if report is not None:
             self.status_label.setText(
                 f"Report ready: {report.summary.coverage_loss_count} "
@@ -1228,6 +1354,7 @@ class AgentPanel(QWidget):
         self._set_chat_enabled(False)
         self.status_label.setText("Run an analysis first, then run the AI agent.")
         self._update_button_state()
+        self.refresh_readiness()
 
     # -- investigation persistence (save/load with the report) ---------------
 
@@ -1315,6 +1442,7 @@ class AgentPanel(QWidget):
         if self.agentic_check.isChecked() != agentic:
             self.agentic_check.setChecked(agentic)
         self.config_changed.emit()
+        self.refresh_readiness()
 
     def set_connection_collapsed(self, collapsed: bool) -> None:
         """Fold the LLM backend box into one summary line, or show it again."""
@@ -1385,6 +1513,7 @@ class AgentPanel(QWidget):
             "agent_mode": self.mode_combo.currentData(),
             "connection_collapsed": self._connection_collapsed,
             "show_details": self.details_visible(),
+            "skip_visualizer_hint": self._skip_visualizer_hint,
         }
 
     def import_settings(self, cfg: dict) -> None:
@@ -1416,6 +1545,7 @@ class AgentPanel(QWidget):
         self._on_mode_combo_changed()
         self.set_connection_collapsed(bool(cfg.get("connection_collapsed")))
         self._set_details_visible(bool(cfg.get("show_details")))
+        self._skip_visualizer_hint = bool(cfg.get("skip_visualizer_hint"))
 
     # -- actions -------------------------------------------------------------
 
@@ -1483,11 +1613,57 @@ class AgentPanel(QWidget):
             self.on_build_prompt()
             return
 
+        if self._should_suggest_visualizer():
+            choice = self._ask_open_visualizer()
+            if choice == "open":
+                self.open_visualizer_requested.emit()
+                self.status_label.setText(
+                    "Launch the design in the Tessent Visualizer tab; once it "
+                    "has loaded, come back and press Run again.")
+                return
+            if choice == "cancel":
+                return
+
         self.on_build_prompt()  # show the prompt that is being sent
         if self.agentic_check.isChecked():
             self._run_agentic(config)
         else:
             self._run_single_shot(config)
+
+    def _should_suggest_visualizer(self) -> bool:
+        return (not self._skip_visualizer_hint
+                and self._can_measure_in_tessent()
+                and self._tessent_refusal(self._tessent_target()) is not None)
+
+    def _ask_open_visualizer(self) -> str:
+        """'open', 'run' or 'cancel'; remembers "Don't ask again"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Let the agent measure in Tessent?")
+        box.setText("No Tessent Visualizer session is open.")
+        box.setInformativeText(
+            "With a live session the agent can run report_statistics and "
+            "analyze_fault on sampled faults and use Tessent's measurements "
+            "instead of structural estimates before recommending fixes. "
+            "Each command still asks for your approval.\n\n"
+            "Open the Tessent Visualizer tab and launch the design first?")
+        open_btn = box.addButton("Open Tessent Visualizer",
+                                 QMessageBox.AcceptRole)
+        run_btn = box.addButton("Run without it", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(open_btn)
+        dont_ask = QCheckBox("Don't ask again")
+        box.setCheckBox(dont_ask)
+        box.exec()
+        clicked = box.clickedButton()
+        if dont_ask.isChecked() and clicked in (open_btn, run_btn):
+            self._skip_visualizer_hint = True
+            self.config_changed.emit()
+        if clicked is open_btn:
+            return "open"
+        if clicked is run_btn:
+            return "run"
+        return "cancel"
 
     def _run_single_shot(self, config: AgentConfig) -> None:
         self.run_btn.setEnabled(False)
@@ -1744,6 +1920,7 @@ class AgentPanel(QWidget):
         bridge = self._bridge_path()
         if not bridge:
             return
+        self._collect_tool_evidence()
         cur = self._bridge_current
         if (cur is not None and self._bridge_running is None
                 and agent_bridge.is_withdrawn(bridge, cur.id)):
@@ -2033,6 +2210,33 @@ class AgentPanel(QWidget):
     def _collect_agent_output(self) -> None:
         self._collect_findings()
         self._collect_fix_edits()
+        self._collect_tool_evidence()
+
+    def _collect_tool_evidence(self) -> None:
+        """Hand a newly collected live measurement to the main window."""
+        sess = self._current_mcp_session()
+        work = getattr(sess, "work_dir", "") if sess is not None else ""
+        if not work:
+            return
+        path = os.path.join(work, agent_bridge.LIVE_EVIDENCE_FILE)
+        try:
+            stamp = os.stat(path).st_mtime_ns
+        except OSError:
+            return
+        if stamp == getattr(self, "_live_evidence_stamp", None):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        self._live_evidence_stamp = stamp
+        n = len(data.get("analyses") or [])
+        self._append_trace(
+            f"✓ Tessent measurement collected ({n} analyze_fault sample(s)"
+            f"{', report_statistics' if data.get('statistics') else ''}) — "
+            "folded into the report (Summary, Triage).")
+        self.tool_evidence_collected.emit(data)
 
     # -- stopping a turn -----------------------------------------------------
 
@@ -2161,6 +2365,9 @@ class AgentPanel(QWidget):
             "click a fault to focus it, or Verify." + tools_note)
         self.run_btn.setEnabled(True)
         self._set_stop_enabled(False)
+        if self._chat_backend == "cli":
+            self._auth_state = "ok"
+            self.refresh_readiness()
         # The backend works now; give its settings' space to the answer.
         if not self._connection_collapsed:
             self.set_connection_collapsed(True)
@@ -2181,6 +2388,8 @@ class AgentPanel(QWidget):
         self.run_btn.setEnabled(True)
         self._set_stop_enabled(False)
         if is_cli_auth_error(message):
+            self._auth_state = "fail"
+            self.refresh_readiness()
             self.status_label.setText(
                 "Copilot CLI is not authenticated — opening the Authentication "
                 "tab so you can sign in.")
@@ -2885,6 +3094,11 @@ class AgentPanel(QWidget):
                 # launch starts authenticated.
                 self._persist_token(announce=False)
         self.auth_log.appendPlainText(f"[done] exit={code}")
+        if action == "login":
+            self._auth_state = "ok" if ok and not not_saved else "fail"
+        else:
+            self._auth_state = "ok" if ok else "fail"
+        self.refresh_readiness()
         self._auth_proc = None
         self.auth_login_btn.setEnabled(True)
         self.auth_check_btn.setEnabled(True)

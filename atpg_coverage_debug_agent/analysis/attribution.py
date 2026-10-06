@@ -52,6 +52,14 @@ _TDR_NAME = re.compile(r"(tdr|test_data_reg)", re.I)
 _SEQ_CELL = re.compile(r"(dff|flop|latch|_reg\b|sdff|sff)", re.I)
 _SCAN_CELL = re.compile(r"(sdff|sff|scan|muxdff|sdf)", re.I)
 _NON_SCAN_CELL = re.compile(r"(_nsff|nonscan|non_scan|_lat\b)", re.I)
+_LATCH_CELL = re.compile(r"(latch|_lat\b|\blat\w*)", re.I)
+_MEMORY_CELL = re.compile(r"(ram|rom|sram|mem|regfile|rf_\d)", re.I)
+_MACRO_NAME = re.compile(
+    r"(ram|rom|mem|macro|pll|phy|analog|serdes|blackbox|_bb\b|^bb_)", re.I)
+
+#: A leaf cell with at least this many pins is treated as a macro rather than
+#: a standard cell when looking for black boxes.
+BB_PIN_THRESHOLD = 16
 
 
 def _is_scan_cell(cell_type: str) -> bool:
@@ -230,6 +238,8 @@ class Attributor:
         self._constraint_index: Dict[str, Any] = {}
         self._tie_cache: Dict[str, Optional[Tuple[str, str, str]]] = {}
         self._constraint_cache: Dict[str, Tuple[str, ...]] = {}
+        self._seq_cache: Dict[str, List[Tuple[str, str, str]]] = {}
+        self._bb_cache: Dict[str, List[Tuple[str, str, str]]] = {}
         self._build_indexes(constraints)
 
     def _build_indexes(self, constraints: Iterable[Any]) -> None:
@@ -350,6 +360,81 @@ class Attributor:
         """Return the constraint record for *signal*, if indexed."""
         return self._constraint_index.get(signal) or \
             self._constraint_index.get(signal.rsplit("/", 1)[-1])
+
+    def _walk_both(self, start_key: str) -> List[str]:
+        """Fan-in then fan-out of *start_key*, each within the depth bound."""
+        out = list(self._walk_upstream(start_key))
+        seen: Set[str] = {start_key, *out}
+        frontier = [start_key]
+        for _ in range(self.max_depth):
+            nxt: List[str] = []
+            for key in frontier:
+                for child in self.conn.downstream(key):
+                    if child not in seen:
+                        seen.add(child)
+                        out.append(child)
+                        nxt.append(child)
+            if not nxt:
+                break
+            frontier = nxt
+        return out
+
+    def find_sequential_sources(self, instance_name: Optional[str]
+                                ) -> List[Tuple[str, str, str]]:
+        """Memories, latches and unscanned flops around a fault site.
+
+        These are what an ``AU.SEQ`` fault needs ATPG to clock through: each
+        one adds a cycle the depth limit has to cover.
+        """
+        key = self._instance_key(instance_name)
+        if key is None:
+            return []
+        cache = self._seq_cache
+        if key in cache:
+            return cache[key]
+        found: List[Tuple[str, str, str]] = []
+        for other in self._walk_both(key):
+            inst = self.conn.instances.get(other)
+            if inst is None:
+                continue
+            cell = inst.cell_type or ""
+            if _MEMORY_CELL.search(cell):
+                found.append((inst.name, cell, "memory"))
+            elif _SEQ_CELL.search(cell) and not _is_scan_cell(cell):
+                kind = "latch" if _LATCH_CELL.search(cell) else "non_scan_flop"
+                found.append((inst.name, cell, kind))
+        cache[key] = found
+        return found
+
+    def find_black_boxes(self, instance_name: Optional[str]
+                         ) -> List[Tuple[str, str, str]]:
+        """Leaf cells around a fault site that look like unmodelled macros.
+
+        Returns ``(instance, cell_type, basis)`` where basis is ``pin_count``
+        (structural: a leaf with many pins) or ``naming`` (the cell type reads
+        like a memory/PLL/PHY macro).
+        """
+        key = self._instance_key(instance_name)
+        if key is None:
+            return []
+        cache = self._bb_cache
+        if key in cache:
+            return cache[key]
+        modules = getattr(getattr(self.conn, "netlist", None), "modules", {})
+        found: List[Tuple[str, str, str]] = []
+        for other in [key] + self._walk_both(key):
+            inst = self.conn.instances.get(other)
+            if inst is None:
+                continue
+            cell = inst.cell_type or ""
+            if not cell or cell in modules:
+                continue
+            if len(getattr(inst, "pins", ()) or ()) >= BB_PIN_THRESHOLD:
+                found.append((inst.name, cell, "pin_count"))
+            elif _MACRO_NAME.search(cell):
+                found.append((inst.name, cell, "naming"))
+        cache[key] = found
+        return found
 
 
 def _add_sample(samples: List[str], path: str) -> None:
@@ -558,15 +643,128 @@ _ATTRIBUTORS = {
 }
 
 
+def _group_sources(results: Iterable[Any], attribution: Attribution,
+                   finder) -> Dict[str, TieSource]:
+    sources: Dict[str, TieSource] = {}
+    for result in results:
+        attribution.analysed += 1
+        mapping = result.mapping
+        if mapping.confidence is MappingConfidence.UNRESOLVED:
+            attribution.unresolved_mapping += 1
+            continue
+        hits = finder(mapping.instance_name)
+        if not hits:
+            continue
+        for name, cell, kind in hits:
+            source = sources.get(name)
+            if source is None:
+                source = sources[name] = TieSource(
+                    driver=name, cell_type=cell, tie_value=None, kind=kind)
+            source.count += 1
+            _add_sample(source.samples, result.fault.fault_object)
+        attribution.attributed += 1
+    return sources
+
+
+def attribute_sequential_sources(results: Iterable[Any], attributor: Attributor,
+                                 subclass_id: str = "AU.SEQ") -> Attribution:
+    """Find the memories and unscanned sequential cells AU.SEQ faults sit by."""
+    attribution = Attribution(subclass_id=subclass_id)
+    sources = _group_sources(results, attribution,
+                             attributor.find_sequential_sources)
+    attribution.tie_sources = sorted(sources.values(),
+                                     key=lambda s: (-s.count, s.driver))
+    top = attribution.top_tie
+    if top is None:
+        attribution.verdict = "inconclusive"
+        attribution.note = (
+            f"No memory, latch or unscanned flop was found within "
+            f"{attributor.max_depth} levels of the {attribution.analysed} "
+            f"fault(s) examined; the sequential element may be further away "
+            f"or modelled inside a library cell.")
+        return attribution
+    memories = sum(s.count for s in attribution.tie_sources
+                   if s.kind == "memory")
+    if memories and memories >= sum(s.count for s in attribution.tie_sources
+                                    if s.kind != "memory"):
+        attribution.verdict = "memory_adjacent"
+        attribution.preferred_fix_ids = ["seq_drc_check"]
+        attribution.note = (
+            f"Most attributed faults sit next to a memory (top: "
+            f"'{top.driver}' [{top.cell_type}]). RAM DRC violations "
+            f"(A14/A15/A16) often explain AU.SEQ wholesale, so check those "
+            f"before any test-point work.")
+    else:
+        attribution.verdict = "non_scan_sequential"
+        attribution.preferred_fix_ids = ["seq_observe_point"]
+        attribution.note = (
+            f"'{top.driver}' ({top.cell_type}, {top.kind.replace('_', ' ')}) "
+            f"is next to {top.count} attributed fault(s); unscanned state "
+            f"between the site and a scan cell is what the depth limit has "
+            f"to clock through. An observation point that cuts the chain is "
+            f"the fix to test.")
+    if attribution.coverage < 0.5:
+        attribution.note += (
+            f" Only {attribution.coverage:.0%} of the faults examined could "
+            f"be traced, so treat this as a partial picture.")
+    return attribution
+
+
+def attribute_black_boxes(results: Iterable[Any], attributor: Attributor,
+                          subclass_id: str = "AU.BB") -> Attribution:
+    """Rank the unmodelled macros that AU.BB faults sit around."""
+    attribution = Attribution(subclass_id=subclass_id)
+    sources = _group_sources(results, attribution, attributor.find_black_boxes)
+    by_cell: Dict[str, TieSource] = {}
+    for source in sources.values():
+        merged = by_cell.get(source.cell_type)
+        if merged is None:
+            merged = by_cell[source.cell_type] = TieSource(
+                driver=source.driver, cell_type=source.cell_type,
+                kind=f"black_box ({source.kind})")
+        merged.count += source.count
+        for sample in source.samples:
+            _add_sample(merged.samples, sample)
+    attribution.tie_sources = sorted(by_cell.values(),
+                                     key=lambda s: (-s.count, s.cell_type))
+    top = attribution.top_tie
+    if top is None:
+        attribution.verdict = "inconclusive"
+        attribution.note = (
+            f"No unmodelled macro was found near the {attribution.analysed} "
+            f"fault(s) examined. 'report_black_boxes' in the tool is the "
+            f"authoritative list.")
+        return attribution
+    attribution.verdict = "black_box_module"
+    attribution.preferred_fix_ids = ["bb_confirm_boundary"]
+    names = ", ".join(f"'{s.cell_type}'" for s in attribution.tie_sources[:3])
+    attribution.note = (
+        f"{len(attribution.tie_sources)} undefined macro type(s) sit next to "
+        f"these faults, largest first: {names}. Confirm with "
+        f"report_black_boxes whether each is intentionally unmodelled or a "
+        f"model that was not read in.")
+    if any("naming" in s.kind for s in attribution.tie_sources):
+        attribution.note += (
+            " Some were recognised only by their cell name, which is a "
+            "naming-based hint, not structural proof.")
+    return attribution
+
+
+_ATTRIBUTORS["AU.SEQ"] = attribute_sequential_sources
+_ATTRIBUTORS["AU.BB"] = attribute_black_boxes
+
+
 def attribute_categories(selected: List[Any], fault_results: Iterable[Any],
                          connectivity: Any,
                          constraints: Iterable[Any] = (),
-                         max_depth: int = DEFAULT_MAX_DEPTH) -> List[Any]:
+                         max_depth: int = DEFAULT_MAX_DEPTH,
+                         cache: Any = None) -> List[Any]:
     """Attach an :class:`Attribution` to every category that supports one.
 
-    Only ``AU.TC`` and ``AU.PC`` are attributed: they are the two categories
-    whose blocking structure can be located reliably by tracing fan-in, and
-    the two where naming the contributor changes what the engineer does next.
+    ``AU.TC`` and ``AU.PC`` are traced to constants and constraints, ``AU.SEQ``
+    to the memories and unscanned state around the site, and ``AU.BB`` to the
+    unmodelled macros nearby: in each, naming the contributor changes what the
+    engineer does next.
 
     Args:
         selected: ``SelectedCategory`` objects to enrich in place.
@@ -589,6 +787,9 @@ def attribute_categories(selected: List[Any], fault_results: Iterable[Any],
             grouped[key].append(result)
 
     attributor = Attributor(connectivity, constraints, max_depth=max_depth)
+    use_cache = cache is not None and max_depth == DEFAULT_MAX_DEPTH
+    if use_cache:
+        cache.seed(attributor=attributor)
     for category in selected:
         tracer = _ATTRIBUTORS.get(category.subclass_id)
         if tracer is None:
@@ -601,4 +802,6 @@ def attribute_categories(selected: List[Any], fault_results: Iterable[Any],
                     category.attribution.attributed,
                     category.attribution.analysed,
                     category.attribution.verdict)
+    if use_cache:
+        cache.collect(attributor=attributor)
     return selected

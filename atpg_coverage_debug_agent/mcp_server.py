@@ -493,9 +493,12 @@ def _call_tessent_tool(msg_id: Any, name: str, arguments: Dict[str, Any],
                            "message": "waiting for the user in the GUI"}})
 
     try:
-        data = agent_bridge.call_tool(name, arguments,
-                                      state.get("work_dir") or "",
-                                      on_tick=_tick)
+        if name == "tessent_collect_evidence":
+            data = collect_live_evidence(arguments, state, on_tick=_tick)
+        else:
+            data = agent_bridge.call_tool(name, arguments,
+                                          state.get("work_dir") or "",
+                                          on_tick=_tick)
     except Exception as exc:  # noqa: BLE001
         log_tool_call(state, name, arguments, False, 0, False,
                       (time.monotonic() - started) * 1000)
@@ -508,6 +511,65 @@ def _call_tessent_tool(msg_id: Any, name: str, arguments: Dict[str, Any],
     log_tool_call(state, name, arguments, ok, len(text), False,
                   (time.monotonic() - started) * 1000)
     return _result(msg_id, {"content": [{"type": "text", "text": text}]})
+
+
+def collect_live_evidence(arguments: Dict[str, Any], state: Dict[str, Any],
+                          on_tick=None) -> Dict[str, Any]:
+    """Build the measurement script, run it through the approval bridge,
+    parse the transcript and leave the evidence for the GUI."""
+    from .analysis import tool_evidence as te
+
+    subclasses = arguments.get("subclasses") or None
+    if isinstance(subclasses, str):
+        subclasses = [s.strip() for s in subclasses.split(",") if s.strip()]
+    targets = te.collect_targets(
+        state.get("faults") or [], subclasses,
+        int(arguments.get("samples") or te.DEFAULT_SAMPLES),
+        state.get("triage"))
+    want_stats = arguments.get("statistics", True) not in (False, "false", 0)
+    if not targets and not want_stats:
+        return {"status": "error",
+                "message": "No fault with a stuck-at value was found in the "
+                           "requested categories, and statistics were off."}
+    script = te.build_collect_script(targets, statistics=want_stats)
+    reason = str(arguments.get("reason") or "").strip() or (
+        "Measure coverage and sample analyze_fault for: "
+        + (", ".join(f"{k} ({len(v)})" for k, v in targets.items()) or
+           "statistics only"))
+    work_dir = state.get("work_dir") or ""
+    data = agent_bridge.call_tool("tessent_run",
+                                  {"script": script, "reason": reason},
+                                  work_dir, on_tick=on_tick)
+    if data.get("status") != "completed":
+        return data
+    text = data.get("transcript") or ""
+    full = data.get("transcript_full_path")
+    if data.get("transcript_truncated") and full and os.path.isfile(full):
+        with open(full, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    evidence = te.evidence_from_transcript(text)
+    out_path = os.path.join(work_dir, agent_bridge.LIVE_EVIDENCE_FILE)
+    previous = None
+    if os.path.isfile(out_path):
+        try:
+            with open(out_path, "r", encoding="utf-8") as fh:
+                previous = te.ToolEvidence.from_dict(json.load(fh))
+        except (OSError, ValueError):
+            previous = None
+    merged = te.merge_evidence(previous, evidence)
+    tmp = f"{out_path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(merged.as_dict(), fh, default=str)
+    os.replace(tmp, out_path)
+    summary = te.summarize_for_agent(evidence, state.get("triage"),
+                                     state.get("context"))
+    summary.update(status="completed", script_ran=data.get("script_ran"),
+                   edited=data.get("edited"), ok=data.get("ok"),
+                   requested_samples={k: len(v) for k, v in targets.items()},
+                   note=("Measured by the ATPG tool itself. The GUI folds this "
+                         "into the report; quote these figures over the "
+                         "structural estimates where they differ."))
+    return summary
 
 
 def serve(stdin=None, stdout=None, state: Optional[Dict[str, Any]] = None) -> int:

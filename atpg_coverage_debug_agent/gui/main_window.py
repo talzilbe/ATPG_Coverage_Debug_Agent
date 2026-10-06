@@ -10,11 +10,12 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QThread, QUrl
+from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -45,6 +46,8 @@ from .details_panel import DetailsPanel
 from .skills_panel import SkillsPanel
 from .agent_panel import AgentPanel
 from .custom_skills_panel import CustomSkillsPanel
+from .empty_state import EmptyState
+from .input_check import CHECKS, ERROR, InputCheck
 from .triage_panel import TriagePanel
 from .visualizer_panel import VisualizerPanel
 from .workers import start_worker, start_multi_worker
@@ -52,8 +55,18 @@ from .workers import start_worker, start_multi_worker
 logger = logging.getLogger(__name__)
 
 _TABLE_HEADERS = [
-    "Fault Object", "Class", "Mapped", "Confidence", "Instance", "Cell",
-    "Fan-in", "Fan-out", "Ctrl", "Obsv", "Constraint", "Scan", "Root Cause",
+    "Fault Object", "Class", "Mapped to", "Mapping confidence", "Instance",
+    "Cell", "Fan-in", "Fan-out", "Controllability issue",
+    "Observability issue", "Constraint touches it", "Scan boundary",
+    "Root Cause",
+]
+
+#: Fault-class filter entries: (shown text, class code or "all").
+_CLASS_FILTER_ITEMS = [
+    ("all classes", "all"),
+    ("AU — ATPG untestable", "AU"),
+    ("UO — unobserved", "UO"),
+    ("UC — uncontrolled", "UC"),
 ]
 
 _TABLE_HEADER_TIPS = [
@@ -152,6 +165,13 @@ First time? <b>Try the demo data</b> (Summary tab, or <b>Help</b> menu) loads
 a small example design so you can explore before using your own files.</div>
 
 <h2>Finding your way around &mdash; and getting things back</h2>
+<p><b>Guided tour.</b> After your first analysis a yellow bar above the tabs
+walks through Summary &rarr; Categories &rarr; Fix Plan &rarr; Coverage Loss
+Table &rarr; AI agent (<b>Next &rsaquo;</b> / <b>&lsaquo; Back</b> /
+<b>Skip tour</b>). <b>Help &rarr; Show the Guided Tour</b> replays it. Tabs
+with nothing to show yet offer <i>Try the demo data</i>, <i>Load a saved
+report</i> and <i>Pick my own files</i>. The window size and every divider
+position are remembered between sessions.</p>
 <p>The window shows only what a first-time user needs. Nothing has been
 removed: everything else is one click away, and this table says where.</p>
 <table>
@@ -215,6 +235,22 @@ explanation.</p>
 <tr><td><b class="k">Output dir</b></td>
     <td>Default folder for exported Markdown / CSV / JSON reports.</td></tr>
 </table>
+<p><b>Checked as you type.</b> A mark beside each box says what was found:
+<span style="color:#1a7f37">&#10003;</span> recognised (with the format,
+compression and size), <span style="color:#a05000">!</span> readable but
+unexpected, <span style="color:#c62828">&#10007;</span> missing or unreadable.
+Analyze refuses to start while a box is red, and says why.</p>
+<p><b class="k">Recent &#9662;</b> (left of the partition toggle) and
+<b>File &rarr; Recent Analyses</b> refill every box from a design you analysed
+before.</p>
+<p><b>Cancel</b> stops a running analysis at its next checkpoint (between
+faults, or between steps) and leaves the previous results on screen. The
+status bar shows elapsed time and, during the per-fault step, an estimate of
+the time left.</p>
+<p>Re-running on the <b>same netlist</b> (for example after editing the
+constraints) reuses the fault mappings, constant drivers and site profiles of
+the earlier run &mdash; none of them depend on the constraints &mdash; so the
+re-run is faster. The status bar says how many mappings were reused.</p>
 <p>Once a report is shown, these rows fold into one line naming the design and
 the files that were analysed, so the results get the screen. Click
 <b class="k">Change inputs &#9662;</b> on that line to show them again; a new
@@ -356,9 +392,17 @@ what to do about it&rdquo;. Three views, deliberately kept apart because they
 carry different weight &mdash; see section&nbsp;5 for how each is derived.</p>
 <ul>
   <li class="step"><b>Categories</b> &mdash; every coverage-loss class with its
-      fault count, share of the design, stuck-at split, and a verdict on
+      plain-language meaning (<i>What it means</i>; hover for the full
+      explanation), fault count, share of the design, stuck-at split, and a verdict on
       whether it is <i>worth acting on</i> (<code>true</code> /
       <code>partial</code> / <code>false</code>) with a confidence level.
+      The <b>Evidence basis</b> column, and the coloured badges in the detail
+      pane and on every Fix Plan evidence line, say where each finding comes
+      from, strongest first: <b>measured</b> (Tessent's own reports),
+      <b>fault list</b>, <b>structural estimate</b> (netlist tracing &mdash;
+      confirm in Tessent before expensive work), <b>naming hint</b>
+      (recognised by a name only), <b>past re-runs</b> (recorded fix
+      outcomes).
       Select a row to see what the subclass means, the reasoning behind the
       verdict, which structure is blocking the faults, and why they were hard
       to test. <b>Export category faults&hellip;</b> writes one CSV and one
@@ -584,6 +628,37 @@ complexity</b>, or a <b>sequential depth explosion</b>. This distinction
 matters: a bottleneck is often fixed by raising the abort limit, while
 reconvergent complexity needs a design bypass and more abort budget is wasted
 runtime.</p>
+<p>A site <i>inside</i> a reconvergent cone sees only one narrow path, which
+used to read as a bottleneck. The analysis now also checks the side inputs of
+that path: when two or more of its gates take a side input from the same
+fan-out stem that feeds the site (up to three levels above it), the site is
+reported as <b>reconvergent complexity</b> instead. <code>AU.SEQ</code> sites
+are profiled the same way, for their sequential depth.</p>
+<p>When an <code>analyze_fault</code> log is supplied (section&nbsp;1), the
+tool's own fields &mdash; activation, observation points, observe depth &mdash;
+are classified with the same rules. Where a category has samples, the
+<b>measured</b> verdict replaces the estimate when the fixes are chosen, and
+the note says whether it confirmed or overrode it.</p>
+
+<h3>Memories, unscanned state and black boxes</h3>
+<p><code>AU.SEQ</code> faults are traced to the memories, latches and
+unscanned flops around the site: next to a memory the plan starts with the
+RAM DRC check (A14/A15/A16), otherwise with an observation point that cuts
+the chain. <code>AU.BB</code> faults are traced to the undefined macros
+around them (a leaf with many pins, or a memory/PLL/PHY-like name &mdash; the
+latter is only a naming hint), ranked by fault count, before
+<code>report_black_boxes</code> confirms them.</p>
+
+<h3>Learning from re-runs</h3>
+<p><b>More &#9662; &rarr; Compare with a previous report&hellip;</b> now also
+shows, for every fix the baseline proposed, how its category changed: faults
+before and after, how many left the coverage loss and how many moved to
+another category. Tick the fixes you actually applied and press <b>Save ticked
+outcomes to fix history</b>. The history (in
+<code>~/.atpg_debug_agent/fix_history.json</code>) feeds later plans: a fix
+that recovered at least half its category goes first, one that repeatedly
+recovered nothing goes last, and its evidence shows a <b>past re-runs</b>
+line. Only measured before/after counts are stored.</p>
 
 <h3>Honesty guardrails</h3>
 <p>Two checks run over everything the tool generates, and over the AI agent's
@@ -660,14 +735,26 @@ settings</b> to fold it yourself. The choice is remembered.</p>
 <div class="warn">On a headless host with no keychain, the browser login can
 succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
 <b>Check authentication</b> to confirm you are signed in.</div>
+<p>The <b>readiness line</b> at the top of the agent tab shows, at a glance,
+whether the CLI was found, whether you are signed in, which model is used and
+whether a report is loaded. Its button jumps straight to the first thing
+that is missing (<i>Find the CLI&hellip;</i>, <i>Check sign-in</i>,
+<i>Sign in&hellip;</i>). It also shows whether a <b>Tessent session</b> is
+open: it is optional, but with one the agent can <b>measure</b> instead of
+estimate (<code>report_statistics</code> / <code>analyze_fault</code> on
+sampled faults). When you press Run in Deep investigation without a live
+session, the agent offers to open the <b>Tessent Visualizer</b> tab first
+(tick <i>Don't ask again</i> to stop the reminder).</p>
 
 <h3>Step 3 &mdash; pick a mode</h3>
 <p>One <b class="k">Mode</b> drop-down above the Run button:</p>
 <ul>
-  <li class="step"><b>Quick diagnosis</b>: the enabled skills run
+  <li class="step"><b>Quick summary</b> (formerly <i>Quick diagnosis</i>):
+      one LLM call. The enabled skills run
       locally and their findings are folded into a single prompt. One answer,
       no way to fetch more evidence.</li>
-  <li class="step"><b>Investigate</b> (recommended, the default): the model
+  <li class="step"><b>Deep investigation</b> (formerly <i>Investigate</i>;
+      recommended, the default): the model
       itself decides which
       investigative tools to call and iterates. For the CLI backend this is
       driven through a local <b>MCP</b> server, switched on automatically by
@@ -756,6 +843,18 @@ succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
           <b class="k">Reject</b> it. The agent gets the return value and the
           transcript the tool printed, and is told if you edited the
           script.</td></tr>
+      <tr><td><code>tessent_collect_evidence</code></td><td>Copilot CLI
+          backend only. Measures in your <i>live</i> session what the offline
+          analysis only estimated: one script &mdash; shown to you for
+          approval like any <code>tessent_run</code> &mdash; runs
+          <code>report_statistics -detailed_analysis</code> and
+          <code>analyze_fault</code> on a few spread-out faults of each
+          selected category. The output is parsed and folded into the report
+          exactly as if you had supplied <b>Tessent reports</b> as an input:
+          the Summary shows Tessent's coverage, Triage shows <i>measured</i>
+          badges, and measured verdicts replace estimates in the Fix Plan.
+          So you need no report file &mdash; open the Visualizer session and
+          let the agent collect it.</td></tr>
       <tr><td><code>list_open_questions</code></td><td>Where the <i>offline</i>
           analysis itself is weakest, as an ordered list of questions each
           naming the tool that would settle it: categories scored with
@@ -876,11 +975,11 @@ model shortens a hierarchy path, quotes one that is not in your inputs, or
 predicts a coverage gain, it is asked once to correct the answer; anything
 still unsupported afterwards appears as a <b>Guardrail check</b> note beneath
 it. Treat anything listed there as unverified.</p>
-<p><b>Investigate mode is what gives the agent its tools.</b> In <b>Quick
-diagnosis</b> the enabled skills
+<p><b>Deep investigation mode is what gives the agent its tools.</b> In <b>Quick
+summary</b> the enabled skills
 execute once locally, their findings are folded into a single prompt, and the
 model gets one pass with no way to ask for anything further. Choose
-<b>Investigate</b> for a real investigation loop &mdash; and for follow-up
+<b>Deep investigation</b> for a real investigation loop &mdash; and for follow-up
 questions that can still call tools (and, with the Copilot CLI, Tessent
 commands).</p>
 <p><b>What the agent will and will not say.</b> It is told that you are already
@@ -957,7 +1056,7 @@ tells you when rows are being left out.</p>
 <p>It caps the <i>table only</i>. The summary, the evidence basis and the whole
 triage &mdash; categories, hotspots, blocking sources, fix plan &mdash; are
 computed over <b>every</b> fault and are always sent in full, so the agent
-always reasons about the complete population. In <b>Investigate</b> mode it can
+always reasons about the complete population. In <b>Deep investigation</b> mode it can
 also pull any individual fault on demand with the <code>list_faults</code> and
 <code>get_fault_detail</code> tools, so the cap hides nothing from it. Raise it
 when you want the model to eyeball raw rows for a pattern the clustering
@@ -989,7 +1088,7 @@ and reports the total time when the answer arrives.</p>
 
 <div class="tip"><b>Recommended flow:</b> Analyze &rarr; read the Summary box
 &rarr; work the <b>Triage &amp; Fix Plan</b> tab &rarr; run the agent in
-<b>Investigate</b> mode
+<b>Deep investigation</b> mode
 &rarr; <b>Verify</b> the answer &rarr; ask follow-ups &rarr; waive legitimate
 faults via <b>More &#9662; &rarr; Edit report</b> &rarr; <b>Save Report</b>.</div>
 
@@ -1023,8 +1122,10 @@ viewer appears, for anything you want to type yourself.</p>
     setup wrapper. Pre-filled from the profile; override per run.</td></tr>
 <tr><td><b class="k">Workarea</b></td><td>Optional. Leave it blank and the
     setup wrapper uses its own working directory.</td></tr>
-<tr><td><b class="k">Licence server</b></td><td>Optional. Blank uses the
-    profile's value. Must be <code>port@host</code>, colon separated.</td></tr>
+<tr><td><b class="k">Licence server</b></td><td>Pre-filled for everyone with the
+    site licence list shipped in the profile, so nobody has to know or type
+    it. Change it only if told to; <b class="k">Use site default</b> puts the
+    shared list back. Must be <code>port@host</code>, colon separated.</td></tr>
 <tr><td><b class="k">Design inputs</b></td><td>Either type each path, or switch
     to <b>Derive from an ATPG run directory</b> and press <b class="k">Fill
     paths</b> &mdash; the profile's search patterns locate the ICL, the flat
@@ -1034,6 +1135,13 @@ viewer appears, for anything you want to type yourself.</p>
     <td>On by default, so the viewer loads exactly the faults this report was
     built from.</td></tr>
 </table>
+<p><b>Ready to launch?</b> Under the form, a checklist re-runs as you type:
+setup wrapper found, tool executable visible, terminal emulator, X display,
+licence format, project and every required design file.
+<span style="color:#c62828">&#10007;</span> items must be fixed before
+<b>Launch</b> will start; <span style="color:#a05000">!</span> items are only
+warnings (the setup wrapper may still put the tool on the path). Nothing is run
+by the check.</p>
 
 <h3>Saving a setup so you only type it once</h3>
 <p>Every field above is remembered <b>per user</b> &mdash; the project, config,
@@ -1119,7 +1227,7 @@ the channel off entirely; the launch then works exactly as before, and the
 signal action reports that the profile disables it.</p>
 
 <h3>Letting the AI agent run commands in the session</h3>
-<p>With the Copilot CLI backend in <b class="k">Investigate</b> mode, the agent
+<p>With the Copilot CLI backend in <b class="k">Deep investigation</b> mode, the agent
 can ask to run a Tcl script in the running session &mdash; to check something
 the offline analysis cannot see, or because you asked it to. This needs the
 profile to set <code>control.allow_agent_eval</code> to <code>true</code>
@@ -1169,6 +1277,108 @@ in the session file, printed in the Markdown and HTML reports under
 """
 
 
+def _fmt_secs(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+#: (tab title, what to look at there) for the first-run tour.
+TOUR_STEPS = [
+    ("Summary",
+     "<b>1/5 &nbsp;Summary.</b> The blue box shows test coverage and the "
+     "number of coverage-loss faults. <i>Where to start</i> lists the biggest "
+     "categories and the first fix for each \u2014 click one to jump to it."),
+    ("Triage & Fix Plan",
+     "<b>2/5 &nbsp;Categories.</b> One row per loss category. <i>What it "
+     "means</i> explains the code in plain words; select a row for the "
+     "reasoning, blocking sources and how hard the sites are to test."),
+    ("Triage & Fix Plan",
+     "<b>3/5 &nbsp;Fix Plan.</b> Ranked actions with the exact Tessent "
+     "commands (<i>Copy commands</i>). The tool never runs them, and never "
+     "predicts a gain \u2014 the re-run measures it."),
+    ("Coverage Loss Table",
+     "<b>4/5 &nbsp;Every fault.</b> Filter, sort, and select a row for its "
+     "evidence on the right. Right-click a row to ask the AI agent about it or "
+     "open it in Tessent Visualizer."),
+    ("AI Debug Agent",
+     "<b>5/5 &nbsp;AI agent.</b> The line at the top says what is still "
+     "missing (CLI, sign-in). Pick <i>Deep investigation</i> and press Run "
+     "for a written diagnosis you can question further."),
+]
+
+
+class _TourBar(QFrame):
+    """A slim, non-modal banner that walks a new user through the tabs."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self._window = window
+        self._step = -1
+        self.setStyleSheet(
+            "_TourBar { background: #fff8e1; border: 1px solid #f0c36d;"
+            " border-radius: 4px; }")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 4, 8, 4)
+        self.label = QLabel("")
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.RichText)
+        row.addWidget(self.label, 1)
+        self.back_btn = QPushButton("\u2039 Back")
+        self.back_btn.clicked.connect(lambda: self.show_step(self._step - 1))
+        row.addWidget(self.back_btn)
+        self.next_btn = QPushButton("Next \u203a")
+        self.next_btn.clicked.connect(self._next)
+        row.addWidget(self.next_btn)
+        self.skip_btn = QPushButton("Skip tour")
+        self.skip_btn.clicked.connect(self.finish)
+        row.addWidget(self.skip_btn)
+        self.setVisible(False)
+
+    @property
+    def step(self) -> int:
+        return self._step
+
+    def start(self) -> None:
+        self.show_step(0)
+
+    def show_step(self, index: int) -> None:
+        index = max(0, min(index, len(TOUR_STEPS) - 1))
+        self._step = index
+        tab, text = TOUR_STEPS[index]
+        self._window._switch_to_tab(tab)
+        panel = self._window.triage_panel
+        if tab == "Triage & Fix Plan":
+            panel.tabs.setCurrentIndex(2 if "Fix Plan" in text[:40] else 0)
+        self.label.setText(text)
+        self.back_btn.setEnabled(index > 0)
+        last = index == len(TOUR_STEPS) - 1
+        self.next_btn.setText("Finish" if last else "Next \u203a")
+        self.setVisible(True)
+
+    def _next(self) -> None:
+        if self._step >= len(TOUR_STEPS) - 1:
+            self.finish()
+        else:
+            self.show_step(self._step + 1)
+
+    def stop(self) -> None:
+        self._step = -1
+        self.setVisible(False)
+
+    def finish(self) -> None:
+        self.stop()
+        self._window._finish_tour()
+        self._window.statusBar().showMessage(
+            "Tour finished. Help \u2192 Show the Guided Tour replays it; "
+            "F1 opens the full user guide.")
+
+
 class _QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
     """A ``SimpleHTTPRequestHandler`` that logs to the logger, not stderr."""
 
@@ -1178,17 +1388,31 @@ class _QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
 
 class _FilePicker(QWidget):
     def __init__(self, label: str, *, directory: bool = False,
-                 parent: Optional[QWidget] = None) -> None:
+                 check=None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._directory = directory
+        self._check = check
+        self.last_check: Optional[InputCheck] = None
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(label), 0)
+        title = QLabel(label)
+        title.setMinimumWidth(230)
+        layout.addWidget(title, 0)
         self.edit = QLineEdit(self)
         layout.addWidget(self.edit, 1)
         browse = QPushButton("Browse…", self)
         browse.clicked.connect(self._browse)
         layout.addWidget(browse, 0)
+        self.status = QLabel("", self)
+        self.status.setMinimumWidth(260)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status, 0)
+        # Checks touch the file system (possibly NFS), so wait for typing to stop.
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(350)
+        self._timer.timeout.connect(self.run_check)
+        self.edit.textChanged.connect(lambda _t: self._timer.start())
 
     def _browse(self) -> None:
         if self._directory:
@@ -1198,11 +1422,29 @@ class _FilePicker(QWidget):
         if path:
             self.edit.setText(path)
 
+    def run_check(self) -> Optional[InputCheck]:
+        """Re-check the path now and show the verdict beside the box."""
+        self._timer.stop()
+        if self._check is None:
+            return None
+        try:
+            result = self._check(self.path())
+        except Exception as exc:  # noqa: BLE001 - a check must never break the form
+            result = InputCheck("warn", f"could not check: {exc}")
+        self.last_check = result
+        self.status.setText(
+            f"<span style='color:{result.colour}; font-weight:bold;'>"
+            f"{result.symbol}</span> <span style='color:{result.colour};'>"
+            f"{_html_escape(result.message)}</span>")
+        self.status.setToolTip(result.message)
+        return result
+
     def path(self) -> str:
         return self.edit.text().strip()
 
     def set_path(self, value: str) -> None:
         self.edit.setText(value)
+        self.run_check()
 
 
 class MainWindow(QMainWindow):
@@ -1241,6 +1483,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._restore_paths()
+        self._refresh_recent_menus()
 
     def _restore_paths(self) -> None:
         s = self._settings
@@ -1252,10 +1495,11 @@ class MainWindow(QMainWindow):
             self.constraints_picker.set_path(s.last_constraints)
         if s.last_output_dir:
             self.outdir_picker.set_path(s.last_output_dir)
+        self._last_tool_reports = getattr(s, "last_tool_reports", "") or ""
         if s.filter_text:
             self.filter_text.setText(s.filter_text)
         if s.class_filter:
-            idx = self.class_filter.findText(s.class_filter)
+            idx = self.class_filter.findData(s.class_filter)
             if idx >= 0:
                 self.class_filter.setCurrentIndex(idx)
         if s.conf_filter:
@@ -1281,15 +1525,30 @@ class MainWindow(QMainWindow):
         self.inputs_box = QWidget()
         inputs_layout = QVBoxLayout(self.inputs_box)
         inputs_layout.setContentsMargins(0, 0, 0, 0)
-        self.netlist_picker = _FilePicker("Netlist (.v / .v.gz):")
-        self.faults_picker = _FilePicker("Fault list (.mtfi / .mtfi.gz / flat):")
-        self.constraints_picker = _FilePicker("Constraints (optional .do):")
-        self.outdir_picker = _FilePicker("Output dir:", directory=True)
+        self.netlist_picker = _FilePicker("Netlist (.v / .v.gz):",
+                                          check=CHECKS["netlist"])
+        self.faults_picker = _FilePicker(
+            "Fault list (.mtfi / .mtfi.gz / flat):", check=CHECKS["faults"])
+        self.constraints_picker = _FilePicker(
+            "Constraints (optional .do):", check=CHECKS["constraints"])
+        self.outdir_picker = _FilePicker("Output dir:", directory=True,
+                                         check=CHECKS["outdir"])
+        # Tessent's own reports are collected live by the agent, or added
+        # afterwards via More -> Add Tessent reports.
+        self._last_tool_reports = ""
         for picker in (self.netlist_picker, self.faults_picker,
                        self.constraints_picker, self.outdir_picker):
             inputs_layout.addWidget(picker)
 
         toggle_row = QHBoxLayout()
+        self.recent_btn = QToolButton()
+        self.recent_btn.setText("Recent ▾")
+        self.recent_btn.setToolTip(
+            "Re-fill all the inputs from a design you analysed before.")
+        self.recent_btn.setPopupMode(QToolButton.InstantPopup)
+        self.recent_menu = QMenu(self.recent_btn)
+        self.recent_btn.setMenu(self.recent_menu)
+        toggle_row.addWidget(self.recent_btn)
         self.partitions_toggle = QPushButton("+ Analyze several partitions…")
         self.partitions_toggle.setFlat(True)
         self.partitions_toggle.setCheckable(True)
@@ -1409,6 +1668,12 @@ class MainWindow(QMainWindow):
             "AU.NOFAULTS), or individual faults; coverage recomputes and the "
             "layout is unchanged. Reversible and saved with the report.")
         self.edit_action.triggered.connect(self.on_edit_report)
+        self.tool_reports_action = more_menu.addAction(
+            "Add Tessent reports to these results…")
+        self.tool_reports_action.setToolTip(
+            "Read report_statistics / analyze_fault output now and compare it "
+            "with the current results; measured verdicts replace estimates.")
+        self.tool_reports_action.triggered.connect(self.on_add_tool_reports)
         more_menu.addSeparator()
         self.clear_action = more_menu.addAction("Clear results")
         self.clear_action.triggered.connect(self.on_clear)
@@ -1451,8 +1716,11 @@ class MainWindow(QMainWindow):
         outer.addLayout(sel_row)
 
         self.tabs = QTabWidget()
+        self.tour_bar = _TourBar(self)
+        outer.addWidget(self.tour_bar)
         self.tabs.addTab(self._build_summary_tab(), "Summary")
         self.triage_panel = TriagePanel()
+        self.triage_panel.empty_action_requested.connect(self._on_empty_action)
         self.triage_panel.fault_referenced.connect(self._focus_fault_in_table)
         self.triage_panel.export_categories_requested.connect(
             self.on_export_category_faults)
@@ -1478,6 +1746,8 @@ class MainWindow(QMainWindow):
         self.agent_panel.fault_referenced.connect(self._focus_fault_in_table)
         self.agent_panel.findings_changed.connect(self._on_agent_findings)
         self.agent_panel.fix_plan_changed.connect(self._on_agent_fix_edits)
+        self.agent_panel.tool_evidence_collected.connect(
+            self._on_agent_tool_evidence)
         self.agent_panel.signal_inspect_requested.connect(
             self._show_signal_in_visualizer)
         # The agent panel is tall. Placed directly in the tab widget its
@@ -1507,6 +1777,12 @@ class MainWindow(QMainWindow):
         self.triage_panel.signal_inspect_requested.connect(
             self._show_signal_in_visualizer)
         self.agent_panel.set_tessent_provider(self.visualizer_panel.agent_target)
+        self.agent_panel.open_visualizer_requested.connect(
+            lambda: self.tabs.setCurrentWidget(vis_scroll))
+        self.visualizer_panel.status_message.connect(
+            lambda *_: self.agent_panel.refresh_readiness())
+        self.tabs.currentChanged.connect(
+            lambda *_: self.agent_panel.refresh_readiness())
         self._advanced_tabs = [self._logs_tab, self.skills_panel,
                                self.custom_skills_panel]
         self._set_advanced_tabs_visible(
@@ -1568,7 +1844,18 @@ class MainWindow(QMainWindow):
 
     def _build_table_tab(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        outer = QVBoxLayout(widget)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.table_empty = EmptyState(
+            "No faults to show yet",
+            "Every coverage-loss fault is listed here, one row each, with its "
+            "mapping, connectivity and the root cause this tool derived.")
+        self.table_empty.action_requested.connect(self._on_empty_action)
+        outer.addWidget(self.table_empty, 1)
+        self.table_content = QWidget()
+        outer.addWidget(self.table_content, 1)
+        self.table_content.setVisible(False)
+        layout = QVBoxLayout(self.table_content)
         filt = QHBoxLayout()
         filt.addWidget(QLabel("Filter:"))
         self.filter_text = QLineEdit()
@@ -1577,7 +1864,8 @@ class MainWindow(QMainWindow):
         filt.addWidget(self.filter_text, 1)
         filt.addWidget(QLabel("Class:"))
         self.class_filter = QComboBox()
-        self.class_filter.addItems(["all", "AU", "UO", "UC"])
+        for text, code in _CLASS_FILTER_ITEMS:
+            self.class_filter.addItem(text, code)
         self.class_filter.currentTextChanged.connect(self._apply_filter)
         filt.addWidget(self.class_filter)
         filt.addWidget(QLabel("Confidence:"))
@@ -1645,6 +1933,8 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
+        self.file_recent_menu = file_menu.addMenu("Recent Analyses")
+        file_menu.addSeparator()
         export_md = QAction("Export Markdown Report…", self)
         export_md.triggered.connect(self.on_export_md)
         file_menu.addAction(export_md)
@@ -1679,6 +1969,9 @@ class MainWindow(QMainWindow):
         demo.setEnabled(_demo_inputs() is not None)
         demo.triggered.connect(self.on_try_demo)
         help_menu.addAction(demo)
+        tour = QAction("Show the Guided Tour", self)
+        tour.triggered.connect(self.start_tour)
+        help_menu.addAction(tour)
 
     def _build_view_menu(self) -> None:
         """Add window-sizing actions that do not rely on the title bar.
@@ -1773,6 +2066,18 @@ class MainWindow(QMainWindow):
         faults = self.faults_picker.path()
         constraints = self.constraints_picker.path() or None
 
+        problems = []
+        for name, picker in (("Netlist", self.netlist_picker),
+                             ("Fault list", self.faults_picker),
+                             ("Constraints", self.constraints_picker)):
+            result = picker.run_check()
+            if result is not None and result.state == ERROR:
+                problems.append(f"{name}: {result.message}")
+        if problems:
+            self._error("Please fix the inputs first (see the red marks next "
+                        "to the file boxes):\n\n" + "\n".join(problems))
+            self._set_inputs_collapsed(False)
+            return
         if not netlist or not os.path.isfile(netlist):
             self._error("Please select a valid netlist file.")
             return
@@ -1791,9 +2096,123 @@ class MainWindow(QMainWindow):
             if not self._prompt_autosave_name(netlist):
                 return  # user cancelled the name dialog -> cancel Analyze
 
+        self._settings.remember_inputs({
+            "netlist": netlist, "faults": faults,
+            "constraints": constraints or "",
+            "outdir": self.outdir_picker.path()})
+        self._refresh_recent_menus()
         self._save_settings()
         inputs = AnalysisInputs(netlist, faults, constraints)
         self._start_analysis(inputs)
+
+    # ------------------------------------------------------------------
+    # Recent inputs
+    # ------------------------------------------------------------------
+    def _refresh_recent_menus(self) -> None:
+        menus = [self.recent_menu]
+        if getattr(self, "file_recent_menu", None) is not None:
+            menus.append(self.file_recent_menu)
+        recent = list(self._settings.recent_inputs or [])
+        for menu in menus:
+            menu.clear()
+            if not recent:
+                act = menu.addAction("(no recent analyses yet)")
+                act.setEnabled(False)
+                continue
+            for entry in recent:
+                netlist = entry.get("netlist", "")
+                faults = entry.get("faults", "")
+                label = (f"{_design_name(netlist) or os.path.basename(netlist)}"
+                         f"  —  {os.path.basename(faults)}")
+                act = menu.addAction(label)
+                act.setToolTip("\n".join(
+                    p for p in (netlist, faults, entry.get("constraints", ""))
+                    if p))
+                act.triggered.connect(partial(self.apply_recent, dict(entry)))
+            menu.setToolTipsVisible(True)
+        self.recent_btn.setEnabled(bool(recent))
+
+    def apply_recent(self, entry: dict) -> None:
+        """Fill every input box from a remembered analysis."""
+        self.netlist_picker.set_path(entry.get("netlist", ""))
+        self.faults_picker.set_path(entry.get("faults", ""))
+        self.constraints_picker.set_path(entry.get("constraints", ""))
+        if entry.get("outdir"):
+            self.outdir_picker.set_path(entry["outdir"])
+        self._set_inputs_collapsed(False)
+        self.statusBar().showMessage(
+            "Inputs filled from a recent analysis — press ▶ Analyze.")
+
+    # ------------------------------------------------------------------
+    # Empty states and the guided tour
+    # ------------------------------------------------------------------
+    def _on_empty_action(self, action: str) -> None:
+        if action == "demo":
+            self.on_try_demo()
+        elif action == "load":
+            self.on_load_report()
+        else:
+            self._set_inputs_collapsed(False)
+            self._switch_to_tab("Summary")
+            self.netlist_picker.edit.setFocus()
+            self.statusBar().showMessage(
+                "Pick a netlist and a fault list at the top, then press "
+                "▶ Analyze.")
+
+    def _set_has_report(self, has_report: bool) -> None:
+        self.table_empty.setVisible(not has_report)
+        self.table_content.setVisible(has_report)
+
+    def start_tour(self) -> None:
+        """Walk a new user through the result tabs, one step at a time."""
+        if self._report is None:
+            self.statusBar().showMessage(
+                "The guided tour starts after an analysis — try the demo "
+                "data first.")
+            return
+        self.tour_bar.start()
+
+    def _finish_tour(self) -> None:
+        self._settings.tour_done = True
+        self._save_settings()
+
+    # ------------------------------------------------------------------
+    # Window and splitter layout persistence
+    # ------------------------------------------------------------------
+    def _splitters(self) -> dict:
+        """Every splitter in the window, keyed by owner class and order."""
+        keyed = {}
+        counts: dict = {}
+        for splitter in self.findChildren(QSplitter):
+            owner = splitter.parent()
+            while owner is not None and not isinstance(
+                    owner, (TriagePanel, AgentPanel, VisualizerPanel,
+                            MainWindow)):
+                owner = owner.parent()
+            base = type(owner).__name__ if owner is not None else "window"
+            n = counts.get(base, 0)
+            counts[base] = n + 1
+            keyed[f"{base}.{n}"] = splitter
+        return keyed
+
+    def save_layout(self) -> None:
+        s = self._settings
+        s.window_geometry = bytes(self.saveGeometry().toBase64()).decode()
+        s.splitter_states = {
+            key: bytes(sp.saveState().toBase64()).decode()
+            for key, sp in self._splitters().items()}
+
+    def restore_layout(self) -> bool:
+        """Restore splitters and geometry; True when a geometry was restored."""
+        s = self._settings
+        for key, splitter in self._splitters().items():
+            state = (s.splitter_states or {}).get(key)
+            if state:
+                splitter.restoreState(QByteArray.fromBase64(state.encode()))
+        if s.window_geometry:
+            return bool(self.restoreGeometry(
+                QByteArray.fromBase64(s.window_geometry.encode())))
+        return False
 
     def _default_report_name(self, netlist: str) -> str:
         """Report base name derived from the netlist (``<design>_atpg_report``)."""
@@ -1908,11 +2327,13 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.statusBar().showMessage("Starting analysis…")
+        self._reset_progress_clock()
 
         self._thread, self._worker = start_worker(inputs, self._skill_manager)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
 
@@ -1924,26 +2345,62 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         self.statusBar().showMessage(
             f"Analyzing {len(partitions)} partition(s)…")
+        self._reset_progress_clock()
 
         self._thread, self._worker = start_multi_worker(
             partitions, self._skill_manager)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_multi_finished)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
 
     def on_cancel(self) -> None:
         if self._thread and self._thread.isRunning():
             self._thread.requestInterruption()
-            self.statusBar().showMessage("Cancellation requested…")
+            self.statusBar().showMessage(
+                "Cancelling — the analysis stops at its next checkpoint…")
             self.cancel_btn.setEnabled(False)
+
+    def _on_cancelled(self) -> None:
+        self.progress.setVisible(False)
+        self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self._pending_save_path = None
+        self._set_export_enabled(self._report is not None)
+        self.statusBar().showMessage(
+            "Analysis cancelled. Nothing was changed; the previous results "
+            "(if any) are still shown.")
+
+    def _reset_progress_clock(self) -> None:
+        self._run_started = time.monotonic()
+        self._phase_key = None
+        self._phase_started = self._run_started
+
+    def progress_text(self, done: int, total: int, msg: str,
+                      now: Optional[float] = None) -> str:
+        """*msg* with elapsed time and, inside a counted phase, time left."""
+        now = time.monotonic() if now is None else now
+        started = getattr(self, "_run_started", now)
+        key = (total, msg.split(" ")[0] if msg else "")
+        if key != getattr(self, "_phase_key", None):
+            self._phase_key = key
+            self._phase_started = now
+        text = f"{msg}  —  {_fmt_secs(now - started)} elapsed"
+        phase = now - self._phase_started
+        if total > 0 and 0 < done < total and phase >= 3.0:
+            left = phase * (total - done) / done
+            text += f", about {_fmt_secs(left)} left in this step"
+        return text
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
         if total > 0:
             self.progress.setRange(0, total)
             self.progress.setValue(done)
-        self.statusBar().showMessage(msg)
+        else:
+            self.progress.setRange(0, 0)
+        self.statusBar().showMessage(self.progress_text(done, total, msg))
 
     def _on_finished(self, report: AnalysisReport) -> None:
         self.progress.setVisible(False)
@@ -1956,6 +2413,13 @@ class MainWindow(QMainWindow):
         n_skills = len(report.skill_results) if report.skill_results else 0
         msg = (f"Done. {report.summary.coverage_loss_count} coverage-loss "
                f"faults. {n_skills} skill(s) ran.")
+        reuse = (getattr(report, "sources", None) or {}).get("analysis_cache")
+        if reuse and reuse.get("reused_mappings"):
+            msg += (f"  Reused {reuse['reused_mappings']:,} fault mapping(s) "
+                    f"from an earlier run on this netlist.")
+        if getattr(report, "tool_evidence", None) is not None:
+            msg += (f"  Tessent reports read; "
+                    f"{report.tool_evidence.disagreements} disagreement(s).")
         if self._pending_save_path:
             if self._auto_save_report(report, self._pending_save_path):
                 msg += f"  Saved: {self._pending_save_path}"
@@ -2037,6 +2501,7 @@ class MainWindow(QMainWindow):
                 f"{p['name']}  ({report.summary.coverage_loss_count} loss)")
             self.partition_selector.blockSignals(False)
         self._set_export_enabled(True)
+        self._set_has_report(True)
         self._populate(report)
         if report.skill_results:
             self.skills_panel.show_results(report.skill_results)
@@ -2071,6 +2536,32 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Agent recorded {len(findings)} structured finding(s) — "
                 "see Summary section 9.2 and the Agent Tool Trace.")
+
+    def _on_agent_tool_evidence(self, data: dict) -> None:
+        """Fold what the agent measured in live Tessent into the report.
+
+        Only the report-side views are refreshed; the agent panel keeps its
+        conversation.
+        """
+        from ..analysis.tool_evidence import (ToolEvidence, apply_tool_evidence,
+                                              merge_evidence)
+        incoming = ToolEvidence.from_dict(data)
+        for report in {id(r): r for r in (self._report, self._base_report)
+                       if r is not None}.values():
+            current = getattr(report, "tool_evidence", None)
+            apply_tool_evidence(report, merge_evidence(
+                ToolEvidence.from_dict(current.as_dict()) if current else None,
+                ToolEvidence.from_dict(incoming.as_dict())))
+        if self._report is None:
+            return
+        self.triage_panel.set_report(self._report)
+        self._populate_summary(self._report)
+        self._populate_logs(self._report)
+        ev = self._report.tool_evidence
+        self.statusBar().showMessage(
+            f"Live Tessent measurement folded in: {len(ev.analyses)} "
+            f"analyze_fault sample(s); {ev.disagreements} disagreement(s) with "
+            "the offline estimate. See Summary and Triage.")
 
     def _on_agent_fix_edits(self, edits: list) -> None:
         """Overlay the agent's fix-plan edits onto the Triage tab and Summary.
@@ -2225,7 +2716,7 @@ class MainWindow(QMainWindow):
 
     def _apply_filter(self) -> None:
         text = self.filter_text.text().strip().lower()
-        cls = self.class_filter.currentText()
+        cls = self.class_filter.currentData() or "all"
         conf = self.conf_filter.currentText()
         for row in range(self.table.rowCount()):
             visible = True
@@ -2369,6 +2860,8 @@ class MainWindow(QMainWindow):
         self._set_inputs_collapsed(True)
         self.demo_btn.setVisible(False)
         self._switch_to_tab("Summary")
+        if not self._settings.tour_done:
+            self.tour_bar.start()
 
     def _set_advanced_tabs_visible(self, visible: bool) -> None:
         for widget in self._advanced_tabs:
@@ -2420,9 +2913,21 @@ class MainWindow(QMainWindow):
                     f"<span style='color:#555;'>{label}</span></td>")
 
         loss = summary.coverage_loss_count
-        cards = [
-            _card(_pct(metrics.get("test_coverage")), "Test coverage"),
-            _card(_pct(metrics.get("fault_coverage")), "Fault coverage"),
+        from ..analysis.tool_evidence import measured_metrics
+        measured = measured_metrics(report)
+        if measured.get("test_coverage") is not None:
+            coverage_cards = [
+                _card(_pct(measured["test_coverage"]),
+                      "Test coverage <b>(measured by Tessent)</b>"),
+                _card(_pct(metrics.get("test_coverage")),
+                      "Test coverage computed from the fault list"),
+            ]
+        else:
+            coverage_cards = [
+                _card(_pct(metrics.get("test_coverage")), "Test coverage"),
+                _card(_pct(metrics.get("fault_coverage")), "Fault coverage"),
+            ]
+        cards = coverage_cards + [
             _card(f"{loss:,}", f"Coverage-loss faults (of "
                   f"{summary.total_faults:,})"),
             _card(f"{summary.actionable_loss_count:,}",
@@ -2778,6 +3283,8 @@ class MainWindow(QMainWindow):
         self.skills_panel.clear_results()
         self.agent_panel.clear()
         self._set_export_enabled(False)
+        self._set_has_report(False)
+        self.tour_bar.stop()
         self._set_inputs_collapsed(False)
         self.statusBar().showMessage("Cleared.")
 
@@ -2787,8 +3294,9 @@ class MainWindow(QMainWindow):
         s.last_faults = self.faults_picker.path()
         s.last_constraints = self.constraints_picker.path()
         s.last_output_dir = self.outdir_picker.path()
+        s.last_tool_reports = self._last_tool_reports
         s.filter_text = self.filter_text.text()
-        s.class_filter = self.class_filter.currentText()
+        s.class_filter = self.class_filter.currentData() or "all"
         s.conf_filter = self.conf_filter.currentText()
         s.update_skills(self._skill_manager.to_config())
         s.agent = self.agent_panel.export_settings()
@@ -2802,6 +3310,7 @@ class MainWindow(QMainWindow):
         s.save()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.save_layout()
         self._save_settings()
         self._shutdown_report_server()
         # The agent panel owns background threads (CLI model fetch, agent run,
@@ -2817,6 +3326,7 @@ class MainWindow(QMainWindow):
         self.save_report_btn.setEnabled(enabled)
         self.compare_action.setEnabled(enabled)
         self.edit_action.setEnabled(enabled)
+        self.tool_reports_action.setEnabled(enabled)
 
     def on_edit_report(self) -> None:
         if not self._base_report:
@@ -2979,21 +3489,107 @@ class MainWindow(QMainWindow):
             label=label)
         c = summ["counts"]
         self.agent_panel.set_compare(compare)
+        from ..analysis.fix_history import evaluate_fix_outcomes
+        outcomes = evaluate_fix_outcomes(baseline, self._report)
+        self._show_compare_dialog(label, c, outcomes)
         self._switch_to_tab("AI Debug Agent")
-        QMessageBox.information(
-            self, "Regression vs baseline",
-            f"Baseline: {label}\n\n"
-            f"Baseline coverage-loss: {c['baseline_loss']}\n"
-            f"Current coverage-loss:  {c['current_loss']}\n"
-            f"Net delta: {c['net_delta']:+d}\n\n"
-            f"Regressed (new loss): {c['regressed']}\n"
-            f"Fixed (improved):     {c['fixed']}\n"
-            f"Changed (class/root): {c['changed']}\n\n"
-            "The AI agent can now use the regression tools — ask it "
-            "'what changed vs the baseline?'")
         self.statusBar().showMessage(
             f"Compared against {label}: +{c['regressed']} regressed, "
             f"-{c['fixed']} fixed, {c['changed']} changed.")
+
+    def _show_compare_dialog(self, label: str, counts: dict,
+                             outcomes: list) -> None:
+        """Regression counts plus, per baseline fix, what the re-run measured."""
+        from ..analysis import fix_history
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Regression vs baseline")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            f"<b>Baseline:</b> {_html_escape(label)}<br>"
+            f"Coverage-loss: {counts['baseline_loss']:,} \u2192 "
+            f"{counts['current_loss']:,} (net {counts['net_delta']:+,})<br>"
+            f"Regressed (new loss): {counts['regressed']:,} \u00b7 "
+            f"Fixed: {counts['fixed']:,} \u00b7 Changed: {counts['changed']:,}"
+            "<br><i>The AI agent can now answer \u201cwhat changed vs the "
+            "baseline?\u201d with its regression tools.</i>"))
+        v.addWidget(QLabel(
+            "<b>Did the fixes work?</b> For each fix the baseline proposed, "
+            "how its category changed. Tick the fixes you actually applied "
+            "and save: future plans rank fixes by these measured outcomes."))
+        table = QTableWidget(len(outcomes), 7)
+        table.setHorizontalHeaderLabels(
+            ["Applied?", "Category", "Fix", "Before", "After",
+             "Left the loss", "Moved to another category"])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for row, o in enumerate(outcomes):
+            check = QTableWidgetItem("")
+            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            check.setCheckState(Qt.Unchecked)
+            table.setItem(row, 0, check)
+            for col, value in enumerate(
+                    [o.subclass, o.title, f"{o.before:,}", f"{o.after:,}",
+                     f"{o.recovered:,} ({o.recovered_share:.0%})",
+                     f"{o.moved:,}"], start=1):
+                table.setItem(row, col, QTableWidgetItem(value))
+        table.resizeColumnsToContents()
+        v.addWidget(table, 1)
+        self._compare_outcomes = (outcomes, table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        save_btn = buttons.addButton("Save ticked outcomes to fix history",
+                                     QDialogButtonBox.ActionRole)
+        save_btn.setEnabled(bool(outcomes))
+        note = QLabel("")
+        v.addWidget(note)
+
+        def _save() -> None:
+            n = self.save_fix_outcomes()
+            note.setText(f"Saved {n} outcome(s) to "
+                         f"{fix_history.history_path()}." if n else
+                         "Tick at least one fix you applied.")
+        save_btn.clicked.connect(_save)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+        dlg.resize(900, 460)
+        dlg.exec()
+
+    def save_fix_outcomes(self) -> int:
+        """Record the ticked rows of the last comparison in the fix history."""
+        from ..analysis import fix_history
+        outcomes, table = getattr(self, "_compare_outcomes", ([], None))
+        if table is None:
+            return 0
+        chosen = [o for row, o in enumerate(outcomes)
+                  if table.item(row, 0).checkState() == Qt.Checked]
+        design = (getattr(self._report, "sources", None) or {}).get("design", "")
+        return fix_history.record_outcomes(chosen, design=design or "")
+
+    def on_add_tool_reports(self) -> None:
+        """Fold Tessent's own reports into the current results."""
+        if not self._report:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Tessent report_statistics / analyze_fault output",
+            self._last_tool_reports,
+            "Tool reports (*.log *.txt *.rpt *.out *.gz);;All files (*)")
+        if not path:
+            return
+        self.apply_tool_reports(path)
+
+    def apply_tool_reports(self, path: str) -> None:
+        from ..analysis.tool_evidence import (apply_tool_evidence,
+                                              load_tool_evidence)
+        evidence = load_tool_evidence(path)
+        if not evidence.statistics and not evidence.analyses:
+            self._error("No report_statistics table or analyze_fault entry "
+                        "was recognised in:\n" + path)
+            return
+        self._last_tool_reports = path
+        apply_tool_evidence(self._report, evidence)
+        self._apply_report(self._report)
+        self.statusBar().showMessage(
+            f"Tessent reports added: {len(evidence.statistics)} statistics "
+            f"table(s), {len(evidence.analyses)} analyze_fault sample(s); "
+            f"{evidence.disagreements} disagreement(s) with this analysis.")
 
     def on_save_report(self) -> None:
         if not self._report:
@@ -3042,7 +3638,10 @@ def run() -> int:
     # The whole UI is English text; never mirror it because of an RTL locale.
     app.setLayoutDirection(Qt.LeftToRight)
     window = MainWindow()
-    # Start maximised: the window has a lot to show, and on remote displays a
-    # broken title-bar maximise button would otherwise leave it small.
-    window.showMaximized()
+    # Reopen where the user left it; first launch starts maximised because on
+    # remote displays a broken title-bar maximise button leaves it small.
+    if window.restore_layout():
+        window.show()
+    else:
+        window.showMaximized()
     return app.exec()

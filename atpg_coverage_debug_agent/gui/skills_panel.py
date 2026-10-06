@@ -33,13 +33,13 @@ logger = logging.getLogger(__name__)
 def agent_reach(skill: SkillBase) -> str:
     """One line saying how this skill reaches the AI agent, in either mode."""
     if getattr(skill, "on_demand", False):
-        return ("Agent tool: called with arguments in Investigate mode, on "
-                "both backends.")
+        return ("Agent tool: called with arguments in Deep investigation "
+                "mode, on both backends.")
     if getattr(skill, "guidance", False):
-        return ("Guidance: Quick diagnosis gets the whole text; Investigate "
-                "mode reads it section by section (read_guidance).")
-    return ("Runs with the analysis: Quick diagnosis gets its findings in the "
-            "prompt; Investigate mode reads them with skill_findings.")
+        return ("Guidance: Quick summary gets the whole text; Deep "
+                "investigation reads it section by section (read_guidance).")
+    return ("Runs with the analysis: Quick summary gets its findings in the "
+            "prompt; Deep investigation reads them with skill_findings.")
 
 
 class _SkillCard(QGroupBox):

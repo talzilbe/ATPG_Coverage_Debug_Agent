@@ -119,6 +119,10 @@ def apply_exclusions(report: AnalysisReport,
     from .open_questions import build_open_questions
     edited.agreement = cross_check(kept)
     edited.open_questions = build_open_questions(edited)
+    evidence = getattr(report, "tool_evidence", None)
+    if evidence is not None:
+        from .tool_evidence import ToolEvidence, apply_tool_evidence
+        apply_tool_evidence(edited, ToolEvidence.from_dict(evidence.as_dict()))
     return edited
 
 

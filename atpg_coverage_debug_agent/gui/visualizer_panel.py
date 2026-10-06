@@ -10,11 +10,12 @@ The launch is *detached*: the vendor shell must outlive this application.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QProcess, QTimer, QUrl, Signal
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
@@ -30,8 +31,8 @@ from ..launcher import (
 )
 from ..launcher.visualizer import (
     ConfigFileError, config_file_stem, default_config_dir,
-    derive_paths_from_run_dir, fault_inspect_commands, missing_inputs,
-    read_launch_config, write_launch_config,
+    derive_paths_from_run_dir, fault_inspect_commands, launch_health,
+    missing_inputs, profile_licence, read_launch_config, write_launch_config,
 )
 from ..launcher.profiles import import_profile_file, user_profile_dir
 
@@ -129,6 +130,7 @@ class VisualizerPanel(QWidget):
         outer.addWidget(self._build_profile_box())
         outer.addWidget(self._build_setup_box())
         outer.addWidget(self._build_inputs_box())
+        outer.addWidget(self._build_health_box())
         outer.addWidget(self._build_commands_box(), 1)
         outer.addLayout(self._build_button_row())
 
@@ -223,12 +225,34 @@ class VisualizerPanel(QWidget):
         self.ward_row.changed.connect(self._on_input_changed)
         form.addRow("Workarea (-ward):", self.ward_row)
 
+        lic_row = QHBoxLayout()
         self.licence_edit = QLineEdit()
         self.licence_edit.setPlaceholderText(
             "port@host[:port@host…] — blank uses the profile's value")
+        self.licence_edit.setToolTip(
+            "Pre-filled with the site licence list from the profile. "
+            "Change it only if you were told to use different servers.")
         self.licence_edit.textChanged.connect(self._on_input_changed)
-        form.addRow("Licence server:", self.licence_edit)
+        lic_row.addWidget(self.licence_edit, 1)
+        self.licence_reset_btn = QPushButton("Use site default")
+        self.licence_reset_btn.setToolTip(
+            "Put the profile's licence server list back in the field.")
+        self.licence_reset_btn.clicked.connect(self.reset_licence)
+        lic_row.addWidget(self.licence_reset_btn, 0)
+        lic_holder = QWidget()
+        lic_holder.setLayout(lic_row)
+        form.addRow("Licence server:", lic_holder)
         return box
+
+    def reset_licence(self) -> None:
+        """Fill the licence field with the selected profile's site default."""
+        profile = self.current_profile()
+        if profile is not None:
+            self.licence_edit.setText(profile_licence(profile))
+
+    def _fill_licence_default(self) -> None:
+        if not self.licence_edit.text().strip():
+            self.reset_licence()
 
     def _build_inputs_box(self) -> QGroupBox:
         box = QGroupBox("Design inputs")
@@ -276,6 +300,56 @@ class VisualizerPanel(QWidget):
         self.use_analysis_faults.toggled.connect(self._on_use_analysis_faults)
         layout.addWidget(self.use_analysis_faults)
         return box
+
+    def _build_health_box(self) -> QGroupBox:
+        box = QGroupBox("Ready to launch?")
+        layout = QVBoxLayout(box)
+        self.health_label = QLabel("")
+        self.health_label.setWordWrap(True)
+        self.health_label.setTextFormat(Qt.RichText)
+        layout.addWidget(self.health_label)
+        row = QHBoxLayout()
+        recheck = QPushButton("Re-check")
+        recheck.setToolTip(
+            "Check the setup wrapper, tool, terminal, display, licence and "
+            "design files again. Nothing is run.")
+        recheck.clicked.connect(self.refresh_health)
+        row.addWidget(recheck)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return box
+
+    def refresh_health(self) -> List[Any]:
+        """Re-run the pre-launch checks; Launch is enabled only when they pass."""
+        profile = self.current_profile()
+        if profile is None:
+            self.health_label.setText("No launch profile is selected.")
+            return []
+        checks = launch_health(profile, self.current_inputs())
+        lines = []
+        for c in checks:
+            if c.ok:
+                mark = "<span style='color:#1a7f37'>&#10003;</span>"
+            elif c.blocking:
+                mark = "<span style='color:#c62828'>&#10007;</span>"
+            else:
+                mark = "<span style='color:#a05000'>!</span>"
+            detail = html.escape(c.detail)
+            lines.append(f"{mark} <b>{html.escape(c.label)}</b> — {detail}")
+        blockers = [c for c in checks if not c.ok and c.blocking]
+        head = ("<b style='color:#1a7f37'>All checks pass — ready to "
+                "launch.</b>" if not blockers else
+                f"<b style='color:#c62828'>{len(blockers)} thing(s) to fix "
+                f"before Launch:</b>")
+        self.health_label.setText(head + "<br>" + "<br>".join(lines))
+        if not profile.is_template:
+            self.launch_btn.setToolTip(
+                "Fix first: " + "; ".join(f"{c.label}: {c.detail}"
+                                          for c in blockers)
+                if blockers else
+                "Open a terminal running the whole chain. The session is "
+                "detached, so it keeps running if this window closes.")
+        return checks
 
     def _build_commands_box(self) -> QGroupBox:
         box = QGroupBox("Commands that will run")
@@ -449,6 +523,7 @@ class VisualizerPanel(QWidget):
             self.proj_edit.setText(profile.psetup.proj)
         if not self.cfg_edit.text().strip():
             self.cfg_edit.setText(profile.psetup.cfg)
+        self._fill_licence_default()
         self._rebuild_path_rows(profile)
         self.refresh_preview()
         self._notify_config_changed()
@@ -552,6 +627,7 @@ class VisualizerPanel(QWidget):
         self.commands_view.setPlainText(text)
         self.commands_view.blockSignals(False)
         self._dofile_edited = False
+        self.refresh_health()
 
     def add_fault_commands(self, fault_path: str, stuck_value: str = "") -> bool:
         """Append the profile's inspection commands for one fault."""
@@ -626,6 +702,13 @@ class VisualizerPanel(QWidget):
             self._set_status(
                 "No supported terminal emulator was found. Use 'Copy commands' "
                 "and run the chain by hand.", True)
+            return
+        blockers = [c for c in self.refresh_health()
+                    if not c.ok and c.blocking and c.label != "Terminal emulator"]
+        if blockers:
+            self._set_status(
+                "Cannot launch yet — see 'Ready to launch?': "
+                + "; ".join(f"{c.label}: {c.detail}" for c in blockers), True)
             return
 
         override = self.commands_view.toPlainText() if self._dofile_edited else None
@@ -973,6 +1056,7 @@ class VisualizerPanel(QWidget):
         self.cfg_edit.setText(str(cfg.get("cfg", "")))
         self.ward_row.set_path(str(cfg.get("ward", "")))
         self.licence_edit.setText(str(cfg.get("licence_server", "")))
+        self._fill_licence_default()
         self.run_dir_row.set_path(str(cfg.get("run_dir", "")))
         if str(cfg.get("mode", "")) == "run_dir":
             self.mode_run_dir.setChecked(True)

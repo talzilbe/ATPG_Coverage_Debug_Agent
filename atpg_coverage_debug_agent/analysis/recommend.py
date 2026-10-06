@@ -71,6 +71,8 @@ class Recommendation:
     supersedes: Optional[int] = None
     #: Why the agent replaced the offline entry.
     edit_reason: str = ""
+    #: Measured outcomes of this fix on this category in earlier re-runs.
+    history: Optional[Dict[str, object]] = None
 
     @property
     def title(self) -> str:
@@ -111,6 +113,7 @@ class Recommendation:
             "superseded_by": self.superseded_by,
             "supersedes": self.supersedes,
             "edit_reason": self.edit_reason,
+            "history": dict(self.history) if self.history else None,
         }
 
 
@@ -298,6 +301,19 @@ def build_recommendations(
     if not selected:
         return []
 
+    from . import fix_history
+    try:
+        history = fix_history.history_stats()
+    except Exception:  # noqa: BLE001 - a bad ledger must never block the plan
+        logger.exception("Fix history unreadable; ranking without it")
+        history = {}
+
+    def _history_adjust(fix_id: str, subclass: str) -> float:
+        state = fix_history.verdict(history.get((fix_id, subclass)))
+        # Measured outcomes outrank every estimate: a proven fix goes first in
+        # its category, one that repeatedly recovered nothing goes last.
+        return {"proven": -100.0, "not_working": 100.0}.get(state, 0.0)
+
     scored = []
     for category in selected:
         confidence = _confidence_for(category)
@@ -306,6 +322,9 @@ def build_recommendations(
         concentration = (verdict.scores.concentration if verdict else 0.0)
         actions = _ordered_fixes(category)
         preferred = set(_preferred_fix_ids(category))
+        actions = sorted(
+            actions, key=lambda a: _history_adjust(a.fix_id,
+                                                   category.subclass_id))
         for position, action in enumerate(actions[:max_fixes_per_category]):
             scored.append((
                 -category.stat.count,
@@ -313,8 +332,9 @@ def build_recommendations(
                 -category.stat.sa_asymmetry,
                 # A fix the traced evidence points at outranks the generic
                 # cheapest-first ordering.
-                position if action.fix_id in preferred
-                else action.feasibility_rank + len(preferred),
+                (position if action.fix_id in preferred
+                 else action.feasibility_rank + len(preferred))
+                + _history_adjust(action.fix_id, category.subclass_id),
                 category,
                 action,
                 confidence,
@@ -327,6 +347,11 @@ def build_recommendations(
     for rank, row in enumerate(scored, start=1):
         _, _, _, _, category, action, confidence, evidence = row
         verdict = getattr(category, "verdict", None)
+        past = history.get((action.fix_id, category.subclass_id))
+        lines = list(evidence)
+        if past:
+            lines.append(_tag(EvidenceSource.FIX_HISTORY,
+                              fix_history.describe(past)))
         recommendations.append(Recommendation(
             rank=rank,
             subclass_id=category.subclass_id,
@@ -334,10 +359,12 @@ def build_recommendations(
             pct=category.stat.pct,
             fix=action,
             confidence=confidence,
-            evidence=list(evidence),
+            evidence=lines,
             caveats=_caveats_for(category, action),
             actionable=(verdict.actionable if verdict else "partial"),
             hotspot=(verdict.hotspot if verdict else ""),
+            history=(dict(past, verdict=fix_history.verdict(past))
+                     if past else None),
         ))
 
     logger.info("Built %d recommendation(s) across %d categorie(s).",

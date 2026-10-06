@@ -398,3 +398,49 @@ def test_profile_tool_reads_the_serialized_payload():
     assert entry["dominant"] == "reconvergent_complexity"
     assert entry["signatures"][0]["samples"]
     assert "opposite fixes" in data["note"]
+
+
+# ---------------------------------------------------------------------------
+# Side-input check: reconvergence seen from INSIDE the cone
+# ---------------------------------------------------------------------------
+INSIDE_CONE = """
+module rc (clk, cin, cout, i_bn, o_bn);
+  input clk, cin, i_bn;
+  output cout, o_bn;
+  wire h, a, b, m0, m1, m2, m3, m4, m5, j0, j1, j2, j3, j4, b1;
+  BUF  u_head ( .A(cin), .Y(h) );
+  BUF  u_a ( .A(h), .Y(a) );
+  BUF  u_b ( .A(h), .Y(b) );
+  AND2 u_m0 ( .A(a), .B(b), .Y(m0) );
+  AND2 u_m1 ( .A(a), .B(b), .Y(m1) );
+  AND2 u_m2 ( .A(a), .B(b), .Y(m2) );
+  AND2 u_m3 ( .A(a), .B(b), .Y(m3) );
+  AND2 u_m4 ( .A(a), .B(b), .Y(m4) );
+  AND2 u_m5 ( .A(a), .B(b), .Y(m5) );
+  AND2 u_j0 ( .A(m0), .B(m1), .Y(j0) );
+  AND2 u_j1 ( .A(m2), .B(m3), .Y(j1) );
+  AND2 u_j2 ( .A(m4), .B(m5), .Y(j2) );
+  AND2 u_j3 ( .A(j0), .B(j1), .Y(j3) );
+  AND2 u_j4 ( .A(j3), .B(j2), .Y(j4) );
+  SDFF u_scan ( .D(j4), .CK(clk), .Q(cout) );
+  BUF  u_bn ( .A(i_bn), .Y(b1) );
+  SDFF u_bn_scan ( .D(b1), .CK(clk), .Q(o_bn) );
+endmodule
+"""
+
+
+def test_a_site_inside_a_reconvergent_cone_is_not_called_a_bottleneck():
+    conn = ConnectivityModel(parse_verilog(INSIDE_CONE))
+    profile = _profiler(conn).profile("u_m0")
+    assert profile.observation_points == 1
+    assert profile.enclosing_reconvergence >= 2
+    assert profile.signature == "reconvergent_complexity"
+    assert profile.as_dict()["enclosing_reconvergence"] == \
+        profile.enclosing_reconvergence
+
+
+def test_a_plain_narrow_path_stays_a_bottleneck():
+    conn = ConnectivityModel(parse_verilog(INSIDE_CONE))
+    profile = _profiler(conn).profile("u_bn")
+    assert profile.enclosing_reconvergence == 0
+    assert profile.signature == "observability_bottleneck"

@@ -179,7 +179,8 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
                  progress=None,
                  config: Optional[AnalysisConfig] = None,
                  faults_path: str = "",
-                 fault_list_candidates=None) -> AnalysisReport:
+                 fault_list_candidates=None,
+                 cache=None) -> AnalysisReport:
     """Run the full analysis pipeline and return an :class:`AnalysisReport`.
 
     Args:
@@ -193,6 +194,8 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         faults_path: Path the fault list was read from, used only to place the
             snapshot relative to the run's fault-disposition step.
         fault_list_candidates: Sibling fault lists found beside it.
+        cache: Optional ``AnalysisCache``; constraint-independent results
+            (mappings, tie drivers, site profiles) are reused from it.
 
     Returns:
         A populated :class:`AnalysisReport`.
@@ -208,7 +211,7 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
         )
 
     connectivity = ConnectivityModel(netlist)
-    mapper = FaultMapper(connectivity)
+    mapper = FaultMapper(connectivity, cache=cache)
     engine = RootCauseEngine(connectivity, mapper, constraints)
 
     loss_faults = [f for f in faults if f.is_coverage_loss]
@@ -274,8 +277,14 @@ def build_report(netlist: VerilogNetlist, faults: List[FaultRecord],
                          if (f.dotted_class or "").upper() != waived]
 
     selected = enrich_categories(select_categories(triage_stats), triage_faults)
-    attribute_categories(selected, results, connectivity, constraints)
-    profile_categories(selected, results, connectivity, constraints)
+    if progress is not None:
+        progress(0, 0, "Tracing blocking sources (tie cells, constraints)")
+    attribute_categories(selected, results, connectivity, constraints,
+                         cache=cache)
+    if progress is not None:
+        progress(0, 0, "Profiling hard-to-test fault sites")
+    profile_categories(selected, results, connectivity, constraints,
+                       cache=cache)
     recommendations = build_recommendations(triage_stats, selected)
 
     logger.info(

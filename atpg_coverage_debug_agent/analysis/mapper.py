@@ -33,8 +33,10 @@ class FaultMapper:
     #: Ancestor levels compared when disambiguating a repeated leaf name.
     MAX_ANCESTOR_DEPTH = 6
 
-    def __init__(self, connectivity: ConnectivityModel) -> None:
+    def __init__(self, connectivity: ConnectivityModel, cache=None) -> None:
         self.conn = connectivity
+        #: Optional :class:`.analysis_cache.AnalysisCache` reused across runs.
+        self.cache = cache
         # Index instance leaf name -> list of (module, instance).
         self._by_name: Dict[str, List[Tuple[str, Instance]]] = {}
         # Index normalised "module/instance" -> (module, instance).
@@ -59,6 +61,16 @@ class FaultMapper:
 
     def map_object(self, fault_object: str) -> MappingResult:
         """Return the best :class:`MappingResult` for *fault_object*."""
+        if self.cache is None:
+            return self._map_object(fault_object)
+        found = self.cache.mapping(fault_object)
+        if found is not None:
+            return found
+        result = self._map_object(fault_object)
+        self.cache.store_mapping(fault_object, result)
+        return result
+
+    def _map_object(self, fault_object: str) -> MappingResult:
         normalized = normalize_object(fault_object)
         inst_path, pin = self._split_object(normalized)
         leaf = inst_path.split("/")[-1] if inst_path else normalized

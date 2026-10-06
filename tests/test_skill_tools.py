@@ -317,4 +317,4 @@ def test_skills_tab_says_how_each_skill_reaches_the_agent():
     from atpg_coverage_debug_agent.gui.skills_panel import agent_reach
     manager = SkillManager()
     assert "skill_findings" in agent_reach(manager.get("scan_boundary"))
-    assert "Investigate" in agent_reach(manager.get("list_faults"))
+    assert "Deep investigation" in agent_reach(manager.get("list_faults"))

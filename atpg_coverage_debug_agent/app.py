@@ -29,6 +29,12 @@ class AnalysisInputs:
     netlist_path: str
     faults_path: str
     constraints_path: Optional[str] = None
+    #: Optional report_statistics / analyze_fault output (file or directory).
+    tool_reports_path: Optional[str] = None
+
+
+class AnalysisCancelled(Exception):
+    """Raised from a progress callback to stop an analysis between steps."""
 
 
 def _validate(path: str, label: str) -> None:
@@ -129,10 +135,15 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 
     if progress:
         progress(3, 5, "Running analysis")
+    from .analysis.analysis_cache import AnalysisCache
+    cache = AnalysisCache.for_netlist(inputs.netlist_path, config)
     report = build_report(netlist, faults, constraints, warnings,
                           progress=progress, config=config,
                           faults_path=faults_path,
-                          fault_list_candidates=candidates)
+                          fault_list_candidates=candidates,
+                          cache=cache)
+    if cache is not None:
+        cache.save()
 
     # Retain the parsed artefacts so the agentic AI layer can build a live
     # AnalysisContext and invoke skills as tools on demand.
@@ -141,6 +152,8 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     report.constraints = constraints
     report.sources = _source_metadata(inputs, faults_path)
     report.sources["netlist_origin"] = netlist_origin
+    if cache is not None:
+        report.sources["analysis_cache"] = cache.stats()
     report.fault_list_header = fault_parse.header
     report.class_diagnostics = fault_parse.unrecognised
     report.constraint_diagnostics = (constraint_parse.summary()
@@ -155,6 +168,14 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
     if audit_issues:
         report.warnings.extend(issues_as_warnings(audit_issues))
         report.summary.warnings = list(report.warnings)
+
+    if inputs.tool_reports_path:
+        if progress:
+            progress(0, 0, "Reading Tessent reports")
+        from .analysis.tool_evidence import (apply_tool_evidence,
+                                             load_tool_evidence)
+        apply_tool_evidence(report, load_tool_evidence(inputs.tool_reports_path))
+        report.sources["tool_reports"] = inputs.tool_reports_path
 
     if skill_manager is not None:
         if progress:
@@ -185,10 +206,12 @@ def analyze_paths(inputs: AnalysisInputs, progress=None,
 def run_analysis(netlist_path: str, faults_path: str,
                  constraints_path: Optional[str] = None,
                  progress=None, skill_manager=None,
-                 config: Optional[AnalysisConfig] = None) -> AnalysisReport:
+                 config: Optional[AnalysisConfig] = None,
+                 tool_reports_path: Optional[str] = None) -> AnalysisReport:
     """Convenience wrapper accepting raw path strings."""
     return analyze_paths(
-        AnalysisInputs(netlist_path, faults_path, constraints_path),
+        AnalysisInputs(netlist_path, faults_path, constraints_path,
+                       tool_reports_path),
         progress=progress,
         skill_manager=skill_manager,
         config=config,

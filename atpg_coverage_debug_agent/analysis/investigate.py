@@ -1007,6 +1007,14 @@ def serialize_context(report: Any) -> Dict[str, Any]:
     if config_used:
         payload["analysis_config"] = dict(config_used)
 
+    evidence = getattr(report, "tool_evidence", None)
+    if evidence is not None:
+        payload["tool_reports"] = evidence.as_dict()
+        payload["tool_reports"]["note"] = (
+            "These are the ATPG tool's own measurements. Where they differ "
+            "from a computed or structurally estimated value, quote the tool's "
+            "figure and say the estimate was overridden.")
+
     edits = getattr(report, "edits", None) or {}
     if edits:
         payload["waivers"] = {
@@ -1116,7 +1124,7 @@ CONTEXT_SECTIONS = ("census", "snapshot", "evidence", "coverage_metrics",
                     "fault_list", "unrecognised_fault_classes",
                     "constraint_parsing", "analysis_config", "patterns",
                     "warnings", "waivers", "visualizer", "open_questions",
-                    "classification_crosscheck")
+                    "classification_crosscheck", "tool_reports")
 
 
 def list_open_questions(context: Optional[Dict[str, Any]],

@@ -81,13 +81,18 @@ class EvidenceSource(str, Enum):
     one this analyzer inferred structurally. Only the first three are direct
     readings of an input file; the last two are this tool's own reasoning and
     must never be presented with the authority of a tool report.
+    ``TOOL_REPORT`` is the ATPG tool's own measurement (report_statistics,
+    analyze_fault) and outranks everything; ``FIX_HISTORY`` is what earlier
+    re-runs measured for the same fix.
     """
 
+    TOOL_REPORT = "tool_report"
     FAULT_LIST = "fault_list"
     CONSTRAINT_FILE = "constraint_file"
     NETLIST = "netlist"
     STRUCTURAL_INFERENCE = "structural_inference"
     CLUSTERING_HINT = "clustering_hint"
+    FIX_HISTORY = "fix_history"
 
 
 class VerdictConfidence(str, Enum):
@@ -531,3 +536,6 @@ class AnalysisReport:
     #: Where the offline analysis recorded a weak spot, as questions for the
     #: reviewer (``List[analysis.open_questions.OpenQuestion]``).
     open_questions: Any = None
+    #: The ATPG tool's own reports read alongside the inputs, and how they
+    #: compare with this analysis (``analysis.tool_evidence.ToolEvidence``).
+    tool_evidence: Any = None

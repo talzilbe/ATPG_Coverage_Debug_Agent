@@ -58,10 +58,21 @@ def test_categories_show_counts_and_stuck_at_split(panel):
     rows = {panel.category_table.item(r, 0).text(): r
             for r in range(panel.category_table.rowCount())}
     row = rows["AU.TC"]
-    assert panel.category_table.item(row, 1).text() == "40"
+    assert panel.category_table.item(row, 1).text() == "Tied cells"
+    assert panel.category_table.item(row, 2).text() == "40"
     # Every AU.TC fault here is stuck-at-1, so the split is maximally skewed.
-    assert panel.category_table.item(row, 4).text() == "40"
-    assert panel.category_table.item(row, 5).text() == "1.00"
+    assert panel.category_table.item(row, 5).text() == "40"
+    assert panel.category_table.item(row, 6).text() == "1.00"
+
+
+def test_an_empty_panel_offers_next_steps(qapp):
+    widget = TriagePanel()
+    assert widget.empty_state.isVisibleTo(widget)
+    assert not widget.tabs.isVisibleTo(widget)
+    seen = []
+    widget.empty_action_requested.connect(seen.append)
+    widget.empty_state.buttons["demo"].click()
+    assert seen == ["demo"]
 
 
 def test_totals_line_states_these_are_fault_list_numbers(panel):

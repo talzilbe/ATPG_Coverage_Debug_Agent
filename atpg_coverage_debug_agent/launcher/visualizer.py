@@ -583,6 +583,82 @@ def missing_inputs(profile: ToolProfile, inputs: VisualizerInputs) -> List[str]:
     return missing
 
 
+def _licence_env_name(env: Dict[str, str]) -> str:
+    return next((k for k in env if "LICENSE" in k.upper() or "LICENCE" in k.upper()),
+                "")
+
+
+def profile_licence(profile: ToolProfile) -> str:
+    """The licence server list the profile ships with, or ``""``."""
+    env = dict(profile.environment)
+    name = _licence_env_name(env)
+    return str(env.get(name, "")).strip() if name else ""
+
+
+@dataclass
+class HealthCheck:
+    """One pre-launch check: what was checked, whether it passed, and why."""
+
+    label: str
+    ok: bool
+    detail: str = ""
+    #: A failed blocking check disables Launch; a failed advisory one only warns.
+    blocking: bool = True
+
+
+def launch_health(profile: ToolProfile, inputs: VisualizerInputs,
+                  ) -> List[HealthCheck]:
+    """Everything that can be verified before a launch, without running anything."""
+    checks: List[HealthCheck] = []
+    if profile.is_template:
+        checks.append(HealthCheck(
+            "Profile", False, "the shipped template has placeholder executables"))
+    psetup = profile.psetup.executable
+    if psetup:
+        ok = os.path.isfile(psetup) and os.access(psetup, os.X_OK)
+        checks.append(HealthCheck(
+            "Project setup wrapper", ok,
+            psetup if ok else f"not found or not executable: {psetup}"))
+    tool = profile.tool.executable
+    if tool:
+        ok = os.path.isfile(tool)
+        # The setup wrapper may put the tool on PATH, so a miss here only warns.
+        checks.append(HealthCheck(
+            "Tool executable", ok,
+            tool if ok else f"not visible from here: {tool}", blocking=False))
+    term = find_terminal(profile.terminal_preference)
+    checks.append(HealthCheck(
+        "Terminal emulator", term is not None,
+        term.name if term is not None else "none found; use 'Copy commands'"))
+    disp = display_available()
+    checks.append(HealthCheck(
+        "X display", disp,
+        os.environ.get("DISPLAY", "") if disp else "$DISPLAY is not set"))
+    licence = (inputs.licence_server or profile_licence(profile)).strip()
+    try:
+        validate_licence(licence, required=bool(_licence_env_name(
+            dict(profile.environment))))
+        checks.append(HealthCheck(
+            "Licence server", True, licence or "profile sets none"))
+    except LaunchInputError as exc:
+        checks.append(HealthCheck("Licence server", False, str(exc)))
+    if not (inputs.proj or profile.psetup.proj).strip():
+        checks.append(HealthCheck("Project (-proj)", False, "required"))
+    for entry in profile.commands.load:
+        label = entry.label or entry.key
+        raw = (inputs.paths.get(entry.key) or "").strip()
+        if not raw:
+            if entry.required:
+                checks.append(HealthCheck(label, False, "required"))
+            continue
+        try:
+            validate_fs_path(raw, label)
+            checks.append(HealthCheck(label, True, raw))
+        except LaunchInputError as exc:
+            checks.append(HealthCheck(label, False, str(exc)))
+    return checks
+
+
 def iter_load_entries(profile: ToolProfile) -> Iterable[Tuple[str, str, bool]]:
     """(key, label, required) for each load command, for building a form."""
     for entry in profile.commands.load:

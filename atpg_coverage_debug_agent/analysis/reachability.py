@@ -48,6 +48,15 @@ OBS_BOTTLENECK = 2
 #: reconvergent structure, which no amount of extra abort budget will fix.
 RECONVERGENCE_HIGH = 5
 
+#: Fan-in levels walked above a site to find the fan-out stem that may
+#: enclose it.
+STEM_DEPTH = 3
+
+#: Gates on the site's propagation path whose SIDE input is fed from that same
+#: stem. At or above this, a bottleneck verdict is really reconvergence seen
+#: from inside the cone.
+ENCLOSING_RECONVERGENCE_HIGH = 2
+
 #: When this share of profiled sites agrees, the signature is taken to
 #: describe the whole category rather than just the sites examined.
 CONSENSUS_SHARE = 0.8
@@ -66,9 +75,12 @@ DEFAULT_SAMPLES = 3
 RECONVERGENCE_BLIND_SPOT = (
     "Reconvergence is counted where fan-out paths re-merge, which is only "
     "visible from a site above the fan-out. A site inside a reconvergent cone "
-    "sees one narrow path and reads as an observability bottleneck instead. "
-    "If a bottleneck verdict here is really reconvergence, a higher abort "
-    "limit will not help and the design bypass is the fix to look at."
+    "sees one narrow path; to catch that, the side inputs of that path are "
+    f"checked against the fan-out stem up to {STEM_DEPTH} levels above the "
+    "site, and a match is reported as reconvergent complexity. A stem further "
+    "up is not examined, so a bottleneck verdict can still be reconvergence: "
+    "if so, a higher abort limit will not help and the design bypass is the "
+    "fix to look at."
 )
 
 #: Verdict id -> (human label, fixes it calls for).
@@ -145,6 +157,8 @@ class SiteProfile:
     sequential_depth: int = 0
     reconvergence: int = 0
     truncated: bool = False
+    #: Path gates whose side input comes from the stem above the site.
+    enclosing_reconvergence: int = 0
     signature: str = "no_structural_blocker"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -155,6 +169,7 @@ class SiteProfile:
             "observation_points": self.observation_points,
             "sequential_depth": self.sequential_depth,
             "reconvergence": self.reconvergence,
+            "enclosing_reconvergence": self.enclosing_reconvergence,
             "truncated": self.truncated,
             "signature": self.signature,
         }
@@ -193,6 +208,11 @@ class ReachabilityProfile:
     preferred_fix_ids: List[str] = field(default_factory=list)
     truncated_sites: int = 0
     note: str = ""
+    #: The structural verdict before an analyze_fault measurement replaced it.
+    estimated_dominant: str = ""
+    #: analyze_fault sample summary when the tool measured this category.
+    measured: Optional[Dict[str, Any]] = None
+    _note_before_measurement: Optional[str] = None
 
     @property
     def dominant_label(self) -> str:
@@ -223,7 +243,10 @@ class ReachabilityProfile:
                                          key=lambda kv: (-kv[1], kv[0]))
             ],
             "note": self.note,
-            "source": EvidenceSource.STRUCTURAL_INFERENCE.value,
+            "estimated_dominant": self.estimated_dominant or self.dominant,
+            "measured": dict(self.measured) if self.measured else None,
+            "source": (EvidenceSource.TOOL_REPORT.value if self.measured
+                       else EvidenceSource.STRUCTURAL_INFERENCE.value),
             "caveat": ("Estimated by walking the netlist. Real ATPG reasons "
                        "about Boolean satisfiability across the whole cone, "
                        "which structural tracing cannot reproduce."),
@@ -292,10 +315,53 @@ class StructuralProfiler:
             "observation_points": observe_points,
             "sequential_depth": best_depth if best_depth is not None else 0,
             "reconvergence": reconvergence,
+            "cone": seen,
             # The walk stopped early, so every count above is a floor. Callers
             # must not read "0 observation points" as "no observation points".
             "truncated": bool(queue) and len(seen) >= MAX_CONE_NODES,
         }
+
+    def _bounded_walk(self, start: Iterable[str], step, depth: int) -> Set[str]:
+        found: Set[str] = set()
+        frontier = set(start)
+        for _ in range(depth):
+            nxt: Set[str] = set()
+            for key in frontier:
+                for other in step(key):
+                    if other not in found:
+                        found.add(other)
+                        nxt.add(other)
+                    if len(found) >= MAX_CONE_NODES:
+                        return found
+            frontier = nxt
+        return found
+
+    def _enclosing_reconvergence(self, start_key: str, cone: Set[str]) -> int:
+        """Count gates on the site's fan-out whose side input shares its stem.
+
+        From inside a reconvergent cone the site sees one narrow path; the
+        reconvergence shows up as the side inputs of that path being driven
+        from the same fan-out stem that feeds the site. Walk up a few levels
+        to the stem, walk its fan-out forward, and count path gates that take
+        a side input from that region.
+        """
+        stem = self._bounded_walk([start_key], self.conn.upstream, STEM_DEPTH)
+        if not stem:
+            return 0
+        region = self._bounded_walk(stem, self.conn.downstream,
+                                    STEM_DEPTH + self.max_depth)
+        region -= {start_key}
+        own_cone = set(cone) | {start_key}
+        count = 0
+        for gate in cone:
+            if gate == start_key:
+                continue
+            drivers = set(self.conn.upstream(gate))
+            on_path = drivers & own_cone
+            side = drivers - own_cone
+            if on_path and side & region:
+                count += 1
+        return count
 
     def profile(self, instance_name: Optional[str]) -> Optional[SiteProfile]:
         """Measure the structure around *instance_name*.
@@ -323,6 +389,12 @@ class StructuralProfiler:
             truncated=downstream["truncated"],
         )
         profile.signature = classify_site(profile)
+        if profile.signature == "observability_bottleneck":
+            # Only the bottleneck verdict is ambiguous with reconvergence seen
+            # from inside the cone, so only it pays for the extra walk.
+            profile.enclosing_reconvergence = self._enclosing_reconvergence(
+                key, downstream["cone"])
+            profile.signature = classify_site(profile)
         self._cache[key] = profile
         return profile
 
@@ -354,6 +426,8 @@ def classify_site(profile: SiteProfile) -> str:
     if profile.observation_points == 0:
         return "hard_observability_gap"
     if profile.observation_points <= OBS_BOTTLENECK:
+        if profile.enclosing_reconvergence >= ENCLOSING_RECONVERGENCE_HIGH:
+            return "reconvergent_complexity"
         return "observability_bottleneck"
     return "no_structural_blocker"
 
@@ -442,13 +516,15 @@ def _finalise(outcome: ReachabilityProfile) -> None:
 
 
 #: Categories whose faults were aborted rather than proven untestable, and so
-#: benefit from knowing which structural obstacle the search hit.
-PROFILED_SUBCLASSES = ("UC.AAB", "UO.AAB", "UC", "UO")
+#: benefit from knowing which structural obstacle the search hit. AU.SEQ is
+#: included for its measured sequential depth.
+PROFILED_SUBCLASSES = ("UC.AAB", "UO.AAB", "UC", "UO", "AU.SEQ")
 
 
 def profile_categories(selected: List[Any], fault_results: Iterable[Any],
                        connectivity: Any, constraints: Iterable[Any] = (),
-                       max_depth: int = DEFAULT_MAX_DEPTH) -> List[Any]:
+                       max_depth: int = DEFAULT_MAX_DEPTH,
+                       cache: Any = None) -> List[Any]:
     """Attach a :class:`ReachabilityProfile` to every aborted-fault category.
 
     Args:
@@ -457,6 +533,7 @@ def profile_categories(selected: List[Any], fault_results: Iterable[Any],
         connectivity: The ``ConnectivityModel`` for the design.
         constraints: Parsed constraint records.
         max_depth: Fan-out levels to explore.
+        cache: Optional ``AnalysisCache`` whose site profiles are reused.
 
     Returns:
         The same list, with ``reachability`` populated where applicable.
@@ -474,6 +551,9 @@ def profile_categories(selected: List[Any], fault_results: Iterable[Any],
     profiler = StructuralProfiler(
         connectivity, Attributor(connectivity, constraints),
         max_depth=max_depth)
+    use_cache = cache is not None and max_depth == DEFAULT_MAX_DEPTH
+    if use_cache:
+        cache.seed(profiler=profiler)
     for category in selected:
         if category.subclass_id not in targets:
             continue
@@ -486,4 +566,6 @@ def profile_categories(selected: List[Any], fault_results: Iterable[Any],
                     category.reachability.analysed,
                     category.reachability.dominant or "none",
                     100 * category.reachability.dominant_share)
+    if use_cache:
+        cache.collect(profiler=profiler)
     return selected

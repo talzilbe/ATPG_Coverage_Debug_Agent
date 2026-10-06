@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,8 @@ class AppSettings:
     last_faults: str = ""
     last_constraints: str = ""
     last_output_dir: str = ""
+    #: Last used Tessent report file/folder (report_statistics, analyze_fault).
+    last_tool_reports: str = ""
     skills: Dict[str, Any] = field(default_factory=dict)
     window_geometry: str = ""
     window_state: str = ""
@@ -56,6 +58,21 @@ class AppSettings:
     visualizer: Dict[str, Any] = field(default_factory=dict)
     #: Show the Logs / Skills / Custom Skills tabs (hidden for new users).
     show_advanced_tabs: bool = False
+    #: Most recent Analyze input sets, newest first.
+    recent_inputs: List[Dict[str, str]] = field(default_factory=list)
+    #: QSplitter.saveState() per splitter key, base64.
+    splitter_states: Dict[str, str] = field(default_factory=dict)
+    #: The guided first-run tour has been shown (or skipped).
+    tour_done: bool = False
+
+    def remember_inputs(self, entry: Dict[str, str], limit: int = 8) -> None:
+        """Put *entry* at the front of :attr:`recent_inputs`, without duplicates."""
+        key = (entry.get("netlist", ""), entry.get("faults", ""),
+               entry.get("constraints", ""))
+        rest = [e for e in self.recent_inputs
+                if (e.get("netlist", ""), e.get("faults", ""),
+                    e.get("constraints", "")) != key]
+        self.recent_inputs = [dict(entry)] + rest[: limit - 1]
 
     # ------------------------------------------------------------------
     # persistence

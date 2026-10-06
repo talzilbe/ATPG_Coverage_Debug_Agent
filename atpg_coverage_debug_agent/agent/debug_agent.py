@@ -528,6 +528,16 @@ Rules for tool use:
   `transcript` is what the tool printed. Output from Tessent is evidence from
   the tool itself -- cite it as such. A rejected request is an answer: do not
   resubmit the same script.
+- `tessent_collect_evidence` is the standard way to MEASURE what the offline
+  analysis estimated: one approved script runs report_statistics plus
+  analyze_fault on a spread sample of each selected category, and returns the
+  tool's own coverage figures and each category's measured verdict beside the
+  structural estimate. When a live session is attached, call it before you
+  recommend an expensive fix (test point, RTL change, long rerun) that rests
+  only on a structural estimate, and whenever the user asks whether the
+  analysis is right. Where the measured verdict differs from the estimate,
+  say so and follow the measurement; quote the tool's figures over the
+  computed ones. Keep `samples` small (default 5) -- analyze_fault is slow.
 """
 
 

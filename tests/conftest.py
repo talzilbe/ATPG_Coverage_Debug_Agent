@@ -19,6 +19,8 @@ SAMPLE_DIR = os.path.join(_ROOT, "sample_data")
 def _isolated_user_profile_dir(tmp_path, monkeypatch):
     """Keep a developer's imported launch profiles out of every test."""
     monkeypatch.setenv("ATPG_USER_PROFILE_DIR", str(tmp_path / "user_profiles"))
+    # A developer's real fix ledger would re-rank every plan under test.
+    monkeypatch.setenv("ATPG_FIX_HISTORY", str(tmp_path / "fix_history.json"))
 
 
 @pytest.fixture
