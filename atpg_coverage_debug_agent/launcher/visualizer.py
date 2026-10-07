@@ -521,6 +521,49 @@ def derive_paths_from_run_dir(profile: ToolProfile, run_dir: str,
     return found, warnings
 
 
+#: How far above the fault list a run directory is looked for.
+MAX_RUN_DIR_LEVELS = 6
+
+
+def guess_run_dir(profile: ToolProfile, faults_path: str) -> str:
+    """The ATPG run directory a fault list most likely came from.
+
+    First the directory the profile's fault-list pattern implies (for
+    ``faultlist/*.faults.gz`` that is two levels up); otherwise the nearest
+    ancestor in which the other design files are found; otherwise the fault
+    list's own directory. ``""`` when there is no fault list.
+    """
+    import fnmatch
+
+    faults_path = os.path.abspath((faults_path or "").strip()) \
+        if (faults_path or "").strip() else ""
+    if not faults_path:
+        return ""
+    ancestors = []
+    current = os.path.dirname(faults_path)
+    for _ in range(MAX_RUN_DIR_LEVELS):
+        ancestors.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    entry = next((e for e in profile.commands.load if e.key == "faults"), None)
+    if entry is not None and entry.run_dir_glob:
+        for candidate in ancestors:
+            rel = os.path.relpath(faults_path, candidate)
+            if fnmatch.fnmatch(rel, entry.run_dir_glob):
+                return candidate
+    others = [e for e in profile.commands.load
+              if e.key != "faults" and e.run_dir_glob]
+    if others:
+        import glob
+        for candidate in ancestors:
+            if any(glob.glob(os.path.join(candidate, e.run_dir_glob))
+                   for e in others):
+                return candidate
+    return ancestors[0]
+
+
 def fault_inspect_commands(profile: ToolProfile, fault_path: str,
                            stuck_value: str = "") -> List[str]:
     """Render the profile's fault-inspection commands for one fault."""

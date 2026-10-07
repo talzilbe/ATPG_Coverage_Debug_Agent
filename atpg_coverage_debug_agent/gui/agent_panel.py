@@ -67,6 +67,7 @@ from ..config import credentials
 from ..launcher import agent_bridge
 from ..launcher.live_session import LiveSessionError
 from ..skills.base import AnalysisContext
+from . import theme
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,10 @@ class AgentPanel(QWidget):
 
     #: Internal: a Tessent script finished on its worker thread.
     _tessent_done = Signal(dict)
+    #: A full agent run delivered its answer.
+    run_completed = Signal()
+    #: The start-up sign-in check finished: (ok, message).
+    auto_auth_finished = Signal(bool, str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -368,6 +373,7 @@ class AgentPanel(QWidget):
         self._thread: Optional[QThread] = None
         self._worker = None
         self._auth_proc = None
+        self._auth_auto = False
         self._auth_buf: list = []
         self._session_id: Optional[str] = None
         self._chat_messages: list = []
@@ -1173,6 +1179,8 @@ class AgentPanel(QWidget):
             state = self._auth_state
             detail = {"ok": "signed in", "fail": "not signed in",
                       "unknown": "not checked yet"}[state]
+            if self._auth_auto and self._auth_proc is not None:
+                detail = "checking…"
             items.append(("Sign-in", state, detail,
                           "auth_tab" if state == "fail" else "check_auth"))
             model = self.cli_model_combo.currentText().strip() or "auto"
@@ -1222,7 +1230,8 @@ class AgentPanel(QWidget):
                 first_gap = action
         head = ("<b style='color:#1a7f37'>Ready to run.</b> " if first_gap is None
                 else "<b>Before you run:</b> ")
-        self.readiness_label.setText(head + " &nbsp;·&nbsp; ".join(parts))
+        theme.set_label(self.readiness_label,
+                        head + " &nbsp;·&nbsp; ".join(parts))
         labels = {"browse_cli": "Find the CLI…", "check_auth": "Check sign-in",
                   "auth_tab": "Sign in…", "edit_connection": "Edit connection",
                   "need_report": "How?",
@@ -1330,6 +1339,24 @@ class AgentPanel(QWidget):
             self.status_label.setText(
                 f"Regression mode: baseline '{label}' ({n} faults) loaded — "
                 "ask the agent what changed, or run agentic mode.")
+
+    def refresh_theme(self) -> None:
+        """Re-render the answer, the chat and the readiness line."""
+        if self._last_response:
+            self._render_response(keep_scroll=True)
+        if self._chat_turns or self._chat_stub:
+            self._rebuild_chat_view()
+        self.refresh_readiness()
+
+    def readiness_summary(self) -> tuple:
+        """(ready, short text, tooltip) for the status bar."""
+        items = self.readiness_items()
+        tip = "\n".join(f"{label}: {detail}" for label, _s, detail, _a in items)
+        gaps = [label for label, state, _d, _a in items
+                if state in ("fail", "unknown")]
+        if not gaps:
+            return True, "Agent: ready", tip
+        return False, f"Agent: check {gaps[0].lower()}", tip
 
     def clear(self) -> None:
         self._report = None
@@ -1985,8 +2012,8 @@ class AgentPanel(QWidget):
             self.approve_tessent(auto=True)
 
     def _on_allow_all_toggled(self, checked: bool) -> None:
-        self.tessent_allow_all_check.setStyleSheet(
-            "color: #c0392b; font-weight: bold;" if checked else "")
+        theme.set_css(self.tessent_allow_all_check,
+                      "color: #c0392b; font-weight: bold;" if checked else "")
         self.status_label.setText(
             "Tessent commands from the agent now run WITHOUT approval."
             if checked else "Tessent commands from the agent need approval again.")
@@ -2371,6 +2398,7 @@ class AgentPanel(QWidget):
         # The backend works now; give its settings' space to the answer.
         if not self._connection_collapsed:
             self.set_connection_collapsed(True)
+        self.run_completed.emit()
         # Seed the follow-up conversation with this diagnosis.
         self._chat_view_reset()
         self._chat_stub = True
@@ -2564,7 +2592,8 @@ class AgentPanel(QWidget):
         # append() starts a new paragraph; insertHtml would merge the fragment
         # into the block that is already at the cursor, running consecutive
         # turns together on one line.
-        browser.append(html_str)
+        theme.apply_document_css(browser)
+        browser.append(theme.adapt(html_str))
         browser.moveCursor(QTextCursor.End)
 
     def _set_response(self, text: str) -> None:
@@ -2596,7 +2625,8 @@ class AgentPanel(QWidget):
                    if (text or "").strip() else "")
         bar = self.response_view.verticalScrollBar()
         pos = bar.value()
-        self.response_view.setHtml(
+        theme.set_html(
+            self.response_view,
             f'<div dir="ltr" style="text-align:left;direction:ltr;">'
             f'{toolbar}{body}</div>')
         if keep_scroll:
@@ -2992,6 +3022,48 @@ class AgentPanel(QWidget):
              "--no-remote", "--log-level", "error"],
             action="check")
 
+    #: Seconds before an automatic start-up check is given up.
+    AUTO_AUTH_TIMEOUT_S = 90
+
+    def has_github_token(self) -> bool:
+        """A token is saved, pasted, or set in the environment."""
+        if self.auth_token_edit.text().strip():
+            return True
+        return any(os.environ.get(name, "").strip() for name in
+                   ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"))
+
+    def auto_check_auth(self) -> bool:
+        """Check sign-in in the background when a token is already there.
+
+        Returns True when a check was started. Nothing happens for the HTTP
+        backend, without a token, or without a usable CLI.
+        """
+        if (self._current_backend() != "cli" or self._auth_proc is not None
+                or not self.has_github_token()):
+            return False
+        exe = self.cli_path_edit.text().strip()
+        if not exe or not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+            self.auto_auth_finished.emit(
+                False, "A GitHub token is saved, but the Copilot CLI was not "
+                       "found — set its path on the AI Debug Agent tab.")
+            return False
+        self._auth_auto = True
+        self.on_check_auth()
+        if self._auth_proc is None:
+            self._auth_auto = False
+            return False
+        proc = self._auth_proc
+        QTimer.singleShot(self.AUTO_AUTH_TIMEOUT_S * 1000,
+                          lambda: self._auto_auth_timeout(proc))
+        self.refresh_readiness()
+        return True
+
+    def _auto_auth_timeout(self, proc) -> None:
+        if self._auth_proc is proc and self._auth_auto:
+            self.auth_log.appendPlainText(
+                f"[timeout] no answer after {self.AUTO_AUTH_TIMEOUT_S}s")
+            proc.kill()
+
     def on_device_login(self) -> None:
         exe = self._cli_exe_or_warn()
         if exe is None:
@@ -3103,6 +3175,14 @@ class AgentPanel(QWidget):
         self.auth_login_btn.setEnabled(True)
         self.auth_check_btn.setEnabled(True)
         self.auth_cancel_btn.setEnabled(False)
+        if self._auth_auto and action == "check":
+            self._auth_auto = False
+            self.refresh_readiness()
+            self.auto_auth_finished.emit(
+                ok, "Copilot sign-in confirmed — the AI agent is ready to run."
+                if ok else
+                "Copilot sign-in failed with the saved GitHub token "
+                f"(exit {code}). Open the Authentication tab to fix it.")
 
     def on_copy_prompt(self) -> None:
         QApplication.clipboard().setText(self.prompt_view.toPlainText())

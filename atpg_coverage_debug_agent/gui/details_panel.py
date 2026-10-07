@@ -7,6 +7,7 @@ from typing import Optional
 from PySide6.QtWidgets import QTextBrowser, QWidget, QVBoxLayout
 
 from ..models import FaultAnalysisResult
+from . import theme
 
 #: Human labels for the tri-state scan verdict. "unknown" is never softened
 #: into "non-scan" -- that substitution is what produced a wrong published
@@ -32,7 +33,8 @@ class DetailsPanel(QWidget):
 
     def clear_details(self) -> None:
         """Reset to the placeholder message."""
-        self._browser.setHtml(
+        theme.set_html(
+            self._browser,
             "<i>Select a row in the Coverage Loss table to see details.</i>"
         )
 
@@ -94,7 +96,7 @@ class DetailsPanel(QWidget):
             html.append(_ul(r.mapping.candidates))
         html.append("<h3>Recommended next step</h3>")
         html.append(f"<p>{_esc(r.recommended_step)}</p>")
-        self._browser.setHtml("".join(html))
+        theme.set_html(self._browser, "".join(html))
 
 
 def _row(label: str, value: str) -> str:

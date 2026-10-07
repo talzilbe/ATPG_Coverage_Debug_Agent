@@ -17,7 +17,6 @@ import logging
 from typing import Any, List, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -38,6 +37,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from . import theme
+from .theme import qcolor as QColor
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +250,7 @@ class TriagePanel(QWidget):
 
         self.category_detail = QTextBrowser()
         self.category_detail.setOpenExternalLinks(False)
-        self.category_detail.setHtml(_EMPTY_HTML)
+        theme.set_html(self.category_detail, _EMPTY_HTML)
         splitter.addWidget(self.category_detail)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
@@ -324,7 +326,7 @@ class TriagePanel(QWidget):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         self.fix_detail = QTextBrowser()
-        self.fix_detail.setHtml(_EMPTY_HTML)
+        theme.set_html(self.fix_detail, _EMPTY_HTML)
         right_layout.addWidget(self.fix_detail, 1)
 
         row = QHBoxLayout()
@@ -380,10 +382,10 @@ class TriagePanel(QWidget):
         self.totals_label.setText(
             "Run an analysis to see the coverage breakdown.")
         self.category_table.setRowCount(0)
-        self.category_detail.setHtml(_EMPTY_HTML)
+        theme.set_html(self.category_detail, _EMPTY_HTML)
         self.cluster_tree.clear()
         self.fix_list.clear()
-        self.fix_detail.setHtml(_EMPTY_HTML)
+        theme.set_html(self.fix_detail, _EMPTY_HTML)
         self.copy_commands_btn.setEnabled(False)
         self.export_categories_btn.setEnabled(False)
         self._set_empty(True)
@@ -437,7 +439,7 @@ class TriagePanel(QWidget):
         if rows:
             self.category_table.selectRow(0)
         else:
-            self.category_detail.setHtml(_html_page(
+            theme.set_html(self.category_detail, _html_page(
                 "<p>No coverage-loss categories were found.</p>"))
 
     def _selected_category_id(self) -> Optional[str]:
@@ -454,8 +456,8 @@ class TriagePanel(QWidget):
 
     def _on_category_selected(self) -> None:
         subclass_id = self._selected_category_id()
-        self.category_detail.setHtml(
-            _html_page(self._category_html(subclass_id)))
+        theme.set_html(self.category_detail,
+                       _html_page(self._category_html(subclass_id)))
 
     def _category_html(self, subclass_id: Optional[str]) -> str:
         stats = getattr(self._report, "statistics", None)
@@ -736,7 +738,7 @@ class TriagePanel(QWidget):
         if self._recommendations:
             self.fix_list.setCurrentRow(0)
         else:
-            self.fix_detail.setHtml(_html_page(
+            theme.set_html(self.fix_detail, _html_page(
                 "<p>No fix proposals — there is no coverage loss to act on.</p>"))
             self.copy_commands_btn.setEnabled(False)
 
@@ -749,11 +751,11 @@ class TriagePanel(QWidget):
     def _on_fix_selected(self, _row: int) -> None:
         rec = self._current_recommendation()
         if rec is None:
-            self.fix_detail.setHtml(_EMPTY_HTML)
+            theme.set_html(self.fix_detail, _EMPTY_HTML)
             self.copy_commands_btn.setEnabled(False)
             return
         self.copy_commands_btn.setEnabled(bool(rec.fix.commands))
-        self.fix_detail.setHtml(_html_page(self._fix_html(rec)))
+        theme.set_html(self.fix_detail, _html_page(self._fix_html(rec)))
 
     def _fix_html(self, rec: Any) -> str:
         parts = [f"<h3>{_esc(rec.title)}</h3>"]

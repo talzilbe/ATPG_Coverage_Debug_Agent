@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
+
 from ..skills.base import SkillBase, SkillResult
 from ..skills.manager import SkillManager
 
@@ -256,14 +258,11 @@ class SkillResultsPane(QWidget):
         self._browser.setOpenExternalLinks(False)
         layout.addWidget(self._browser)
 
-        self._browser.setHtml(
-            "<i>Run an analysis to see Skill Results here.</i>"
-        )
+        self.clear()
 
     def clear(self) -> None:
-        self._browser.setHtml(
-            "<i>Run an analysis to see Skill Results here.</i>"
-        )
+        theme.set_html(self._browser,
+                       "<i>Run an analysis to see Skill Results here.</i>")
 
     def show_skill_content(self, skill) -> None:
         """Render the selected *skill*'s content / guidance."""
@@ -300,12 +299,13 @@ class SkillResultsPane(QWidget):
             else:
                 parts.append("<p><i>This skill has no extra content; it runs "
                              "structural analysis logic.</i></p>")
-        self._browser.setHtml("".join(parts))
+        theme.set_html(self._browser, "".join(parts))
 
     def show_results(self, results: List[SkillResult]) -> None:
         """Render *results* into the browser widget."""
         if not results:
-            self._browser.setHtml("<p><i>No skills were executed.</i></p>")
+            theme.set_html(self._browser,
+                           "<p><i>No skills were executed.</i></p>")
             return
 
         html = ["<h2>Skill Results</h2>"]
@@ -372,7 +372,7 @@ class SkillResultsPane(QWidget):
 
             html.append("<hr/>")
 
-        self._browser.setHtml("".join(html))
+        theme.set_html(self._browser, "".join(html))
 
 
 class SkillsPanel(QWidget):

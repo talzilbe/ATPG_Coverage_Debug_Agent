@@ -64,6 +64,14 @@ class AppSettings:
     splitter_states: Dict[str, str] = field(default_factory=dict)
     #: The guided first-run tour has been shown (or skipped).
     tour_done: bool = False
+    #: "light" or "dark".
+    theme: str = "light"
+    #: Points added to the application font size (View -> Zoom).
+    font_delta: int = 0
+    #: The Getting Started checklist was dismissed.
+    getting_started_hidden: bool = False
+    #: Getting Started steps ever completed (ids).
+    getting_started_done: List[str] = field(default_factory=list)
 
     def remember_inputs(self, entry: Dict[str, str], limit: int = 8) -> None:
         """Put *entry* at the front of :attr:`recent_inputs`, without duplicates."""

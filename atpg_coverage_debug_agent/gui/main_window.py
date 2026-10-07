@@ -15,9 +15,10 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
-from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QCloseEvent,
     QDesktopServices,
     QKeySequence,
@@ -46,8 +47,14 @@ from .details_panel import DetailsPanel
 from .skills_panel import SkillsPanel
 from .agent_panel import AgentPanel
 from .custom_skills_panel import CustomSkillsPanel
+from .command_palette import FAULT_PREFIX, CommandPalette, PaletteEntry, rank_entries
 from .empty_state import EmptyState
-from .input_check import CHECKS, ERROR, InputCheck
+from .find_bar import FindBar
+from .getting_started import GettingStarted
+from .input_check import CHECKS, ERROR, OK, WARN, InputCheck, classify_file
+from .preferences import PreferencesDialog
+from . import shortcuts, theme
+from .toast import Toast
 from .triage_panel import TriagePanel
 from .visualizer_panel import VisualizerPanel
 from .workers import start_worker, start_multi_worker
@@ -109,8 +116,9 @@ _WELCOME_HTML = """
 <h2 style="color:#0b5394;">ATPG Coverage Debug &mdash; getting started</h2>
 <ol style="font-size: 14px; line-height: 1.7;">
   <li>Pick a <b>Netlist</b> and a <b>Fault list</b> at the top
-      (constraints are optional).</li>
-  <li>Click the blue <b>&#9654; Analyze</b> button.</li>
+      (constraints are optional) &mdash; or simply <b>drag the files onto
+      this window</b>; each one lands in the right box.</li>
+  <li>Click the blue <b>&#9654; Analyze</b> button (<b>Ctrl+R</b>).</li>
   <li>Read this <b>Summary</b> tab: the box at the top shows the coverage and
       where to start.</li>
   <li>Work the <b>Triage &amp; Fix Plan</b> tab, then drill into single
@@ -118,8 +126,9 @@ _WELCOME_HTML = """
   <li>Optionally ask the <b>AI Debug Agent</b> for an explanation.</li>
 </ol>
 <p style="color:#555;">New here? Click <b>Try the demo data</b> above to load
-a small example design. <b>Help &rarr; User Guide</b> explains every screen;
-<b>View</b> brings back the advanced tabs (Logs, Skills, Custom Skills).</p>
+a small example design. <b>Ctrl+Shift+P</b> finds any command by name,
+<b>F1</b> opens the User Guide (with every keyboard shortcut), and
+<b>View &rarr; Theme</b> switches between Light and Dark.</p>
 </body>
 """
 
@@ -1127,9 +1136,14 @@ viewer appears, for anything you want to type yourself.</p>
     it. Change it only if told to; <b class="k">Use site default</b> puts the
     shared list back. Must be <code>port@host</code>, colon separated.</td></tr>
 <tr><td><b class="k">Design inputs</b></td><td>Either type each path, or switch
-    to <b>Derive from an ATPG run directory</b> and press <b class="k">Fill
-    paths</b> &mdash; the profile's search patterns locate the ICL, the flat
-    model and the fault list. Every derived path stays editable, and an
+    to <b>Derive from an ATPG run directory</b>. The run directory starts as
+    the one the analysed fault list came from (for
+    <code>&lt;run&gt;/faultlist/x.faults.gz</code> that is
+    <code>&lt;run&gt;</code>) and the paths are filled at once &mdash; the
+    profile's search patterns locate the ICL, the flat model and the fault
+    list. If the ICL or flat model is not there, the status line says which is
+    missing; type the run directory that holds them and press
+    <b class="k">Fill paths</b>. Every derived path stays editable, and an
     ambiguous match is reported rather than chosen silently.</td></tr>
 <tr><td><b class="k">Use the fault list from the analysis inputs</b></td>
     <td>On by default, so the viewer loads exactly the faults this report was
@@ -1276,6 +1290,129 @@ in the session file, printed in the Markdown and HTML reports under
 </body></html>
 """
 
+_EVERYDAY_HELP = """
+<h2>Everyday helpers &mdash; appearance, keyboard and shortcuts</h2>
+<p>Everything in this section is optional; it exists so the tool is quick to
+learn the first time and quick to drive every day after that.</p>
+
+<a name="checklist"></a><h3>Getting Started checklist</h3>
+<p>Until you have done each step once, the top of the <b>Summary</b> tab shows a
+five-step checklist: <i>pick the inputs &rarr; Analyze &rarr; review Triage
+&amp; Fix Plan &rarr; ask the AI agent &rarr; open the design in Tessent
+Visualizer</i>. Each step ticks itself when you do it, and its button takes you
+straight there. <b>Hide checklist</b> removes it; <b>Help &rarr; Getting Started
+Checklist</b> brings it back. Progress is remembered between sessions.</p>
+
+<a name="dragdrop"></a><h3>Drag and drop</h3>
+<p>Drop files from a file manager anywhere on the window. Each file is
+recognised by its <i>content</i>: a Verilog netlist fills <b>Netlist</b>, a
+Tessent fault list fills <b>Fault list</b>, a <code>.do</code> /
+<code>.tcl</code> dofile fills <b>Constraints</b>, a folder fills <b>Output
+dir</b>, and a report saved with <b>Save Report</b> is loaded directly. A
+notice in the corner says where every file went, and names any file it could
+not recognise.</p>
+
+<a name="palette"></a><h3>Command palette</h3>
+<p><code>Ctrl+Shift+P</code> (or <b>Edit &rarr; Command Palette</b>) opens a
+search box over every menu command, every tab and every recent analysis.
+Type a few letters of what you want &mdash; <i>exp csv</i>, <i>dark</i>,
+<i>triage</i> &mdash; and press <b>Enter</b>. Start with <code>@</code> to
+search the fault paths of the current report instead: <i>@u_tdr</i> jumps to
+that row of the Coverage Loss Table.</p>
+
+<a name="find"></a><h3>Find</h3>
+<p><code>Ctrl+F</code> does the natural thing for the tab you are on: on the
+<b>Coverage Loss Table</b> it puts the cursor in the filter box; on the
+<b>Summary</b>, the <b>Triage</b> Categories / Fix Plan details and the
+<b>AI agent</b>'s answer it opens a find bar above the tabs (<b>Enter</b> next
+match, <b>Shift+Enter</b> previous, <b>Esc</b> close).</p>
+
+<a name="undo"></a><h3>Undo a waiver</h3>
+<p>Every waiver &mdash; <b>Edit report</b>, or <i>Exclude this fault</i> from
+the table's right-click menu &mdash; can be taken back with
+<code>Ctrl+Z</code> (<b>Edit &rarr; Undo Last Waiver</b>), or with the
+<b>Undo</b> button on the notice that appears. The last 20 are kept until the
+next Analyze or Load Report.</p>
+
+<a name="status"></a><h3>Status bar and notices</h3>
+<p>When the application starts and a GitHub token is already available
+(saved on the Authentication tab, or in <code>COPILOT_GITHUB_TOKEN</code> /
+<code>GH_TOKEN</code> / <code>GITHUB_TOKEN</code>), the Copilot sign-in is
+checked in the background, so the AI agent is ready to run without pressing
+<b>Check authentication</b>. The agent item in the status bar shows the
+result; if the check fails, a notice says so and its <b>Fix sign-in</b>
+button opens the Authentication tab.</p>
+<p>The right end of the status bar always shows the loaded design with its
+coverage-loss count and test coverage, whether the AI agent is ready to run,
+and whether a Tessent Visualizer session is live. Click any of them to go to
+that tab. Short confirmations (files assigned, waiver applied, report loaded)
+appear as a notice in the bottom-right corner that fades on its own; only
+real errors still open a dialog. When a long analysis finishes while you are
+in another window, the task-bar entry flashes.</p>
+
+<a name="appearance"></a><h3>Light and Dark theme, text size</h3>
+<p><b>View &rarr; Theme</b> chooses <b>Light</b> or <b>Dark</b> (modelled on
+VS&nbsp;Code's Dark+); <code>Ctrl+K, Ctrl+T</code> and the &#9790;/&#9728;
+button in the status bar switch between them. Every view follows the theme,
+including the Summary report, this guide and the agent's answers.
+<b>Exported and browser reports always stay light</b>, so a file you share
+looks the same for everyone. <code>Ctrl+=</code> / <code>Ctrl+-</code> make
+the text larger or smaller and <code>Ctrl+0</code> resets it. Both choices are
+remembered per user.</p>
+
+<a name="preferences"></a><h3>Preferences</h3>
+<p><b>Edit &rarr; Preferences&hellip;</b> (<code>Ctrl+,</code>) collects the
+per-user choices in one dialog: theme, text size, auto-save of the report,
+the advanced tabs, the Getting Started checklist and whether the guided tour
+runs again after the next analysis. They are stored in
+<code>~/.atpg_debug_agent/settings.json</code>.</p>
+
+<a name="help_buttons"></a><h3>Help for the screen you are on</h3>
+<p>The <b>?</b> at the right end of the tab bar opens this guide at the
+section for the current tab; the <b>?</b> buttons beside the input files and
+the action buttons do the same for those.</p>
+
+<a name="shortcuts"></a><h3>Keyboard shortcuts &mdash; the complete map</h3>
+<p>Every shortcut the application defines. The menus show the same keys next
+to each command.</p>
+<!--SHORTCUT_TABLE-->
+"""
+
+#: User Guide section anchors, inserted before these headings.
+_HELP_ANCHORS = [
+    ("<h2>Finding your way around", "findyourway"),
+    ("<h2>1. Input files", "inputs"),
+    ("<h2>2. Action buttons", "actions"),
+    ("<h3>Summary</h3>", "summary"),
+    ("<h3>Triage &amp; Fix Plan</h3>", "triage"),
+    ("<h3>Coverage Loss Table</h3>", "table"),
+    ("<h3>Logs / Warnings</h3>", "logs"),
+    ("<h3>Skills</h3>", "skills"),
+    ("<h2>4. Edit Report", "edit"),
+    ("<h2>6. AI Debug Agent", "agent"),
+    ("<h2>7. Tessent Visualizer", "visualizer"),
+]
+
+
+def _build_help_html(base: str) -> str:
+    for heading, name in _HELP_ANCHORS:
+        base = base.replace(heading, f'<a name="{name}"></a>{heading}', 1)
+    extra = _EVERYDAY_HELP.replace("<!--SHORTCUT_TABLE-->",
+                                   shortcuts.help_table_html())
+    marker = '<a name="inputs"></a>'
+    return base.replace(marker, '<a name="everyday"></a>' + extra + marker, 1)
+
+
+_HELP_HTML = _build_help_html(_HELP_HTML)
+
+#: Help anchor for each tab title (the "?" in the tab bar).
+_TAB_HELP = {
+    "Summary": "summary", "Triage & Fix Plan": "triage",
+    "Coverage Loss Table": "table", "AI Debug Agent": "agent",
+    "Tessent Visualizer": "visualizer", "Logs / Warnings": "logs",
+    "Skills": "skills", "Custom Skills": "skills",
+}
+
 
 def _fmt_secs(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
@@ -1387,6 +1524,8 @@ class _QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
 
 
 class _FilePicker(QWidget):
+    checked = Signal()
+
     def __init__(self, label: str, *, directory: bool = False,
                  check=None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1432,11 +1571,13 @@ class _FilePicker(QWidget):
         except Exception as exc:  # noqa: BLE001 - a check must never break the form
             result = InputCheck("warn", f"could not check: {exc}")
         self.last_check = result
-        self.status.setText(
+        theme.set_label(
+            self.status,
             f"<span style='color:{result.colour}; font-weight:bold;'>"
             f"{result.symbol}</span> <span style='color:{result.colour};'>"
             f"{_html_escape(result.message)}</span>")
         self.status.setToolTip(result.message)
+        self.checked.emit()
         return result
 
     def path(self) -> str:
@@ -1479,11 +1620,24 @@ class MainWindow(QMainWindow):
         self._skill_manager = SkillManager()
         if self._settings.skills:
             self._skill_manager.from_config(self._settings.skills)
+        # Earlier states of the current report, newest last, for Ctrl+Z.
+        self._undo_stack: List[AnalysisReport] = []
+        self._settings.font_delta = theme.clamp_font_delta(
+            getattr(self._settings, "font_delta", 0))
+        theme.apply_app(QApplication.instance(),
+                        getattr(self._settings, "theme", theme.LIGHT),
+                        self._settings.font_delta)
 
         self._build_ui()
         self._build_menu()
+        self._build_status_chips()
         self._restore_paths()
         self._refresh_recent_menus()
+        self.toast = Toast(self)
+        self.command_palette = CommandPalette(self, self.palette_entries)
+        self.setAcceptDrops(True)
+        self._init_getting_started()
+        theme.refresh(self)
 
     def _restore_paths(self) -> None:
         s = self._settings
@@ -1559,6 +1713,8 @@ class MainWindow(QMainWindow):
         self.partitions_toggle.toggled.connect(self._set_partitions_visible)
         toggle_row.addWidget(self.partitions_toggle)
         toggle_row.addStretch(1)
+        toggle_row.addWidget(self._help_button(
+            "inputs", "What each input box expects, and how they are checked"))
         inputs_layout.addLayout(toggle_row)
 
         # --- Partition queue (analyze several partitions together) ---
@@ -1691,6 +1847,8 @@ class MainWindow(QMainWindow):
         self.autosave_check.toggled.connect(self._save_settings)
         btn_row.addWidget(self.autosave_check)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._help_button(
+            "actions", "What each of these buttons does"))
         outer.addLayout(btn_row)
         self._set_export_enabled(False)
 
@@ -1718,7 +1876,14 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tour_bar = _TourBar(self)
         outer.addWidget(self.tour_bar)
-        self.tabs.addTab(self._build_summary_tab(), "Summary")
+        self.find_bar = FindBar()
+        outer.addWidget(self.find_bar)
+        tab_help = self._help_button(
+            "", "Open the User Guide at the section for this tab (F1 opens "
+                "it from the top)", slot=self.show_help_for_current_tab)
+        self.tabs.setCornerWidget(tab_help, Qt.TopRightCorner)
+        self._summary_tab = self._build_summary_tab()
+        self.tabs.addTab(self._summary_tab, "Summary")
         self.triage_panel = TriagePanel()
         self.triage_panel.empty_action_requested.connect(self._on_empty_action)
         self.triage_panel.fault_referenced.connect(self._focus_fault_in_table)
@@ -1783,6 +1948,12 @@ class MainWindow(QMainWindow):
             lambda *_: self.agent_panel.refresh_readiness())
         self.tabs.currentChanged.connect(
             lambda *_: self.agent_panel.refresh_readiness())
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.agent_panel.run_completed.connect(
+            lambda: self._gs_mark("agent"))
+        self.agent_panel.auto_auth_finished.connect(self._on_auto_auth)
+        self.visualizer_panel.launched.connect(
+            lambda: self._gs_mark("visualizer"))
         self._advanced_tabs = [self._logs_tab, self.skills_panel,
                                self.custom_skills_panel]
         self._set_advanced_tabs_visible(
@@ -1816,6 +1987,12 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.open_browser_btn)
         layout.addLayout(bar)
 
+        self.getting_started = GettingStarted()
+        self.getting_started.action_requested.connect(self._on_gs_action)
+        self.getting_started.hide_requested.connect(
+            lambda: self.set_checklist_visible(False))
+        layout.addWidget(self.getting_started)
+
         # At-a-glance results above the full report.
         self.dashboard = QLabel("")
         self.dashboard.setWordWrap(True)
@@ -1835,7 +2012,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _set_summary_html(self, html: str) -> None:
-        self.summary_view.setHtml(html)
+        theme.set_html(self.summary_view, html)
 
     def _clear_summary(self) -> None:
         self.dashboard.setVisible(False)
@@ -1914,37 +2091,95 @@ class MainWindow(QMainWindow):
         self.logs_view.setReadOnly(True)
         return self.logs_view
 
-    def _show_help(self) -> None:
-        """Open the user guide in a scrollable dialog."""
+    def _help_button(self, anchor: str, tip: str, slot=None) -> QToolButton:
+        """A small "?" that opens the User Guide at *anchor*."""
+        btn = QToolButton()
+        btn.setText("?")
+        btn.setAutoRaise(True)
+        btn.setToolTip(tip)
+        btn.setProperty("help_anchor", anchor)
+        btn.clicked.connect(slot or partial(self.show_help, anchor))
+        return btn
+
+    def show_help_for_current_tab(self) -> None:
+        title = self.tabs.tabText(self.tabs.currentIndex()).replace("&&", "&")
+        self.show_help(_TAB_HELP.get(title, ""))
+
+    def show_help(self, anchor: str = "") -> None:
+        """Open the user guide in a scrollable dialog, at *anchor* if given."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Help — User Guide")
-        dlg.resize(820, 720)
+        dlg.resize(860, 760)
         v = QVBoxLayout(dlg)
         view = QTextBrowser()
         view.setOpenExternalLinks(True)
-        view.setHtml(_HELP_HTML)
+        theme.set_html(view, _HELP_HTML)
         view.moveCursor(QTextCursor.Start)
         v.addWidget(view, 1)
+        if anchor:
+            QTimer.singleShot(0, lambda: view.scrollToAnchor(anchor))
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
         v.addWidget(buttons)
         dlg.exec()
 
+    def _action(self, text: str, slot, shortcut_id: str = "",
+                menu: Optional[QMenu] = None, extra_keys=()) -> QAction:
+        """A window-wide action; keys come from :mod:`shortcuts`."""
+        act = QAction(text, self)
+        if shortcut_id:
+            seqs = [QKeySequence(shortcuts.keys(shortcut_id))]
+            seqs += [QKeySequence(k) for k in extra_keys]
+            act.setShortcuts(seqs)
+            act.setShortcutContext(Qt.WindowShortcut)
+        act.triggered.connect(slot)
+        if menu is not None:
+            menu.addAction(act)
+        else:
+            self.addAction(act)
+        return act
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
+        self.analyze_action = self._action(
+            "Analyze", self.on_analyze, "analyze", file_menu)
+        self.cancel_action = self._action(
+            "Cancel Analysis", self.on_cancel, "cancel", file_menu)
+        self.cancel_action.setEnabled(False)
+        file_menu.addSeparator()
+        self._action("Load Report…", self.on_load_report, "load_report",
+                     file_menu)
+        self.save_report_action = self._action(
+            "Save Report…", self.on_save_report, "save_report", file_menu)
         self.file_recent_menu = file_menu.addMenu("Recent Analyses")
         file_menu.addSeparator()
-        export_md = QAction("Export Markdown Report…", self)
-        export_md.triggered.connect(self.on_export_md)
-        file_menu.addAction(export_md)
-        export_csv = QAction("Export CSV…", self)
-        export_csv.triggered.connect(self.on_export_csv)
-        file_menu.addAction(export_csv)
+        self.md_action.setText("Export Markdown Report…")
+        self.md_action.setShortcut(QKeySequence(shortcuts.keys("export_md")))
+        file_menu.addAction(self.md_action)
+        self.csv_action.setText("Export CSV…")
+        self.csv_action.setShortcut(QKeySequence(shortcuts.keys("export_csv")))
+        file_menu.addAction(self.csv_action)
         file_menu.addSeparator()
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
+        self._action("Quit", self.close, "quit", file_menu)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+        self.undo_action = self._action(
+            "Undo Last Waiver", self.undo_exclusion, "undo", edit_menu)
+        self.undo_action.setEnabled(False)
+        edit_menu.addSeparator()
+        self._action("Find…", self.on_find, "find", edit_menu)
+        self.palette_action = self._action(
+            "Command Palette…", self.open_command_palette, "palette",
+            edit_menu)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.edit_action)
+        edit_menu.addAction(self.compare_action)
+        edit_menu.addAction(self.tool_reports_action)
+        edit_menu.addAction(self.clear_action)
+        edit_menu.addSeparator()
+        self._action("Preferences…", self.on_preferences, "preferences",
+                     edit_menu)
 
         skills_menu = self.menuBar().addMenu("&Skills")
         enable_all = QAction("Enable All Skills", self)
@@ -1961,24 +2196,22 @@ class MainWindow(QMainWindow):
         self._build_view_menu()
 
         help_menu = self.menuBar().addMenu("&Help")
-        user_guide = QAction("User Guide…", self)
-        user_guide.setShortcut(QKeySequence("F1"))
-        user_guide.triggered.connect(self._show_help)
-        help_menu.addAction(user_guide)
-        demo = QAction("Try the Demo Data", self)
+        self._action("User Guide…", self.show_help, "help", help_menu)
+        self._action("Keyboard Shortcuts…",
+                     partial(self.show_help, "shortcuts"), menu=help_menu)
+        self._action("Getting Started Checklist",
+                     lambda: self.set_checklist_visible(True), menu=help_menu)
+        demo = self._action("Try the Demo Data", self.on_try_demo,
+                            menu=help_menu)
         demo.setEnabled(_demo_inputs() is not None)
-        demo.triggered.connect(self.on_try_demo)
-        help_menu.addAction(demo)
-        tour = QAction("Show the Guided Tour", self)
-        tour.triggered.connect(self.start_tour)
-        help_menu.addAction(tour)
+        self._action("Show the Guided Tour", self.start_tour, menu=help_menu)
 
     def _build_view_menu(self) -> None:
-        """Add window-sizing actions that do not rely on the title bar.
+        """Tabs, theme, text size and window-sizing actions.
 
         Some remote X sessions have a window manager whose maximise button
-        does nothing. These actions drive the window directly through Qt, so
-        they work regardless.
+        does nothing. The sizing actions drive the window directly through
+        Qt, so they work regardless.
         """
         view_menu = self.menuBar().addMenu("&View")
 
@@ -1986,10 +2219,28 @@ class MainWindow(QMainWindow):
         for n, title in enumerate(("Summary", "Triage & Fix Plan",
                                    "Coverage Loss Table", "AI Debug Agent",
                                    "Tessent Visualizer"), start=1):
-            act = QAction(title.replace("&", "&&"), self)
-            act.setShortcut(QKeySequence(f"Ctrl+{n}"))
-            act.triggered.connect(partial(self._switch_to_tab, title))
-            goto.addAction(act)
+            self._action(title.replace("&", "&&"),
+                         partial(self._switch_to_tab, title), f"tab{n}", goto)
+
+        theme_menu = view_menu.addMenu("Theme")
+        self.theme_group = QActionGroup(self)
+        self.theme_actions = {}
+        for label, name in (("Light", theme.LIGHT), ("Dark", theme.DARK)):
+            act = QAction(label, self, checkable=True)
+            act.setChecked(theme.current() == name)
+            act.triggered.connect(partial(self.set_theme, name))
+            self.theme_group.addAction(act)
+            theme_menu.addAction(act)
+            self.theme_actions[name] = act
+        self._action("Toggle Light / Dark Theme", self.toggle_theme,
+                     "toggle_theme", view_menu)
+        self._action("Zoom In (larger text)", lambda: self.change_font(+1),
+                     "zoom_in", view_menu, extra_keys=("Ctrl++",))
+        self._action("Zoom Out (smaller text)", lambda: self.change_font(-1),
+                     "zoom_out", view_menu)
+        self._action("Reset Zoom", lambda: self.set_font_delta(0),
+                     "zoom_reset", view_menu)
+        view_menu.addSeparator()
 
         self.advanced_tabs_action = QAction(
             "Show Advanced Tabs (Logs, Skills, Custom Skills)", self)
@@ -2003,21 +2254,12 @@ class MainWindow(QMainWindow):
             act.triggered.connect(partial(self._switch_to_tab, title))
             view_menu.addAction(act)
         view_menu.addSeparator()
-        maximize = QAction("Maximize", self)
-        maximize.setShortcut(QKeySequence("Ctrl+M"))
-        maximize.triggered.connect(self.showMaximized)
-        view_menu.addAction(maximize)
-
-        self.fullscreen_action = QAction("Full Screen", self)
+        self._action("Maximize", self.showMaximized, "maximize", view_menu)
+        self.fullscreen_action = self._action(
+            "Full Screen", self._toggle_full_screen, "fullscreen", view_menu)
         self.fullscreen_action.setCheckable(True)
-        self.fullscreen_action.setShortcut(QKeySequence("F11"))
-        self.fullscreen_action.triggered.connect(self._toggle_full_screen)
-        view_menu.addAction(self.fullscreen_action)
-
-        restore = QAction("Restore Down", self)
-        restore.setShortcut(QKeySequence("Ctrl+Shift+M"))
-        restore.triggered.connect(self._restore_window)
-        view_menu.addAction(restore)
+        self._action("Restore Down", self._restore_window, "restore",
+                     view_menu)
 
     def _toggle_full_screen(self, checked: bool) -> None:
         """Enter or leave full screen, returning to a maximised window."""
@@ -2088,8 +2330,8 @@ class MainWindow(QMainWindow):
             self._error("The constraint path is set but the file does not exist.")
             return
         if not constraints:
-            QMessageBox.warning(self, "No constraints",
-                "No constraint file selected. Constraint-related diagnoses will be disabled.")
+            self.notify("No constraint file selected — constraint-related "
+                        "diagnoses are disabled for this run.", "warn")
 
         self._pending_save_path = None
         if self.autosave_check.isChecked():
@@ -2321,8 +2563,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Partition queue cleared.")
 
     def _start_analysis(self, inputs: AnalysisInputs) -> None:
-        self.analyze_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
+        self._set_running(True)
         self._set_export_enabled(False)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
@@ -2338,8 +2579,7 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _start_multi_analysis(self, partitions) -> None:
-        self.analyze_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
+        self._set_running(True)
         self._set_export_enabled(False)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
@@ -2362,11 +2602,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Cancelling — the analysis stops at its next checkpoint…")
             self.cancel_btn.setEnabled(False)
+            self.cancel_action.setEnabled(False)
+
+    def _set_running(self, running: bool) -> None:
+        self.analyze_btn.setEnabled(not running)
+        self.cancel_btn.setEnabled(running)
+        if getattr(self, "analyze_action", None) is not None:
+            self.analyze_action.setEnabled(not running)
+            self.cancel_action.setEnabled(running)
 
     def _on_cancelled(self) -> None:
         self.progress.setVisible(False)
-        self.analyze_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self._set_running(False)
         self._pending_save_path = None
         self._set_export_enabled(self._report is not None)
         self.statusBar().showMessage(
@@ -2404,9 +2651,9 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, report: AnalysisReport) -> None:
         self.progress.setVisible(False)
-        self.analyze_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self._set_running(False)
         self._reset_partitions()
+        self._clear_undo()
         self._base_report = report
         self._apply_report(report)
         self._after_new_report()
@@ -2425,11 +2672,14 @@ class MainWindow(QMainWindow):
                 msg += f"  Saved: {self._pending_save_path}"
             self._pending_save_path = None
         self.statusBar().showMessage(msg)
+        self._notify_done(
+            f"Analysis finished: {report.summary.coverage_loss_count:,} "
+            "coverage-loss faults.", "ok")
 
     def _on_multi_finished(self, results) -> None:
         self.progress.setVisible(False)
-        self.analyze_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self._set_running(False)
+        self._clear_undo()
         self._partitions = [
             {"name": name, "report": rep, "base_report": rep}
             for name, rep in results
@@ -2449,6 +2699,8 @@ class MainWindow(QMainWindow):
                 msg += (f"  Auto-saved {saved} report(s) to "
                         f"{self._autosave_dir()}.")
         self.statusBar().showMessage(msg)
+        self._notify_done(f"Analysis finished: {len(results)} partition(s).",
+                          "ok")
 
     def _reset_partitions(self) -> None:
         """Clear analyzed-partition state and hide the selector (single run)."""
@@ -2484,6 +2736,7 @@ class MainWindow(QMainWindow):
         self._apply_report(p["report"])
 
     def _on_partition_selected(self, idx: int) -> None:
+        self._clear_undo()
         self._set_active_partition(idx)
 
     def _apply_report(self, report: AnalysisReport) -> None:
@@ -2509,11 +2762,16 @@ class MainWindow(QMainWindow):
         # Restore a saved agent investigation (or clear stale agent output).
         self.agent_panel.import_investigation(getattr(report, "investigation",
                                                       None))
+        self._gs_mark("analyze")
+        self._update_status_chips()
+        if theme.is_dark():
+            theme.refresh(self)
 
     def _on_failed(self, message: str) -> None:
         self.progress.setVisible(False)
-        self.analyze_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self._set_running(False)
+        if not self.isActiveWindow():
+            QApplication.alert(self)
         self._error(f"Analysis failed:\n{message}")
         self.statusBar().showMessage("Analysis failed.")
 
@@ -2607,7 +2865,7 @@ class MainWindow(QMainWindow):
         self._set_summary_html(html)
         self.open_browser_btn.setEnabled(True)
         try:
-            self.dashboard.setText(self._dashboard_html(report))
+            theme.set_label(self.dashboard, self._dashboard_html(report))
             self.dashboard.setVisible(True)
         except Exception:  # noqa: BLE001 - the full report is still shown
             logger.exception("Could not build the summary dashboard")
@@ -3092,11 +3350,10 @@ class MainWindow(QMainWindow):
         if port is not None:
             self._show_share_dialog(share_url)
         else:
-            QMessageBox.information(
-                self, "Report opened",
+            self.notify(
                 "The report was opened locally, but a shareable network link "
-                "could not be created (the HTTP server failed to start).\n\n"
-                f"Local file:\n{path}")
+                f"could not be created. Local file: {path}", "warn",
+                msec=10000)
 
     def _ensure_report_server(self, directory: str) -> int:
         """Start (or reuse) a background HTTP server serving ``directory``.
@@ -3286,6 +3543,8 @@ class MainWindow(QMainWindow):
         self._set_has_report(False)
         self.tour_bar.stop()
         self._set_inputs_collapsed(False)
+        self._clear_undo()
+        self._update_status_chips()
         self.statusBar().showMessage("Cleared.")
 
     def _save_settings(self) -> None:
@@ -3310,6 +3569,7 @@ class MainWindow(QMainWindow):
         s.save()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._chip_timer.stop()
         self.save_layout()
         self._save_settings()
         self._shutdown_report_server()
@@ -3415,11 +3675,13 @@ class MainWindow(QMainWindow):
             self._base_report, excluded_classes=excluded,
             excluded_subtypes=excluded_subtypes, excluded_ids=excluded_ids,
             note=new_note)
+        self._push_undo()
         self._apply_report(edited)
         banner = report_edit.edit_banner(edited.edits)
         self.statusBar().showMessage(
             "Report edited" + (f": {banner}" if banner else " (note updated).")
             + f"  {edited.summary.coverage_loss_count} coverage-loss faults remain.")
+        self._offer_undo("Report edited.")
 
     @staticmethod
     def _loss_subtype_counts(report: AnalysisReport) -> List[tuple]:
@@ -3458,10 +3720,44 @@ class MainWindow(QMainWindow):
             excluded_subtypes=current_edits.get("excluded_subtypes", []),
             excluded_ids=sorted(ex_ids),
             note=current_edits.get("note", ""))
+        self._push_undo()
         self._apply_report(edited)
         self.statusBar().showMessage(
             f"Excluded {len(objects)} fault(s).  "
             f"{edited.summary.coverage_loss_count} coverage-loss faults remain.")
+        self._offer_undo(f"Excluded {len(objects)} fault(s).")
+
+    # ------------------------------------------------------------------
+    # Undo for waivers
+    # ------------------------------------------------------------------
+    MAX_UNDO = 20
+
+    def _push_undo(self) -> None:
+        if self._report is None:
+            return
+        self._undo_stack.append(self._report)
+        del self._undo_stack[:-self.MAX_UNDO]
+        self.undo_action.setEnabled(True)
+
+    def _clear_undo(self) -> None:
+        self._undo_stack = []
+        self.undo_action.setEnabled(False)
+
+    def _offer_undo(self, text: str) -> None:
+        self.notify(text, "ok", action="Undo", callback=self.undo_exclusion,
+                    status=False)
+
+    def undo_exclusion(self) -> bool:
+        """Put back the report as it was before the last waiver."""
+        if not self._undo_stack:
+            self.notify("Nothing to undo.")
+            return False
+        previous = self._undo_stack.pop()
+        self._apply_report(previous)
+        self.undo_action.setEnabled(bool(self._undo_stack))
+        self.notify(f"Waiver undone — {previous.summary.coverage_loss_count:,} "
+                    "coverage-loss faults.", "ok")
+        return True
 
     def on_compare_report(self) -> None:
         if not self._report:
@@ -3615,12 +3911,16 @@ class MainWindow(QMainWindow):
             "ATPG report (*.json);;All files (*)")
         if not path:
             return
+        self.load_report_path(path)
+
+    def load_report_path(self, path: str) -> bool:
         try:
             report = load_report(path)
         except (OSError, ValueError) as exc:
             self._error(f"Could not load report:\n{exc}")
-            return
+            return False
         self._reset_partitions()
+        self._clear_undo()
         self._base_report = report
         self._apply_report(report)
         self._after_new_report()
@@ -3628,6 +3928,377 @@ class MainWindow(QMainWindow):
             f"Report loaded: {path} — "
             f"{report.summary.coverage_loss_count} coverage-loss faults. "
             "Work on it without re-analyzing.")
+        return True
+
+    # ------------------------------------------------------------------
+    # Start-up sign-in check
+    # ------------------------------------------------------------------
+    def auto_check_sign_in(self) -> bool:
+        """Confirm the saved GitHub token works, so the agent is ready."""
+        started = self.agent_panel.auto_check_auth()
+        if started:
+            self.statusBar().showMessage(
+                "Checking Copilot sign-in with the saved GitHub token…")
+            self._update_status_chips()
+        return started
+
+    def _open_auth_tab(self) -> None:
+        self._switch_to_tab("AI Debug Agent")
+        self.agent_panel.tabs.setCurrentIndex(self.agent_panel.tabs.count() - 1)
+
+    def _on_auto_auth(self, ok: bool, message: str) -> None:
+        self._update_status_chips()
+        if ok:
+            self.notify(message, "ok")
+        else:
+            self.notify(message, "error", action="Fix sign-in",
+                        callback=self._open_auth_tab, msec=15000)
+
+    # ------------------------------------------------------------------
+    # Notices
+    # ------------------------------------------------------------------
+    def notify(self, text: str, kind: str = "info", action: Optional[str] = None,
+               callback=None, msec: int = 5000, status: bool = True) -> None:
+        """A corner notice that fades by itself (errors still use a dialog)."""
+        if status:
+            self.statusBar().showMessage(text)
+        self.toast.show_message(text, kind, action, callback, msec)
+
+    def _notify_done(self, text: str, kind: str = "ok") -> None:
+        """A long run ended: notice, and flash the task bar when unfocused."""
+        self.notify(text, kind, status=False)
+        if not self.isActiveWindow():
+            QApplication.alert(self)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        toast = getattr(self, "toast", None)
+        if toast is not None and toast.isVisible():
+            toast.reposition()
+
+    # ------------------------------------------------------------------
+    # Status bar
+    # ------------------------------------------------------------------
+    def _build_status_chips(self) -> None:
+        bar = self.statusBar()
+
+        def _chip(tip: str, slot) -> QToolButton:
+            btn = QToolButton()
+            btn.setAutoRaise(True)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            bar.addPermanentWidget(btn)
+            return btn
+
+        self.report_chip = _chip("The loaded report \u2014 click for the "
+                                 "Summary", lambda: self._switch_to_tab("Summary"))
+        self.agent_chip = _chip("", lambda: self._switch_to_tab("AI Debug Agent"))
+        self.vis_chip = _chip("", lambda: self._switch_to_tab("Tessent Visualizer"))
+        self.theme_btn = _chip("Switch between the Light and Dark theme "
+                               "(Ctrl+K, Ctrl+T)", self.toggle_theme)
+        self._chip_timer = QTimer(self)
+        self._chip_timer.setInterval(3000)
+        self._chip_timer.timeout.connect(self._update_status_chips)
+        self._chip_timer.start()
+        self.visualizer_panel.status_message.connect(
+            lambda *_: self._update_status_chips())
+        self.agent_panel.config_changed.connect(self._update_status_chips)
+        self._update_status_chips()
+
+    def _update_status_chips(self) -> None:
+        if getattr(self, "report_chip", None) is None:
+            return
+        report = self._report
+        if report is None:
+            self.report_chip.setText("No report loaded")
+        else:
+            sources = getattr(report, "sources", None) or {}
+            design = (sources.get("design")
+                      or _design_name(sources.get("netlist") or "") or "report")
+            if len(design) > 22:
+                design = design[:21] + "\u2026"
+            text = f"{design} \u00b7 {report.summary.coverage_loss_count:,} loss"
+            stats = getattr(report, "statistics", None)
+            tc = stats.metrics().get("test_coverage") if stats is not None else None
+            if tc is not None:
+                text += f" \u00b7 TC {tc:.2f}%"
+            self.report_chip.setText(text)
+        try:
+            ready, text, tip = self.agent_panel.readiness_summary()
+        except Exception:  # noqa: BLE001 - a status hint must never break the UI
+            ready, text, tip = False, "Agent", ""
+        self.agent_chip.setText(("\u2713 " if ready else "\u25cb ") + text)
+        self.agent_chip.setToolTip(tip + "\n\nClick to open the AI Debug Agent tab.")
+        live = self.visualizer_panel.has_live_session()
+        self.vis_chip.setText("\u25cf Visualizer: live" if live
+                              else "\u25cb Visualizer: not open")
+        self.vis_chip.setToolTip(
+            "A Tessent Visualizer session is running; right-click a signal to "
+            "show it there." if live else
+            "No Tessent Visualizer session \u2014 click to launch one.")
+        theme.set_css(self.vis_chip,
+                      f"color: {theme.color('ok')};" if live else "")
+        theme.set_css(self.agent_chip,
+                      f"color: {theme.color('ok')};" if ready else "")
+        self.theme_btn.setText("\u2600 Light" if theme.is_dark()
+                               else "\u263e Dark")
+
+    # ------------------------------------------------------------------
+    # Theme and text size
+    # ------------------------------------------------------------------
+    def set_theme(self, name: str, *_args) -> None:
+        name = theme.apply_app(QApplication.instance(), name)
+        self._settings.theme = name
+        for key, act in getattr(self, "theme_actions", {}).items():
+            act.setChecked(key == name)
+        self._refresh_theme_views()
+        self._settings.save()
+        self.statusBar().showMessage(
+            f"{name.title()} theme. View \u2192 Theme or Ctrl+K, Ctrl+T "
+            "switches back.")
+
+    def toggle_theme(self, *_args) -> None:
+        self.set_theme(theme.LIGHT if theme.is_dark() else theme.DARK)
+
+    def _refresh_theme_views(self) -> None:
+        theme.refresh(self)
+        if self._report is not None:
+            self.triage_panel.set_report(self._report)
+            self._on_row_selected()
+        self.agent_panel.refresh_theme()
+        self.visualizer_panel.refresh_health()
+        self.getting_started.restyle()
+        self.toast.hide()
+        self._update_status_chips()
+
+    def set_font_delta(self, delta: int) -> int:
+        delta = theme.apply_font(QApplication.instance(), delta)
+        self._settings.font_delta = delta
+        self._settings.save()
+        self.statusBar().showMessage(
+            "Text size: default" if delta == 0 else
+            f"Text size: {delta:+d} pt (Ctrl+0 resets)")
+        return delta
+
+    def change_font(self, step: int) -> int:
+        return self.set_font_delta(theme.font_delta() + step)
+
+    # ------------------------------------------------------------------
+    # Find, command palette, preferences
+    # ------------------------------------------------------------------
+    def on_find(self) -> None:
+        current = self.tabs.currentWidget()
+        if current is self._table_tab and self._report is not None:
+            self.filter_text.setFocus()
+            self.filter_text.selectAll()
+            return
+        target, where = None, ""
+        if current is self._summary_tab:
+            target, where = self.summary_view, "Summary"
+        elif current is self.triage_panel:
+            inner = self.triage_panel.tabs.currentIndex()
+            if inner == 0:
+                target, where = self.triage_panel.category_detail, "Category details"
+            elif inner == 2:
+                target, where = self.triage_panel.fix_detail, "Fix details"
+        elif current is self._agent_tab:
+            target, where = self.agent_panel.response_view, "Agent response"
+        if target is None:
+            self.notify("Find works on the Summary, the Triage Categories and "
+                        "Fix Plan details, the Coverage Loss Table and the AI "
+                        "agent's answer.")
+            return
+        self.find_bar.open_for(target, where)
+
+    def open_command_palette(self) -> None:
+        self.command_palette.open()
+
+    def _menu_entries(self, menu: QMenu, path: str) -> List[PaletteEntry]:
+        entries = []
+        for act in menu.actions():
+            if act.isSeparator() or not act.isVisible():
+                continue
+            text = act.text().replace("&&", "\0").replace("&", "").replace("\0", "&")
+            if act.menu() is not None:
+                entries.extend(self._menu_entries(act.menu(), f"{path} \u203a {text}"))
+                continue
+            if not act.isEnabled() or act is getattr(self, "palette_action", None):
+                continue
+            keys = act.shortcut().toString(QKeySequence.NativeText)
+            entries.append(PaletteEntry(f"{path} \u203a {text}", act.trigger, keys))
+        return entries
+
+    def palette_entries(self, query: str) -> List[PaletteEntry]:
+        """What the command palette lists for *query*."""
+        if query.startswith(FAULT_PREFIX):
+            needle = query[len(FAULT_PREFIX):].strip()
+            if not self._results:
+                return [PaletteEntry("No report is loaded \u2014 run Analyze "
+                                     "first", lambda: None)]
+            low = needle.lower()
+            faults = []
+            for r in self._results:
+                fo = r.fault.fault_object
+                if not low or low in fo.lower():
+                    faults.append(PaletteEntry(
+                        fo, partial(self._focus_fault_in_table, fo),
+                        r.fault.fault_class.value))
+                    if len(faults) >= 500:
+                        break
+            return rank_entries(needle, faults)
+        commands: List[PaletteEntry] = []
+        for act in self.menuBar().actions():
+            if act.menu() is not None:
+                name = act.text().replace("&", "")
+                commands.extend(self._menu_entries(act.menu(), name))
+        commands.append(PaletteEntry(
+            f"Search faults \u2014 type {FAULT_PREFIX} and part of a path",
+            lambda: QTimer.singleShot(0, self._reopen_palette_for_faults)))
+        return rank_entries(query, commands)
+
+    def _reopen_palette_for_faults(self) -> None:
+        self.command_palette.open()
+        self.command_palette.edit.setText(FAULT_PREFIX)
+
+    def preference_values(self) -> dict:
+        s = self._settings
+        return {
+            "theme": theme.current(),
+            "font_delta": theme.font_delta(),
+            "auto_save_report": self.autosave_check.isChecked(),
+            "show_advanced_tabs": self.advanced_tabs_action.isChecked(),
+            "show_checklist": not s.getting_started_hidden,
+            "tour_done": bool(s.tour_done),
+        }
+
+    def apply_preferences(self, values: dict) -> None:
+        if values.get("theme", theme.current()) != theme.current():
+            self.set_theme(values["theme"])
+        if "font_delta" in values and \
+                theme.clamp_font_delta(values["font_delta"]) != theme.font_delta():
+            self.set_font_delta(values["font_delta"])
+        self.autosave_check.setChecked(bool(values.get("auto_save_report")))
+        self.advanced_tabs_action.setChecked(
+            bool(values.get("show_advanced_tabs")))
+        self.set_checklist_visible(bool(values.get("show_checklist", True)))
+        self._settings.tour_done = bool(values.get("tour_done",
+                                                   self._settings.tour_done))
+        self._save_settings()
+
+    def on_preferences(self) -> None:
+        dlg = PreferencesDialog(self.preference_values(), self)
+        if dlg.exec() == QDialog.Accepted:
+            self.apply_preferences(dlg.values())
+            self.notify("Preferences saved.", "ok", status=False)
+
+    # ------------------------------------------------------------------
+    # Getting Started checklist
+    # ------------------------------------------------------------------
+    def _init_getting_started(self) -> None:
+        s = self._settings
+        self.getting_started.set_done(s.getting_started_done or [])
+        self.getting_started.setVisible(not s.getting_started_hidden)
+        for picker in (self.netlist_picker, self.faults_picker):
+            picker.checked.connect(self._check_inputs_step)
+        self._check_inputs_step()
+
+    def _check_inputs_step(self) -> None:
+        good = (OK, WARN)
+        if all(p.last_check is not None and p.last_check.state in good
+               for p in (self.netlist_picker, self.faults_picker)):
+            self._gs_mark("inputs")
+
+    def _gs_mark(self, step: str) -> None:
+        gs = getattr(self, "getting_started", None)
+        if gs is None or not gs.mark(step):
+            return
+        self._settings.getting_started_done = gs.done_steps()
+        self._settings.save()
+        if gs.all_done() and gs.isVisible():
+            self.notify("Getting Started complete \u2014 you have used every "
+                        "part of the tool.", "ok", status=False)
+
+    def set_checklist_visible(self, visible: bool) -> None:
+        self._settings.getting_started_hidden = not visible
+        self.getting_started.setVisible(visible)
+        self._settings.save()
+        if visible:
+            self._switch_to_tab("Summary")
+        else:
+            self.notify("Checklist hidden. Help \u2192 Getting Started "
+                        "Checklist brings it back.", status=False)
+
+    def _on_gs_action(self, step: str) -> None:
+        if step == "inputs":
+            self._on_empty_action("inputs")
+        elif step == "analyze":
+            self.on_analyze()
+        elif step == "triage":
+            self._switch_to_tab("Triage & Fix Plan")
+        elif step == "agent":
+            self._switch_to_tab("AI Debug Agent")
+        elif step == "visualizer":
+            self._switch_to_tab("Tessent Visualizer")
+
+    def _on_tab_changed(self, _index: int) -> None:
+        if self._report is not None and \
+                self.tabs.currentWidget() is self.triage_panel:
+            self._gs_mark("triage")
+        if not self.find_bar.isHidden():
+            self.find_bar.hide()
+
+    # ------------------------------------------------------------------
+    # Drag and drop
+    # ------------------------------------------------------------------
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        mime = event.mimeData()
+        if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        paths = [u.toLocalFile() for u in event.mimeData().urls()
+                 if u.isLocalFile()]
+        if paths:
+            event.acceptProposedAction()
+            self.handle_dropped_paths(paths)
+
+    def handle_dropped_paths(self, paths: List[str]) -> dict:
+        """Put each dropped file in the box it belongs to; load a report."""
+        pickers = {"netlist": self.netlist_picker, "faults": self.faults_picker,
+                   "constraints": self.constraints_picker,
+                   "outdir": self.outdir_picker}
+        names = {"netlist": "Netlist", "faults": "Fault list",
+                 "constraints": "Constraints", "outdir": "Output dir"}
+        assigned, unknown, report_path = {}, [], None
+        for path in paths:
+            kind = classify_file(path)
+            if kind == "report":
+                report_path = report_path or path
+            elif kind in pickers:
+                pickers[kind].set_path(path)
+                assigned[kind] = path
+            else:
+                unknown.append(path)
+        parts = [f"{names[k]} \u2190 {os.path.basename(p)}"
+                 for k, p in assigned.items()]
+        if unknown:
+            parts.append("not recognised: " + ", ".join(
+                os.path.basename(p) for p in unknown))
+        if assigned:
+            self._set_inputs_collapsed(False)
+        if report_path and self.load_report_path(report_path):
+            parts.insert(0, f"Report loaded \u2190 {os.path.basename(report_path)}")
+        if parts:
+            ready = "netlist" in assigned and "faults" in assigned
+            self.notify("; ".join(parts) + (".  Press \u25b6 Analyze (Ctrl+R)."
+                                            if ready else "."),
+                        "warn" if unknown else "ok", msec=8000)
+        result = dict(assigned)
+        if report_path:
+            result["report"] = report_path
+        if unknown:
+            result["unknown"] = unknown
+        return result
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
@@ -3644,4 +4315,5 @@ def run() -> int:
         window.show()
     else:
         window.showMaximized()
+    QTimer.singleShot(800, window.auto_check_sign_in)
     return app.exec()

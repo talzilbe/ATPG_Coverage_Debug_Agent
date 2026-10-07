@@ -185,6 +185,65 @@ def test_the_run_directory_field_only_shows_in_that_mode(panel):
     assert panel.run_dir_widget.isVisibleTo(panel)
 
 
+def _run_dir(tmp_path, with_icl=True):
+    run = tmp_path / "atpg_run"
+    (run / "faultlist").mkdir(parents=True)
+    faults = run / "faultlist" / "core.faults.gz"
+    faults.write_bytes(b"x")
+    if with_icl:
+        (run / "icl").mkdir()
+        (run / "icl" / "core.icl").write_text("x", encoding="utf-8")
+    return run, faults
+
+
+def test_run_directory_is_guessed_from_the_fault_list(tmp_path):
+    from atpg_coverage_debug_agent.launcher.profiles import ToolProfile
+    from atpg_coverage_debug_agent.launcher.visualizer import guess_run_dir
+    profile = ToolProfile.from_dict(PROFILE_DATA)
+    run, faults = _run_dir(tmp_path)
+    assert guess_run_dir(profile, str(faults)) == str(run)
+    assert guess_run_dir(profile, "") == ""
+    loose = tmp_path / "elsewhere" / "list.gz"
+    loose.parent.mkdir()
+    loose.write_bytes(b"x")
+    assert guess_run_dir(profile, str(loose)) == str(loose.parent)
+
+
+def test_choosing_run_dir_mode_fills_from_the_fault_list(panel, tmp_path):
+    run, faults = _run_dir(tmp_path)
+    panel.set_analysis_faults(str(faults))
+    panel.mode_run_dir.setChecked(True)
+    assert panel.run_dir_row.path() == str(run)
+    assert panel._path_rows["icl"].path() == str(run / "icl" / "core.icl")
+    assert "taken from the fault list" in panel.status_label.text()
+
+
+def test_missing_design_files_ask_for_another_run_directory(panel, tmp_path):
+    run, faults = _run_dir(tmp_path, with_icl=False)
+    panel.set_analysis_faults(str(faults))
+    panel.mode_run_dir.setChecked(True)
+    assert panel.run_dir_row.path() == str(run)
+    assert not panel._path_rows["icl"].path()
+    text = panel.status_label.text()
+    assert "No ICL file found" in text and "Run directory" in text
+    other = tmp_path / "other_run"
+    (other / "icl").mkdir(parents=True)
+    (other / "icl" / "x.icl").write_text("x", encoding="utf-8")
+    panel.run_dir_row.set_path(str(other))
+    assert panel.on_fill_from_run_dir()
+    assert panel._path_rows["icl"].path() == str(other / "icl" / "x.icl")
+    assert panel._path_rows["faults"].path() == str(faults), \
+        "the analysis fault list stays linked"
+
+
+def test_a_chosen_run_directory_is_not_overwritten(panel, tmp_path):
+    run, faults = _run_dir(tmp_path)
+    panel.set_analysis_faults(str(faults))
+    panel.run_dir_row.set_path(str(tmp_path))
+    panel.mode_run_dir.setChecked(True)
+    assert panel.run_dir_row.path() == str(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Preview
 # ---------------------------------------------------------------------------

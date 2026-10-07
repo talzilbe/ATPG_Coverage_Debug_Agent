@@ -31,10 +31,12 @@ from ..launcher import (
 )
 from ..launcher.visualizer import (
     ConfigFileError, config_file_stem, default_config_dir,
-    derive_paths_from_run_dir, fault_inspect_commands, launch_health,
+    derive_paths_from_run_dir, fault_inspect_commands, guess_run_dir,
+    launch_health,
     missing_inputs, profile_licence, read_launch_config, write_launch_config,
 )
 from ..launcher.profiles import import_profile_file, user_profile_dir
+from . import theme
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,11 @@ LOG_POLL_MS = 1500
 
 #: How often the control channel is re-checked while waiting for it to appear.
 SESSION_POLL_MS = 2000
+
+#: How often a live session is checked for still being there.
+ALIVE_POLL_MS = 4000
+#: Consecutive failed checks before a session is declared closed.
+ALIVE_MISSES = 2
 
 #: Cap on the log text kept in the view, in characters.
 MAX_LOG_CHARS = 400_000
@@ -89,6 +96,8 @@ class VisualizerPanel(QWidget):
 
     config_changed = Signal()
     status_message = Signal(str)
+    #: A launch chain was started in a terminal.
+    launched = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -111,6 +120,10 @@ class VisualizerPanel(QWidget):
         self._session_timer = QTimer(self)
         self._session_timer.setInterval(SESSION_POLL_MS)
         self._session_timer.timeout.connect(self._poll_session)
+        self._alive_timer = QTimer(self)
+        self._alive_timer.setInterval(ALIVE_POLL_MS)
+        self._alive_timer.timeout.connect(self._check_alive)
+        self._alive_misses = 0
         self._build()
         self.reload_profiles()
 
@@ -341,7 +354,7 @@ class VisualizerPanel(QWidget):
                 "launch.</b>" if not blockers else
                 f"<b style='color:#c62828'>{len(blockers)} thing(s) to fix "
                 f"before Launch:</b>")
-        self.health_label.setText(head + "<br>" + "<br>".join(lines))
+        theme.set_label(self.health_label, head + "<br>" + "<br>".join(lines))
         if not profile.is_template:
             self.launch_btn.setToolTip(
                 "Fix first: " + "; ".join(f"{c.label}: {c.detail}"
@@ -569,7 +582,29 @@ class VisualizerPanel(QWidget):
 
     def _on_mode_changed(self, _checked: bool) -> None:
         self.run_dir_widget.setVisible(self.mode_run_dir.isChecked())
+        if self.mode_run_dir.isChecked() and not self.run_dir_row.path():
+            self.prefill_run_dir()
         self._notify_config_changed()
+
+    def _fault_list_for_run_dir(self) -> str:
+        row = self._path_rows.get("faults")
+        return self._analysis_faults or (row.path() if row is not None else "")
+
+    def prefill_run_dir(self) -> bool:
+        """Start the run directory at the one the fault list came from.
+
+        Returns True when every required design file was found there.
+        """
+        profile = self.current_profile()
+        faults = self._fault_list_for_run_dir()
+        if profile is None or not faults:
+            self._set_status(
+                "Enter the ATPG run directory and press Fill paths.")
+            self.run_dir_row.edit.setFocus()
+            return False
+        guess = guess_run_dir(profile, faults)
+        self.run_dir_row.set_path(guess)
+        return self.on_fill_from_run_dir(from_guess=True)
 
     def _on_input_changed(self, *_args: Any) -> None:
         self.refresh_preview()
@@ -590,21 +625,46 @@ class VisualizerPanel(QWidget):
             extra_commands=list(self._extra_commands),
         )
 
-    def on_fill_from_run_dir(self) -> None:
+    def on_fill_from_run_dir(self, from_guess: bool = False) -> bool:
+        """Fill the design paths from the run directory.
+
+        Returns True when every required design file was found.
+        """
         profile = self.current_profile()
         if profile is None:
-            return
-        found, warnings = derive_paths_from_run_dir(profile, self.run_dir_row.path())
+            return False
+        run_dir = self.run_dir_row.path()
+        found, warnings = derive_paths_from_run_dir(profile, run_dir)
         for key, path in found.items():
             row = self._path_rows.get(key)
             if row is not None and row.isEnabled():
                 row.set_path(path)
+        missing = [e.label or e.key for e in profile.commands.load
+                   if e.required and e.key not in found
+                   and not (self._path_rows.get(e.key) is not None
+                            and self._path_rows[e.key].path())]
         filled = ", ".join(sorted(found)) or "nothing"
-        message = f"Filled: {filled}."
+        if missing:
+            where = ("the fault list's run directory" if from_guess
+                     else "this run directory")
+            message = (f"No {', '.join(missing)} found in {where} "
+                       f"({run_dir or 'not set'}). Enter the ATPG run "
+                       "directory that holds them under 'Run directory' and "
+                       "press Fill paths.")
+            if found:
+                message += f"  Filled: {filled}."
+            self.run_dir_row.edit.setFocus()
+            self.run_dir_row.edit.selectAll()
+        else:
+            message = f"Filled: {filled}."
+            if from_guess:
+                message = (f"Run directory taken from the fault list: "
+                           f"{run_dir}.  {message}")
         if warnings:
             message += "  " + "  ".join(warnings)
-        self._set_status(message, bool(warnings))
+        self._set_status(message, bool(missing or warnings))
         self.refresh_preview()
+        return not missing
 
     # ------------------------------------------------------------------
     # Preview
@@ -737,6 +797,7 @@ class VisualizerPanel(QWidget):
             message += "  " + "  ".join(bundle.warnings)
         self._set_status(message, bool(bundle.warnings))
         self.status_message.emit("Tessent Visualizer launching…")
+        self.launched.emit()
 
     # ------------------------------------------------------------------
     # The live control channel
@@ -762,15 +823,40 @@ class VisualizerPanel(QWidget):
             return
         self._session_timer.stop()
         self._session_ready = True
+        self._alive_misses = 0
+        self._alive_timer.start()
         self._set_session_label(f"Live session on port {self._session.port}")
+
+    def _check_alive(self) -> bool:
+        """Drop the session once its listener stops answering.
+
+        The port file outlives the tool, so only a connection proves it is up.
+        """
+        session = self._session
+        if session is None or not self._session_ready:
+            self._alive_timer.stop()
+            return False
+        if session.is_listening():
+            self._alive_misses = 0
+            return True
+        self._alive_misses += 1
+        if self._alive_misses < ALIVE_MISSES:
+            return True
+        self._alive_timer.stop()
+        self._session = None
+        self._session_ready = False
+        self._set_session_label(
+            "No live session (the Tessent session was closed)")
+        self.status_message.emit("Tessent Visualizer session closed.")
+        return False
 
     def _set_session_label(self, text: str) -> None:
         self.session_label.setText(text)
-        self.session_label.setStyleSheet(
-            "color: #1a7f37;" if self._session_ready else "color: #777;")
+        theme.set_css(self.session_label,
+                      "color: #1a7f37;" if self._session_ready else "color: #777;")
 
     def has_live_session(self) -> bool:
-        return self._session is not None and self._session.port is not None
+        return self._session is not None and self._session_ready
 
     def agent_target(self) -> Optional[Dict[str, Any]]:
         """What the AI agent may reach: the session, its log and its inputs."""
@@ -867,13 +953,14 @@ class VisualizerPanel(QWidget):
     def stop_log_tail(self) -> None:
         self._log_timer.stop()
         self._session_timer.stop()
+        self._alive_timer.stop()
 
     # ------------------------------------------------------------------
     # Status and settings
     # ------------------------------------------------------------------
     def _set_status(self, text: str, warning: bool = False) -> None:
         self.status_label.setText(text)
-        self.status_label.setStyleSheet("color: #a05000;" if warning else "")
+        theme.set_css(self.status_label, "color: #a05000;" if warning else "")
         if text:
             logger.debug("visualizer panel: %s", text)
 

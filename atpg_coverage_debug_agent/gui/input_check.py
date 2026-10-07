@@ -152,3 +152,42 @@ CHECKS = {
     "outdir": check_output_dir,
     "tool_reports": check_tool_reports,
 }
+
+_CONSTRAINT_RE = re.compile(
+    r"^\s*(add_|set_|delete_|report_|dofile|source|read_|create_|"
+    r"set_context|add_input_constraints|add_clocks)", re.MULTILINE)
+_CONSTRAINT_EXT = (".do", ".dofile", ".tcl")
+
+
+def classify_file(path: str):
+    """What a dropped path is: netlist, faults, constraints, report, outdir.
+
+    ``None`` when it is none of them. Netlists and fault lists are recognised
+    by content, so a renamed file still lands in the right box.
+    """
+    if os.path.isdir(path):
+        return "outdir"
+    if not os.path.isfile(path) or not os.access(path, os.R_OK):
+        return None
+    lower = path.lower()
+    if lower.endswith(".json"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return None
+        from ..reporting.session_report import FORMAT_MARKER
+        return "report" if FORMAT_MARKER in head else None
+    if check_netlist(path).state == OK:
+        return "netlist"
+    if lower.endswith(_CONSTRAINT_EXT):
+        return "constraints"
+    if check_faults(path).state == OK:
+        return "faults"
+    try:
+        head = "\n".join(_head(path))
+    except (OSError, EOFError, ValueError):
+        return None
+    if _CONSTRAINT_RE.search(head):
+        return "constraints"
+    return None
