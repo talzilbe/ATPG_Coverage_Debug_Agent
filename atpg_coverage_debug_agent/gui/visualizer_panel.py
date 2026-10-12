@@ -32,7 +32,7 @@ from ..launcher import (
 from ..launcher.visualizer import (
     ConfigFileError, config_file_stem, default_config_dir,
     derive_paths_from_run_dir, fault_inspect_commands, guess_run_dir,
-    launch_health,
+    heavy_command, launch_health,
     missing_inputs, profile_licence, read_launch_config, write_launch_config,
 )
 from ..launcher.profiles import import_profile_file, user_profile_dir
@@ -255,7 +255,25 @@ class VisualizerPanel(QWidget):
         lic_holder = QWidget()
         lic_holder.setLayout(lic_row)
         form.addRow("Licence server:", lic_holder)
+
+        self.heavy_check = QCheckBox("Heavy machine (Netbatch)")
+        self.heavy_check.setToolTip(
+            "Run Tessent on a large Netbatch machine instead of this one. "
+            "Project setup submits the job; Tessent opens in its own window "
+            "on that machine once the job starts.")
+        self.heavy_check.toggled.connect(self._on_heavy_toggled)
+        form.addRow("Run on:", self.heavy_check)
+        self.heavy_note = QLabel("Submitted with: " + heavy_command())
+        self.heavy_note.setWordWrap(True)
+        self.heavy_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        theme.set_css(self.heavy_note, "color: #777;")
+        self.heavy_note.setVisible(False)
+        form.addRow("", self.heavy_note)
         return box
+
+    def _on_heavy_toggled(self, checked: bool) -> None:
+        self.heavy_note.setVisible(checked)
+        self._on_input_changed()
 
     def reset_licence(self) -> None:
         """Fill the licence field with the selected profile's site default."""
@@ -623,6 +641,7 @@ class VisualizerPanel(QWidget):
             licence_server=self.licence_edit.text().strip(),
             paths=paths,
             extra_commands=list(self._extra_commands),
+            heavy=self.heavy_check.isChecked(),
         )
 
     def on_fill_from_run_dir(self, from_guess: bool = False) -> bool:
@@ -790,9 +809,14 @@ class VisualizerPanel(QWidget):
         self._enable_script_folder(bundle.directory)
         self._start_log_tail(bundle.log_path)
         self._begin_session(bundle)
-        message = (f"Launched in {bundle.terminal} (pid {pid}). "
-                   f"Loading the design takes a while; the viewer opens when "
-                   f"the commands finish.")
+        if bundle.heavy:
+            message = (f"Submitting to Netbatch from {bundle.terminal} (pid "
+                       f"{pid}). Tessent opens in its own window on the heavy "
+                       f"machine once the job starts and the design loads.")
+        else:
+            message = (f"Launched in {bundle.terminal} (pid {pid}). "
+                       f"Loading the design takes a while; the viewer opens "
+                       f"when the commands finish.")
         if bundle.warnings:
             message += "  " + "  ".join(bundle.warnings)
         self._set_status(message, bool(bundle.warnings))
@@ -812,20 +836,27 @@ class VisualizerPanel(QWidget):
                 "No control channel (this profile disables it)")
             return
         self._session = LiveSession(bundle.port_file, bundle.token)
-        self._set_session_label("Session starting…")
+        self._set_session_label(
+            "Queued on Netbatch — waiting for the remote session…"
+            if getattr(bundle, "heavy", False) else "Session starting…")
         self._session_timer.start()
 
     def _poll_session(self) -> None:
         if self._session is None:
             self._session_timer.stop()
             return
-        if self._session.port is None:
+        endpoint = self._session.endpoint
+        if endpoint is None:
             return
         self._session_timer.stop()
         self._session_ready = True
         self._alive_misses = 0
         self._alive_timer.start()
-        self._set_session_label(f"Live session on port {self._session.port}")
+        if getattr(getattr(self, "_bundle", None), "heavy", False):
+            self._set_session_label(
+                f"Live session on {endpoint[0]}:{endpoint[1]} (heavy)")
+        else:
+            self._set_session_label(f"Live session on port {endpoint[1]}")
 
     def _check_alive(self) -> bool:
         """Drop the session once its listener stops answering.
@@ -1119,6 +1150,7 @@ class VisualizerPanel(QWidget):
             "run_dir": self.run_dir_row.path(),
             "mode": "run_dir" if self.mode_run_dir.isChecked() else "individual",
             "use_analysis_faults": self.use_analysis_faults.isChecked(),
+            "heavy_mode": self.heavy_check.isChecked(),
         }
 
     def _apply_form_config(self, cfg: Dict[str, Any]) -> None:
@@ -1151,6 +1183,7 @@ class VisualizerPanel(QWidget):
             self.mode_individual.setChecked(True)
         self.use_analysis_faults.setChecked(
             bool(cfg.get("use_analysis_faults", True)))
+        self.heavy_check.setChecked(bool(cfg.get("heavy_mode", False)))
         for key, value in dict(cfg.get("paths") or {}).items():
             row = self._path_rows.get(str(key))
             if row is not None:

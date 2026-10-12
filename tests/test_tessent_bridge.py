@@ -115,6 +115,8 @@ class FakeEvalTool:
         self.log_path = log_path
         self.enabled = enabled
         self.fail = fail
+        #: Send the transcript inline, as the current listener does.
+        self.inline = None
         self.scripts = []
         self._sock = socket.socket()
         self._sock.bind(("127.0.0.1", 0))
@@ -150,6 +152,9 @@ class FakeEvalTool:
                              f"ATPG_END {req_id} rc={1 if self.fail else 0}\n")
                 status = "ERR64" if self.fail else "OK64"
                 result = base64.b64encode(b"returned\nvalue").decode()
+                if self.inline is not None:
+                    text = base64.b64encode(self.inline.encode()).decode() or "-"
+                    result += f" T1 {text}"
                 conn.sendall(f"{status} {result}\n".encode())
 
     def close(self):
@@ -184,6 +189,32 @@ def test_a_failing_script_is_a_result_not_an_exception(eval_tool):
     tool.fail = True
     res = session.run_script("bogus_cmd", "abc124", log)
     assert res.ok is False and res.result == "returned\nvalue"
+
+
+def test_the_inline_transcript_is_used_when_the_log_is_not_visible(eval_tool):
+    """A remote tool's log can lag for seconds over NFS; the reply carries it."""
+    tool, session, _log = eval_tool
+    tool.inline = "seen on the tool's own host"
+    res = session.run_script("report_statistics", "abc126",
+                             "/nonexistent/tool.log")
+    assert res.transcript == "seen on the tool's own host"
+    assert res.transcript_complete is True
+    assert res.result == "returned\nvalue"
+
+
+def test_an_empty_inline_transcript_is_complete(eval_tool):
+    tool, session, _log = eval_tool
+    tool.inline = ""
+    res = session.run_script("set x 1", "abc127", "/nonexistent/tool.log")
+    assert res.transcript == "" and res.transcript_complete is True
+
+
+def test_the_listener_reads_the_transcript_on_the_tools_host():
+    tcl = build_listener_tcl("/tmp/p", new_token(), [], [], allow_eval=True,
+                             log_file="/tmp/tool.log")
+    assert "set ::atpg_log {/tmp/tool.log}" in tcl
+    assert "::atpg_slice $id $start" in tcl
+    assert "@@" not in tcl
 
 
 def test_a_disabled_profile_refusal_raises(eval_tool):

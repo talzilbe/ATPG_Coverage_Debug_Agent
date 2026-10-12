@@ -1157,6 +1157,23 @@ licence format, project and every required design file.
 warnings (the setup wrapper may still put the tool on the path). Nothing is run
 by the check.</p>
 
+<h3>Heavy mode: running on a Netbatch machine</h3>
+<p>Tick <b class="k">Run on: Heavy machine (Netbatch)</b> in <i>Project
+setup</i> when the design is too large for this host. Everything else stays
+the same &mdash; the same dofile, licence and design paths &mdash; but instead
+of starting Tessent here, project setup submits it with <code>nbjob run</code>
+(the exact line is shown under the checkbox). Tessent then opens in its own
+xterm on the Netbatch machine once the job starts. Notes:</p>
+<ul>
+<li>The launch scripts are written under <code>&lt;workarea&gt;/.atpg_visualizer</code>
+(or <code>~/.atpg_debug_agent/vis_sessions</code> without a workarea), because
+the remote machine cannot see this host's <code>/tmp</code>.</li>
+<li>Your X display must be reachable from the remote machine. An ssh-forwarded
+<code>localhost:N</code> display is not, and <i>Ready to launch?</i> says so.</li>
+<li>Right-click &ldquo;Open signal in Tessent Visualizer&rdquo; still works:
+the remote session accepts connections only from this machine, with the
+per-session token, so the AI agent can measure there too.</li>
+</ul>
 <h3>Saving a setup so you only type it once</h3>
 <p>Every field above is remembered <b>per user</b> &mdash; the project, config,
 workarea, licence server and each design path are written to

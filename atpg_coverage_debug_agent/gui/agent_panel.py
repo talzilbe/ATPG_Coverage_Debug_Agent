@@ -1197,11 +1197,16 @@ class AgentPanel(QWidget):
                       "loaded" if has_report else "run Analyze first",
                       "need_report"))
         if self._can_measure_in_tessent():
-            live = self._tessent_refusal(self._tessent_target()) is None
-            items.append(("Tessent session", "ok" if live else "optional",
-                          "live — the agent can measure" if live else
-                          "not open (optional — lets the agent measure)",
-                          "open_visualizer"))
+            refusal = self._tessent_refusal(self._tessent_target())
+            if refusal is None:
+                state, text = "ok", "live — the agent can measure"
+            elif refusal[0] == "disabled":
+                state, text = ("optional", "live, but this session does not "
+                               "accept agent commands (relaunch to enable)")
+            else:
+                state, text = ("optional", "not open (optional — lets the "
+                               "agent measure)")
+            items.append(("Tessent session", state, text, "open_visualizer"))
         return items
 
     def _can_measure_in_tessent(self) -> bool:
@@ -1930,9 +1935,10 @@ class AgentPanel(QWidget):
                     "loaded.")
         if not target.get("agent_eval"):
             return ("disabled",
-                    f"The profile '{target.get('profile', '')}' does not allow "
-                    "agent commands (control.allow_agent_eval is false). The "
-                    "user must relaunch with a profile that allows them.")
+                    "The Tessent session is live, but it was launched without "
+                    "agent commands enabled (profile "
+                    f"'{target.get('profile', '')}', control.allow_agent_eval). "
+                    "The user must relaunch it to let the agent run scripts.")
         return None
 
     def _bridge_path(self) -> str:
