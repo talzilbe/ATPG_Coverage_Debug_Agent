@@ -13,7 +13,9 @@ from __future__ import annotations
 import html
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import shutil
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QProcess, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -32,8 +34,9 @@ from ..launcher import (
 from ..launcher.visualizer import (
     ConfigFileError, config_file_stem, default_config_dir,
     derive_paths_from_run_dir, fault_inspect_commands, guess_run_dir,
-    heavy_command, launch_health,
-    missing_inputs, profile_licence, read_launch_config, write_launch_config,
+    heavy_command, job_remove_argv, job_status_argv, launch_health,
+    missing_inputs, parse_job_status, profile_licence, read_job_id,
+    read_launch_config, write_launch_config,
 )
 from ..launcher.profiles import import_profile_file, user_profile_dir
 from . import theme
@@ -50,6 +53,13 @@ SESSION_POLL_MS = 2000
 ALIVE_POLL_MS = 4000
 #: Consecutive failed checks before a session is declared closed.
 ALIVE_MISSES = 2
+
+#: Heavy mode: how often the job file is checked for the Netbatch job id.
+JOB_POLL_MS = 5000
+#: Heavy mode: minimum gap between two Netbatch status queries.
+JOB_STATUS_EVERY_S = 30.0
+#: Cap on one nbstatus / nbjob call.
+NB_TIMEOUT_MS = 90_000
 
 #: Cap on the log text kept in the view, in characters.
 MAX_LOG_CHARS = 400_000
@@ -124,6 +134,15 @@ class VisualizerPanel(QWidget):
         self._alive_timer.setInterval(ALIVE_POLL_MS)
         self._alive_timer.timeout.connect(self._check_alive)
         self._alive_misses = 0
+        self._job_id = ""
+        self._job_file = ""
+        self._job_seen = False
+        self._job_since = 0.0
+        self._job_last_query = 0.0
+        self._job_busy = False
+        self._job_timer = QTimer(self)
+        self._job_timer.setInterval(JOB_POLL_MS)
+        self._job_timer.timeout.connect(self._poll_job)
         self._build()
         self.reload_profiles()
 
@@ -438,6 +457,14 @@ class VisualizerPanel(QWidget):
             "A live session accepts 'Open signal in Tessent Visualizer' from "
             "the other tabs.")
         row.addWidget(self.session_label)
+
+        self.cancel_job_btn = QPushButton("Cancel Netbatch job")
+        self.cancel_job_btn.setToolTip(
+            "Remove the queued heavy-mode job (nbjob remove), so Tessent "
+            "does not open later on its own.")
+        self.cancel_job_btn.setVisible(False)
+        self.cancel_job_btn.clicked.connect(self.on_cancel_job)
+        row.addWidget(self.cancel_job_btn)
         row.addStretch(1)
         return row
 
@@ -789,6 +816,12 @@ class VisualizerPanel(QWidget):
                 "Cannot launch yet — see 'Ready to launch?': "
                 + "; ".join(f"{c.label}: {c.detail}" for c in blockers), True)
             return
+        if self.has_pending_job():
+            choice = self._ask_pending_job()
+            if choice == "abort":
+                return
+            if choice == "cancel":
+                self.cancel_job()
 
         override = self.commands_view.toPlainText() if self._dofile_edited else None
         try:
@@ -830,6 +863,11 @@ class VisualizerPanel(QWidget):
         self._session_ready = False
         self._bundle = bundle
         self._launch_form = self._form_config()
+        self._reset_job()
+        if getattr(bundle, "heavy", False) and getattr(bundle, "job_file", ""):
+            self._job_file = bundle.job_file
+            self._job_since = time.monotonic()
+            self._job_timer.start()
         if not bundle.token or not bundle.port_file:
             self._session = None
             self._set_session_label(
@@ -852,6 +890,8 @@ class VisualizerPanel(QWidget):
         self._session_ready = True
         self._alive_misses = 0
         self._alive_timer.start()
+        self._job_timer.stop()
+        self.cancel_job_btn.setVisible(False)
         if getattr(getattr(self, "_bundle", None), "heavy", False):
             self._set_session_label(
                 f"Live session on {endpoint[0]}:{endpoint[1]} (heavy)")
@@ -885,6 +925,171 @@ class VisualizerPanel(QWidget):
         self.session_label.setText(text)
         theme.set_css(self.session_label,
                       "color: #1a7f37;" if self._session_ready else "color: #777;")
+
+    # ------------------------------------------------------------------
+    # Heavy mode: the Netbatch job
+    # ------------------------------------------------------------------
+    def _reset_job(self) -> None:
+        self._job_timer.stop()
+        self._job_id = ""
+        self._job_file = ""
+        self._job_seen = False
+        self._job_last_query = 0.0
+        self.cancel_job_btn.setVisible(False)
+
+    def job_id(self) -> str:
+        return self._job_id
+
+    def has_pending_job(self) -> bool:
+        """A heavy job was submitted and its Tessent session is not up yet."""
+        return bool(self._job_id) and not self._session_ready
+
+    def _start_nb(self, argv: List[str],
+                  on_done: Callable[[int, str], None]) -> bool:
+        """Run a Netbatch command without blocking; *on_done(rc, output)*."""
+        program = shutil.which(argv[0]) or argv[0]
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        timer = QTimer(proc)
+        timer.setSingleShot(True)
+        timer.timeout.connect(proc.kill)
+        reported = [False]
+
+        def finished(code: int, _status: Any) -> None:
+            if reported[0]:
+                return
+            reported[0] = True
+            timer.stop()
+            text = bytes(proc.readAll()).decode("utf-8", "replace")
+            proc.deleteLater()
+            on_done(code, text)
+
+        def failed(error: Any) -> None:
+            if error == QProcess.FailedToStart:
+                finished(-1, proc.errorString())
+
+        proc.finished.connect(finished)
+        proc.errorOccurred.connect(failed)
+        proc.start(program, argv[1:])
+        timer.start(NB_TIMEOUT_MS)
+        return True
+
+    def _poll_job(self) -> None:
+        if self._session_ready:
+            self._job_timer.stop()
+            return
+        if not self._job_id:
+            self._job_id = read_job_id(self._job_file)
+            if not self._job_id:
+                return
+            self.cancel_job_btn.setVisible(True)
+            self.cancel_job_btn.setEnabled(True)
+            self._set_session_label(
+                f"Netbatch job {self._job_id} submitted — waiting for its "
+                "status…")
+        now = time.monotonic()
+        if self._job_busy or now - self._job_last_query < JOB_STATUS_EVERY_S:
+            return
+        self._job_last_query = now
+        self._job_busy = True
+        job = self._job_id
+
+        def done(_rc: int, text: str) -> None:
+            self._job_busy = False
+            if job == self._job_id:
+                self._on_job_status(text)
+
+        self._start_nb(job_status_argv(job), done)
+
+    def _on_job_status(self, text: str) -> None:
+        if self._session_ready or not self._job_id:
+            return
+        found = parse_job_status(text, self._job_id)
+        if found is None:
+            # Netbatch reports a fresh job only after a short lag.
+            if self._job_seen:
+                self._set_session_label(
+                    f"Netbatch job {self._job_id} is no longer queued or "
+                    "running, and Tessent never reported in. Check the "
+                    "Netbatch job log.")
+                self._end_job()
+            return
+        self._job_seen = True
+        status, reason = found
+        minutes = int((time.monotonic() - self._job_since) // 60)
+        if status.lower().startswith("run"):
+            self._set_session_label(
+                f"Netbatch job {self._job_id} is running — waiting for "
+                "Tessent to start…")
+        else:
+            detail = f" ({reason})" if reason else ""
+            self._set_session_label(
+                f"Netbatch job {self._job_id}: {status}{detail} — submitted "
+                f"{minutes} min ago")
+
+    def _end_job(self) -> None:
+        self._job_timer.stop()
+        self._job_id = ""
+        self.cancel_job_btn.setVisible(False)
+        if not self._session_ready:
+            self._session_timer.stop()
+            self._session = None
+
+    def on_cancel_job(self) -> None:
+        if not self._job_id:
+            return
+        answer = QMessageBox.question(
+            self, "Cancel Netbatch job",
+            f"Remove Netbatch job {self._job_id}? Tessent will not open "
+            "for it.")
+        if answer == QMessageBox.Yes:
+            self.cancel_job()
+
+    def cancel_job(self) -> bool:
+        """Remove the pending heavy job.  Returns True when removal started."""
+        job = self._job_id
+        if not job:
+            return False
+        self.cancel_job_btn.setEnabled(False)
+        self._set_session_label(f"Cancelling Netbatch job {job}…")
+
+        def done(rc: int, text: str) -> None:
+            ok = rc == 0 or "removed successfully" in text
+            if ok:
+                self._set_status(f"Netbatch job {job} was removed.")
+                self.status_message.emit(f"Netbatch job {job} cancelled.")
+            else:
+                self._set_status(
+                    f"Could not remove Netbatch job {job}: "
+                    f"{text.strip() or 'nbjob remove failed'}", True)
+            if job != self._job_id:
+                return
+            if ok:
+                self._set_session_label(f"Netbatch job {job} cancelled")
+                self._end_job()
+            else:
+                self.cancel_job_btn.setEnabled(True)
+
+        return self._start_nb(job_remove_argv(job), done)
+
+    def _ask_pending_job(self) -> str:
+        """'cancel', 'keep' or 'abort' for a launch while a job is pending."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Netbatch job still pending")
+        box.setText(
+            f"Netbatch job {self._job_id} has not started Tessent yet. If it "
+            "starts later, Tessent opens in a window of its own.")
+        cancel = box.addButton("Cancel it and launch", QMessageBox.AcceptRole)
+        keep = box.addButton("Keep it and launch", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel:
+            return "cancel"
+        if clicked is keep:
+            return "keep"
+        return "abort"
 
     def has_live_session(self) -> bool:
         return self._session is not None and self._session_ready

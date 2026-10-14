@@ -1173,6 +1173,12 @@ the remote machine cannot see this host's <code>/tmp</code>.</li>
 <li>Right-click &ldquo;Open signal in Tessent Visualizer&rdquo; still works:
 the remote session accepts connections only from this machine, with the
 per-session token, so the AI agent can measure there too.</li>
+<li>The job can wait in the Netbatch queue for a while before Tessent opens.
+While it waits, the line next to <b class="k">Launch Visualizer</b> shows the
+job id and its Netbatch state (for example <i>Wait (not candidate yet)</i>),
+refreshed every 30 seconds. <b class="k">Cancel Netbatch job</b> removes it
+(<code>nbjob remove</code>), and launching again while a job is still pending
+asks whether to cancel it first.</li>
 </ul>
 <h3>Saving a setup so you only type it once</h3>
 <p>Every field above is remembered <b>per user</b> &mdash; the project, config,
