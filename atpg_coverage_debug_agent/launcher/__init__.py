@@ -32,6 +32,7 @@ from .terminals import (
     find_terminal,
 )
 from .visualizer import (
+    ActiveSetup,
     LaunchBundle,
     LaunchInputError,
     VisualizerInputs,
@@ -41,12 +42,14 @@ from .visualizer import (
     build_tessent_script,
     derive_paths_from_run_dir,
     describe_chain,
+    detect_active_setup,
     signal_inspect_actions,
     write_launch_bundle,
 )
 
 __all__ = [
     "KNOWN_TERMINALS",
+    "ActiveSetup",
     "InspectAction",
     "LaunchBundle",
     "LaunchInputError",
@@ -63,6 +66,7 @@ __all__ = [
     "build_tessent_script",
     "derive_paths_from_run_dir",
     "describe_chain",
+    "detect_active_setup",
     "display_available",
     "find_terminal",
     "get_profile",

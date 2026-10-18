@@ -11,7 +11,10 @@
     "cfg_flag": "-cfg",
     "ward_flag": "-ward",
     "command_flag": "-x",
-    "extra_args": []
+    "extra_args": [],
+    "active_env": ["CTH_SESSION_ID", "CTH_ENV_INDICATOR"],
+    "setup_cmd_env": "CTH_SETUP_CMD",
+    "ward_env": "WORKAREA"
   },
   "environment": {
     "SALT_LICENSE_SERVER": "1717@mentor14p.elic.intel.com:1717@mentor06p.elic.intel.com:1717@mentor37p.elic.intel.com:1717@mentor47p.elic.intel.com:1717@siemens12p.elic.intel.com"

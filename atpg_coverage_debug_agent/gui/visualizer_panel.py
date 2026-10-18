@@ -850,6 +850,9 @@ class VisualizerPanel(QWidget):
             message = (f"Launched in {bundle.terminal} (pid {pid}). "
                        f"Loading the design takes a while; the viewer opens "
                        f"when the commands finish.")
+        if bundle.setup_reused:
+            message = ("Already inside the project setup, so it was reused "
+                       "rather than entered again.  " + message)
         if bundle.warnings:
             message += "  " + "  ".join(bundle.warnings)
         self._set_status(message, bool(bundle.warnings))

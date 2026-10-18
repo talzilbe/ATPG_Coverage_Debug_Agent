@@ -72,6 +72,8 @@ class AppSettings:
     getting_started_hidden: bool = False
     #: Getting Started steps ever completed (ids).
     getting_started_done: List[str] = field(default_factory=list)
+    #: A new netlist refills the fault list and constraints from its run folder.
+    auto_fill_inputs: bool = True
 
     def remember_inputs(self, entry: Dict[str, str], limit: int = 8) -> None:
         """Put *entry* at the front of :attr:`recent_inputs`, without duplicates."""

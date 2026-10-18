@@ -15,7 +15,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
-from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QObject, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from ..app import AnalysisInputs, PartitionInputs, _design_name
 from ..analysis import investigate, regression, report_edit
+from ..analysis.input_discovery import InputDiscovery, discover_inputs
 from ..config.settings import AppSettings
 from ..models import AnalysisReport, FaultAnalysisResult
 from ..reporting.csv_report import write_csv
@@ -249,6 +250,20 @@ explanation.</p>
 compression and size), <span style="color:#a05000">!</span> readable but
 unexpected, <span style="color:#c62828">&#10007;</span> missing or unreadable.
 Analyze refuses to start while a box is red, and says why.</p>
+<p><b>Filled in from the netlist.</b> When the netlist box holds a valid
+netlist, the app looks around its ATPG run folder (for example
+<code>WORK/&lt;recipe&gt;/faultlist</code> and
+<code>proj_common/atpg_files/&lt;design&gt;.do</code>) and fills in the
+<b>Fault list</b> and <b>Constraints</b> boxes. The final fault list
+(<code>.fd</code> in its name) is preferred, then the latest phase; partial
+lists such as <code>.del</code>, <code>.detected</code> and disposition slices
+are never picked. A grey note under the box says why that file was chosen and
+how many others are there; beside the fault list,
+<b class="k">Pick another &#9662;</b> switches to one of the other fault lists.
+Both boxes stay editable. With <b>Fill the fault list and constraints from a
+new netlist</b> ticked (under the netlist box), entering a netlist for another
+design replaces both paths; untick it and only empty boxes are filled in.
+Re-entering the same netlist never replaces a path you set yourself.</p>
 <p><b class="k">Recent &#9662;</b> (left of the partition toggle) and
 <b>File &rarr; Recent Analyses</b> refill every box from a design you analysed
 before.</p>
@@ -1116,6 +1131,10 @@ model and the fault list, and open the viewer. The chain runs in its own
 terminal window and is <b>detached</b>, so the session keeps running if you
 close this application &mdash; and the tool prompt stays usable after the
 viewer appears, for anything you want to type yourself.</p>
+<p>If you started this application from a shell that is <b>already inside the
+project setup</b>, Launch notices and reuses that setup instead of entering it
+a second time; <i>Ready to launch?</i> says so. When that setup's project,
+config or workarea differs from the form, it is still used, with a warning.</p>
 
 <h3>Filling it in</h3>
 <table>
@@ -1546,6 +1565,12 @@ class _QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
         logger.debug("report-server: " + format, *args)
 
 
+class _DiscoveryRelay(QObject):
+    """Carries a background input search back to the GUI thread."""
+
+    done = Signal(str, object)
+
+
 class _FilePicker(QWidget):
     checked = Signal()
 
@@ -1555,8 +1580,14 @@ class _FilePicker(QWidget):
         self._directory = directory
         self._check = check
         self.last_check: Optional[InputCheck] = None
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        #: The path the app filled in itself; "" once the user takes over.
+        self._auto_path = ""
+        self._alternatives: List[str] = []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(1)
+        layout = QHBoxLayout()
+        outer.addLayout(layout)
         title = QLabel(label)
         title.setMinimumWidth(230)
         layout.addWidget(title, 0)
@@ -1569,18 +1600,40 @@ class _FilePicker(QWidget):
         self.status.setMinimumWidth(260)
         self.status.setWordWrap(True)
         layout.addWidget(self.status, 0)
+
+        note_row = QHBoxLayout()
+        note_row.addSpacing(236)
+        self.note = QLabel("", self)
+        self.note.setWordWrap(True)
+        self.note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.note.setStyleSheet("color: #5f6b7a; font-size: 11px;")
+        self.note.hide()
+        note_row.addWidget(self.note, 1)
+        self.alt_btn = QToolButton(self)
+        self.alt_btn.setText("Pick another ▾")
+        self.alt_btn.setToolTip("Choose another file from the same folder.")
+        self.alt_btn.setPopupMode(QToolButton.InstantPopup)
+        self.alt_menu = QMenu(self.alt_btn)
+        self.alt_menu.aboutToShow.connect(self._fill_alt_menu)
+        self.alt_btn.setMenu(self.alt_menu)
+        self.alt_btn.hide()
+        note_row.addWidget(self.alt_btn, 0, Qt.AlignTop)
+        outer.addLayout(note_row)
+
         # Checks touch the file system (possibly NFS), so wait for typing to stop.
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(350)
         self._timer.timeout.connect(self.run_check)
         self.edit.textChanged.connect(lambda _t: self._timer.start())
+        self.edit.textChanged.connect(self._on_text_changed)
 
     def _browse(self) -> None:
+        start = os.path.dirname(self.path()) if self.path() else ""
         if self._directory:
-            path = QFileDialog.getExistingDirectory(self, "Select directory")
+            path = QFileDialog.getExistingDirectory(self, "Select directory", start)
         else:
-            path, _ = QFileDialog.getOpenFileName(self, "Select file")
+            path, _ = QFileDialog.getOpenFileName(self, "Select file", start)
         if path:
             self.edit.setText(path)
 
@@ -1609,6 +1662,59 @@ class _FilePicker(QWidget):
     def set_path(self, value: str) -> None:
         self.edit.setText(value)
         self.run_check()
+
+    @property
+    def is_auto(self) -> bool:
+        """True while the box still holds the path the app filled in."""
+        return bool(self._auto_path) and self.path() == self._auto_path
+
+    def set_auto(self, path: str, note: str, alternatives: List[str]) -> None:
+        """Fill the box for the user, saying why and offering the other files."""
+        self._auto_path = path
+        self._alternatives = list(alternatives)
+        self.set_path(path)
+        self.note.setText(note)
+        self.note.setToolTip(note)
+        self.note.setVisible(bool(note))
+        self.alt_btn.setVisible(bool(self._alternatives))
+
+    def alt_menu_model(self) -> List[tuple]:
+        """``(label, path)`` for every other file the user can switch to."""
+        current = self.path()
+        paths = ([self._auto_path] if self._auto_path else []) + self._alternatives
+        model = []
+        for path in paths:
+            if not path or path == current or any(p == path for _, p in model):
+                continue
+            label = os.path.basename(path)
+            if path == self._auto_path:
+                label += "   (auto choice)"
+            model.append((label, path))
+        return model
+
+    def _fill_alt_menu(self) -> None:
+        self.alt_menu.clear()
+        for label, path in self.alt_menu_model():
+            action = self.alt_menu.addAction(label)
+            action.setToolTip(path)
+            action.triggered.connect(partial(self.set_path, path))
+
+    def _on_text_changed(self, text: str) -> None:
+        if not self._auto_path:
+            return
+        text = text.strip()
+        if text == self._auto_path:
+            self.note.setVisible(bool(self.note.text()))
+            self.alt_btn.setVisible(bool(self._alternatives))
+            return
+        # The user took over: the reason no longer describes the box.
+        self.note.hide()
+        if os.path.dirname(text) == os.path.dirname(self._auto_path):
+            self.alt_btn.setVisible(bool(self._alternatives))
+            return
+        self._auto_path = ""
+        self._alternatives = []
+        self.alt_btn.hide()
 
 
 class MainWindow(QMainWindow):
@@ -1662,8 +1768,86 @@ class MainWindow(QMainWindow):
         self._init_getting_started()
         theme.refresh(self)
 
+    # ------------------------------------------------------------------
+    # Filling the fault list and constraints from the netlist
+    # ------------------------------------------------------------------
+    def _on_autofill_toggled(self, on: bool) -> None:
+        self._save_settings()
+        if on:
+            # Ticking it is a request to fill from the netlist already entered.
+            self._discovered_for = ""
+            self._inputs_netlist = ""
+            self._on_netlist_checked()
+
+    def _on_netlist_checked(self) -> None:
+        check = self.netlist_picker.last_check
+        path = self.netlist_picker.path()
+        if os.environ.get("ATPG_INPUT_DISCOVERY", "1").strip() == "0":
+            return
+        if not path or check is None or check.state != OK:
+            return
+        if path == self._discovered_for:
+            return
+        self._discovered_for = path
+        if self._discovery_sync:
+            self._apply_discovery(path, discover_inputs(path))
+            return
+        relay = self._discovery_relay
+
+        def work() -> None:
+            try:
+                result = discover_inputs(path)
+            except Exception:  # noqa: BLE001 - a search must never break the form
+                logger.exception("Searching for inputs next to %s failed", path)
+                return
+            try:
+                relay.done.emit(path, result)
+            except RuntimeError:
+                pass  # the window closed while searching
+
+        # The search walks folders that may be on NFS; keep the form responsive.
+        threading.Thread(target=work, name="input-discovery", daemon=True).start()
+
+    def _apply_discovery(self, netlist: str, result: InputDiscovery) -> List[str]:
+        """Fill the boxes from the netlist's run folder.
+
+        A netlist for another design replaces both paths when the option is on;
+        otherwise only empty or still auto-filled boxes are touched.
+        """
+        if netlist != self.netlist_picker.path():
+            return []
+        new_design = (self.autofill_check.isChecked()
+                      and netlist != self._inputs_netlist)
+        self._inputs_netlist = netlist
+        filled: List[str] = []
+        # Only the fault list offers "Pick another"; constraints are edited by hand.
+        for label, picker, choice, offer in (
+                ("fault list", self.faults_picker, result.faults, True),
+                ("constraints", self.constraints_picker, result.constraints, False)):
+            if choice is None:
+                continue
+            if picker.path() and not picker.is_auto and not new_design:
+                continue
+            picker.set_auto(choice.path, choice.note,
+                            choice.alternatives if offer else [])
+            filled.append(label)
+        if getattr(self, "toast", None) is None:
+            return filled
+        if filled:
+            self.notify("Filled the " + " and ".join(filled) + " from the "
+                        "netlist's run folder \u2014 see the note under each box.")
+        elif new_design and result.faults is None:
+            self.notify("No fault list was found near the new netlist; set the "
+                        "Fault list yourself.", "warn")
+        return filled
+
     def _restore_paths(self) -> None:
         s = self._settings
+        self.autofill_check.blockSignals(True)
+        self.autofill_check.setChecked(bool(getattr(s, "auto_fill_inputs", True)))
+        self.autofill_check.blockSignals(False)
+        # The restored fault list and constraints belong to the restored netlist.
+        self._inputs_netlist = s.last_netlist or ""
         if s.last_netlist:
             self.netlist_picker.set_path(s.last_netlist)
         if s.last_faults:
@@ -1716,6 +1900,29 @@ class MainWindow(QMainWindow):
         for picker in (self.netlist_picker, self.faults_picker,
                        self.constraints_picker, self.outdir_picker):
             inputs_layout.addWidget(picker)
+            if picker is self.netlist_picker:
+                fill_row = QHBoxLayout()
+                fill_row.addSpacing(236)
+                self.autofill_check = QCheckBox(
+                    "Fill the fault list and constraints from a new netlist")
+                self.autofill_check.setChecked(True)
+                self.autofill_check.setToolTip(
+                    "When you enter a netlist for another design, look in its "
+                    "ATPG run folder and replace the Fault list and Constraints "
+                    "paths with the ones found there. Off: only empty boxes "
+                    "are ever filled in.")
+                self.autofill_check.toggled.connect(self._on_autofill_toggled)
+                fill_row.addWidget(self.autofill_check)
+                fill_row.addStretch(1)
+                inputs_layout.addLayout(fill_row)
+        #: The netlist the fault list and constraints boxes currently belong to.
+        self._inputs_netlist = ""
+        self._discovered_for = ""
+        #: Tests run the search inline instead of on a thread.
+        self._discovery_sync = False
+        self._discovery_relay = _DiscoveryRelay(self)
+        self._discovery_relay.done.connect(self._apply_discovery)
+        self.netlist_picker.checked.connect(self._on_netlist_checked)
 
         toggle_row = QHBoxLayout()
         self.recent_btn = QToolButton()
@@ -2402,6 +2609,7 @@ class MainWindow(QMainWindow):
         self.netlist_picker.set_path(entry.get("netlist", ""))
         self.faults_picker.set_path(entry.get("faults", ""))
         self.constraints_picker.set_path(entry.get("constraints", ""))
+        self._inputs_netlist = self.netlist_picker.path()
         if entry.get("outdir"):
             self.outdir_picker.set_path(entry["outdir"])
         self._set_inputs_collapsed(False)
@@ -3586,6 +3794,7 @@ class MainWindow(QMainWindow):
         self._sync_visualizer_config()
         s.custom_skills_dir = self.custom_skills_panel.custom_dir()
         s.auto_save_report = self.autosave_check.isChecked()
+        s.auto_fill_inputs = self.autofill_check.isChecked()
         s.show_advanced_tabs = bool(
             getattr(self, "advanced_tabs_action", None)
             and self.advanced_tabs_action.isChecked())
@@ -4302,6 +4511,9 @@ class MainWindow(QMainWindow):
                 assigned[kind] = path
             else:
                 unknown.append(path)
+        if "faults" in assigned or "constraints" in assigned:
+            # Dropped together with the netlist: the user's files, not a guess.
+            self._inputs_netlist = self.netlist_picker.path()
         parts = [f"{names[k]} \u2190 {os.path.basename(p)}"
                  for k, p in assigned.items()]
         if unknown:

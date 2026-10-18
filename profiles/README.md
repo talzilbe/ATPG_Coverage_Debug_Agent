@@ -36,6 +36,9 @@ live here without being published.
 | `psetup.executable` | Project-setup wrapper. |
 | `psetup.proj` / `.cfg` | Defaults for the `-proj` / `-cfg` arguments. |
 | `psetup.command_flag` | Flag that runs a command inside the setup shell. `-x` keeps the shell open afterwards; `-cmd` exits. |
+| `psetup.active_env` | Variables the setup exports. If any is set when you launch, the launch is already inside the setup and runs the tool directly instead of entering it again. Empty = always enter it. |
+| `psetup.setup_cmd_env` | Variable holding the setup command line in effect; parsed with the flags above to learn the active project/config/workarea, for the mismatch warning. |
+| `psetup.ward_env` | Variable holding the active workarea. |
 | `environment` | `setenv` lines written into the inner script. A variable whose name contains `LICENSE`/`LICENCE` is the one the GUI's licence field overrides. |
 | `tool.executable` | Vendor tool binary. |
 | `tool.dofile_flag` / `.logfile_flag` / `.replace_flag` | How the tool is pointed at the generated dofile and log. |

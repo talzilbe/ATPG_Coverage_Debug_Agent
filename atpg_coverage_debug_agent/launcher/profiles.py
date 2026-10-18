@@ -100,6 +100,14 @@ class PsetupSpec:
     #: offers ``-x`` (stay in the shell afterwards) and ``-cmd`` (exit).
     command_flag: str = "-x"
     extra_args: List[str] = field(default_factory=list)
+    #: Environment variables the setup exports; any one set means the launch
+    #: is already inside the setup and must not enter it again.  Empty = never.
+    active_env: List[str] = field(default_factory=list)
+    #: Variable holding the setup command line that is in effect, parsed with
+    #: the flags above to learn the active project, config and workarea.
+    setup_cmd_env: str = ""
+    #: Variable holding the active workarea.
+    ward_env: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PsetupSpec":
@@ -112,6 +120,9 @@ class PsetupSpec:
             ward_flag=str(data.get("ward_flag", "-ward")),
             command_flag=str(data.get("command_flag", "-x")),
             extra_args=[str(a) for a in data.get("extra_args", [])],
+            active_env=[str(a) for a in data.get("active_env", [])],
+            setup_cmd_env=str(data.get("setup_cmd_env", "")),
+            ward_env=str(data.get("ward_env", "")),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -124,6 +135,9 @@ class PsetupSpec:
             "ward_flag": self.ward_flag,
             "command_flag": self.command_flag,
             "extra_args": list(self.extra_args),
+            "active_env": list(self.active_env),
+            "setup_cmd_env": self.setup_cmd_env,
+            "ward_env": self.ward_env,
         }
 
 

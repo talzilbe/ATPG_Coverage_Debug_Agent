@@ -21,6 +21,11 @@ def _isolated_user_profile_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("ATPG_USER_PROFILE_DIR", str(tmp_path / "user_profiles"))
     # A developer's real fix ledger would re-rank every plan under test.
     monkeypatch.setenv("ATPG_FIX_HISTORY", str(tmp_path / "fix_history.json"))
+    # Running pytest inside a project setup must not change launch scripts.
+    for name in ("CTH_SESSION_ID", "CTH_ENV_INDICATOR", "CTH_SETUP_CMD", "WORKAREA"):
+        monkeypatch.delenv(name, raising=False)
+    # Setting a netlist would otherwise search real disks around it.
+    monkeypatch.setenv("ATPG_INPUT_DISCOVERY", "0")
 
 
 @pytest.fixture

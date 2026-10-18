@@ -235,6 +235,21 @@ DEFAULT_DISPOSITION_FILE_PATTERNS = ["*.fd", "*.fd.*", "*fault*.fd*",
 #: to prefer the LAST phase when several snapshots are present.
 DEFAULT_PHASE_FILE_PATTERNS = [r"(?:^|[._-])(?:ph|phase|pass)[._-]?(\d+)"]
 
+#: Where a fault-list folder sits relative to a folder at or above the
+#: netlist; tried nearest folder first.
+DEFAULT_FAULT_LIST_DIR_GLOBS = ["faultlist", "*/faultlist", "*/*/faultlist",
+                                "*/*/*/faultlist"]
+
+#: Where the design's constraints dofile sits, same search; ``{stem}`` is the
+#: design name taken from the netlist file name.
+DEFAULT_CONSTRAINT_FILE_GLOBS = ["{stem}.do", "atpg_files/{stem}.do",
+                                 "*/atpg_files/{stem}.do",
+                                 "*/*/atpg_files/{stem}.do",
+                                 "*/*/*/atpg_files/{stem}.do"]
+
+#: How many folders above the netlist the input search climbs.
+DEFAULT_DISCOVERY_MAX_LEVELS = 3
+
 
 def _lower_list(values: Any, default: List[str]) -> List[str]:
     if not values:
@@ -275,6 +290,10 @@ class AnalysisConfig:
             is excluded from fault-list candidacy.
         disposition_file_patterns: Globs suggesting a post-disposition list.
         phase_file_patterns: Regexes whose first group is a phase number.
+        fault_list_dir_globs / constraint_file_globs: Where the fault list and
+            constraints are looked for, relative to the netlist's folder and
+            its ancestors, when the GUI fills them in from the netlist.
+        discovery_max_levels: How far above the netlist that search climbs.
         unknown_class_threshold_pct: Share of records that may carry an
             unrecognised fault class before parsing fails outright.
         unknown_class_fatal: Whether breaching that threshold raises.
@@ -319,6 +338,11 @@ class AnalysisConfig:
         default_factory=lambda: list(DEFAULT_DISPOSITION_FILE_PATTERNS))
     phase_file_patterns: List[str] = field(
         default_factory=lambda: list(DEFAULT_PHASE_FILE_PATTERNS))
+    fault_list_dir_globs: List[str] = field(
+        default_factory=lambda: list(DEFAULT_FAULT_LIST_DIR_GLOBS))
+    constraint_file_globs: List[str] = field(
+        default_factory=lambda: list(DEFAULT_CONSTRAINT_FILE_GLOBS))
+    discovery_max_levels: int = DEFAULT_DISCOVERY_MAX_LEVELS
 
     unknown_class_threshold_pct: float = 0.1
     unknown_class_fatal: bool = True
@@ -533,7 +557,8 @@ class AnalysisConfig:
                      "tie_low_patterns", "effectiveness_posdet_families",
                      "waiver_subclass_patterns", "fault_list_file_patterns",
                      "partial_fault_file_patterns",
-                     "disposition_file_patterns", "phase_file_patterns"):
+                     "disposition_file_patterns", "phase_file_patterns",
+                     "fault_list_dir_globs", "constraint_file_globs"):
             if name in data:
                 incoming = [str(v) for v in data[name] if str(v).strip()]
                 base = [] if replace else list(getattr(cfg, name))
@@ -549,6 +574,7 @@ class AnalysisConfig:
             ("unresolved_constraint_threshold_pct", float),
             ("unmapped_object_threshold_pct", float),
             ("sample_limit", int),
+            ("discovery_max_levels", int),
             ("unknown_class_fatal", bool),
             ("unresolved_constraint_fatal", bool),
             ("unmapped_object_fatal", bool),

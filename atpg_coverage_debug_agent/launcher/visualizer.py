@@ -9,7 +9,9 @@ Nothing in this module runs anything.  It produces three artefacts and an argv:
 ``psetup_launch.csh``
     enters the project setup and runs the inner script inside it, then holds the
     window open so a setup failure is readable instead of a window that blinks
-    out of existence.
+    out of existence.  When the GUI already runs inside that project setup
+    (the profile's ``psetup.active_env`` markers are set), the setup is not
+    entered again and the inner script runs directly.
 
 In heavy mode the project setup runs ``heavy_submit.csh`` instead, which hands
 ``heavy_remote.csh`` to Netbatch; that opens an xterm on the heavy machine and
@@ -26,11 +28,12 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .live_session import (
     PORT_FILE, TOKEN_FILE, InspectAction, build_listener_tcl, local_addresses,
@@ -246,6 +249,8 @@ class LaunchBundle:
     remote_script_path: str = ""
     #: Heavy mode only: where nbjob's output (with the job id) lands.
     job_file: str = ""
+    #: The launch ran inside the project setup that was already active.
+    setup_reused: bool = False
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -265,7 +270,82 @@ class LaunchBundle:
             "submit_script_path": self.submit_script_path,
             "remote_script_path": self.remote_script_path,
             "job_file": self.job_file,
+            "setup_reused": self.setup_reused,
         }
+
+
+@dataclass
+class ActiveSetup:
+    """The project setup this process is already running inside."""
+
+    #: The profile's marker variables that were found set.
+    markers: List[str]
+    proj: str = ""
+    cfg: str = ""
+    ward: str = ""
+
+    def describe(self) -> str:
+        parts = [f"proj {self.proj}" if self.proj else "",
+                 f"cfg {self.cfg}" if self.cfg else "",
+                 f"workarea {self.ward}" if self.ward else ""]
+        return ", ".join(p for p in parts if p) or ", ".join(self.markers)
+
+
+def _flag_value(words: Sequence[str], flag: str) -> str:
+    if not flag:
+        return ""
+    for i, word in enumerate(words[:-1]):
+        if word == flag:
+            return words[i + 1]
+    return ""
+
+
+def detect_active_setup(profile: ToolProfile,
+                        environ: Optional[Mapping[str, str]] = None,
+                        ) -> Optional[ActiveSetup]:
+    """The setup already in effect for this process, or None.
+
+    Detection is profile data (``psetup.active_env``); a profile that names
+    no marker variables always enters the setup.
+    """
+    env = os.environ if environ is None else environ
+    psetup = profile.psetup
+    found = [name for name in psetup.active_env if str(env.get(name, "")).strip()]
+    if not found:
+        return None
+    active = ActiveSetup(markers=found)
+    command = str(env.get(psetup.setup_cmd_env, "")) if psetup.setup_cmd_env else ""
+    if command:
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            words = command.split()
+        active.proj = _flag_value(words, psetup.proj_flag)
+        active.cfg = _flag_value(words, psetup.cfg_flag)
+        active.ward = _flag_value(words, psetup.ward_flag)
+    if psetup.ward_env and str(env.get(psetup.ward_env, "")).strip():
+        active.ward = str(env[psetup.ward_env]).strip()
+    return active
+
+
+def setup_mismatches(profile: ToolProfile, inputs: VisualizerInputs,
+                     active: ActiveSetup) -> List[str]:
+    """Where the active setup differs from what the form asks for."""
+    wanted = [
+        ("project", (inputs.proj or profile.psetup.proj).strip(), active.proj),
+        ("config", (inputs.cfg or profile.psetup.cfg).strip(), active.cfg),
+    ]
+    differ = [f"{label} {have} (form: {want})" for label, want, have in wanted
+              if want and have and want != have]
+    ward = inputs.ward.strip()
+    if ward and active.ward and (os.path.normpath(ward)
+                                 != os.path.normpath(active.ward)):
+        differ.append(f"workarea {active.ward} (form: {ward})")
+    if not differ:
+        return []
+    return ["Already inside a project setup with " + "; ".join(differ)
+            + ". It is used as is; to change it, start the GUI from the "
+            "right setup or from a plain shell."]
 
 
 def _effective_env(profile: ToolProfile, inputs: VisualizerInputs) -> Dict[str, str]:
@@ -366,33 +446,46 @@ def build_tessent_script(profile: ToolProfile, inputs: VisualizerInputs,
 
 
 def build_psetup_script(profile: ToolProfile, inputs: VisualizerInputs,
-                        tessent_script_path: str) -> str:
+                        tessent_script_path: str,
+                        active: Optional[ActiveSetup] = None) -> str:
     """Render the outer script: enter project setup, run the inner script.
+
+    With *active*, the setup is already in effect and the inner script is run
+    directly; entering it a second time would nest a fresh setup.
 
     The window is held open afterwards on purpose.  Without it a project-setup
     failure closes the terminal instantly and the user has nothing to read.
     """
     psetup = profile.psetup
-    if not psetup.executable:
-        raise LaunchInputError(
-            f"profile '{profile.title}' does not name a project-setup executable")
-    exe = validate_fs_path(psetup.executable, "Project setup executable")
     inner = validate_fs_path(tessent_script_path, "Inner script",
                              require_exists=False)
-    proj = validate_token(inputs.proj or psetup.proj, "Project (-proj)")
-    cfg = validate_token(inputs.cfg or psetup.cfg, "Config (-cfg)", required=False)
-    ward = inputs.ward.strip()
-    if ward:
-        ward = validate_fs_path(ward, "Workarea (-ward)", require_exists=True,
-                                must_be_dir=True)
-
-    parts = [quote_shell(exe), psetup.proj_flag, quote_shell(proj)]
-    if cfg:
-        parts.extend([psetup.cfg_flag, quote_shell(cfg)])
-    if ward:
-        parts.extend([psetup.ward_flag, quote_shell(ward)])
-    parts.extend(psetup.extra_args)
-    parts.extend([psetup.command_flag, quote_shell(inner)])
+    if active is not None:
+        header = ("# Project setup is already active (" + ", ".join(active.markers)
+                  + "); it is reused, not entered again.")
+        run_line = quote_shell(inner)
+        failure = "The launch script exited with status $rc."
+    else:
+        if not psetup.executable:
+            raise LaunchInputError(
+                f"profile '{profile.title}' does not name a project-setup executable")
+        exe = validate_fs_path(psetup.executable, "Project setup executable")
+        proj = validate_token(inputs.proj or psetup.proj, "Project (-proj)")
+        cfg = validate_token(inputs.cfg or psetup.cfg, "Config (-cfg)",
+                             required=False)
+        ward = inputs.ward.strip()
+        if ward:
+            ward = validate_fs_path(ward, "Workarea (-ward)", require_exists=True,
+                                    must_be_dir=True)
+        parts = [quote_shell(exe), psetup.proj_flag, quote_shell(proj)]
+        if cfg:
+            parts.extend([psetup.cfg_flag, quote_shell(cfg)])
+        if ward:
+            parts.extend([psetup.ward_flag, quote_shell(ward)])
+        parts.extend(psetup.extra_args)
+        parts.extend([psetup.command_flag, quote_shell(inner)])
+        header = ""
+        run_line = " ".join(parts)
+        failure = "Project setup exited with status $rc."
 
     if inputs.heavy:
         tail = [
@@ -411,12 +504,13 @@ def build_psetup_script(profile: ToolProfile, inputs: VisualizerInputs,
     return "\n".join([
         f"#!{profile.shell} -f",
         "# Generated by the ATPG Coverage Debug Agent.",
+        *([header] if header else []),
         "",
-        " ".join(parts),
+        run_line,
         "set rc = $status",
         "if ( $rc != 0 ) then",
         '    echo ""',
-        '    echo "Project setup exited with status $rc."',
+        f'    echo "{failure}"',
         "endif",
         *tail,
         'set reply = "$<"',
@@ -572,7 +666,9 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
                         dest_dir: Optional[str] = None,
                         terminal: Optional[TerminalSpec] = None,
                         extra_commands: Sequence[str] = (),
-                        dofile_text: Optional[str] = None) -> LaunchBundle:
+                        dofile_text: Optional[str] = None,
+                        environ: Optional[Mapping[str, str]] = None,
+                        ) -> LaunchBundle:
     """Validate the inputs, write the three artefacts, and return the bundle.
 
     *dofile_text* replaces the generated dofile verbatim.  It is the escape
@@ -585,9 +681,13 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
             "the repository (its executables are /path/to/... placeholders). "
             "Select a site profile, or copy the template to <site>.json in the "
             "profiles directory and fill in the real paths.")
+    active = detect_active_setup(profile, environ)
     if dest_dir is None:
         if inputs.heavy:
-            dest_dir = heavy_bundle_dir(inputs)
+            ward_inputs = inputs
+            if active is not None and active.ward and not inputs.ward.strip():
+                ward_inputs = replace(inputs, ward=active.ward)
+            dest_dir = heavy_bundle_dir(ward_inputs)
         else:
             from ..session import session_dir  # local import keeps this module standalone
             dest_dir = session_dir(design="visualizer")
@@ -632,6 +732,8 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
             allowed_peers=peers, log_file=log_path)
 
     warnings: List[str] = []
+    if active is not None:
+        warnings.extend(setup_mismatches(profile, inputs, active))
     if dofile_text is None:
         commands = build_commands(profile, inputs, extra_commands)
         dofile = build_dofile(profile, inputs, extra_commands, listener)
@@ -648,9 +750,9 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
     if inputs.heavy:
         submit_script = build_heavy_submit_script(profile, remote_path, job_path)
         remote_script = build_heavy_remote_script(profile, tessent_path, display)
-        psetup_script = build_psetup_script(profile, inputs, submit_path)
+        psetup_script = build_psetup_script(profile, inputs, submit_path, active)
     else:
-        psetup_script = build_psetup_script(profile, inputs, tessent_path)
+        psetup_script = build_psetup_script(profile, inputs, tessent_path, active)
     argv, term = build_launch_argv(profile, psetup_path, terminal)
 
     # A stale port file would point the GUI at a dead or unrelated session.
@@ -690,6 +792,7 @@ def write_launch_bundle(profile: ToolProfile, inputs: VisualizerInputs,
         submit_script_path=submit_path if inputs.heavy else "",
         remote_script_path=remote_path if inputs.heavy else "",
         job_file=job_path if inputs.heavy else "",
+        setup_reused=active is not None,
     )
 
 
@@ -798,7 +901,8 @@ def fault_inspect_commands(profile: ToolProfile, fault_path: str,
 
 
 def describe_chain(profile: ToolProfile, inputs: VisualizerInputs,
-                   extra_commands: Sequence[str] = ()) -> List[str]:
+                   extra_commands: Sequence[str] = (),
+                   environ: Optional[Mapping[str, str]] = None) -> List[str]:
     """A human-readable account of the whole chain, for reports and the agent.
 
     Used where the commands are shown rather than run, so the user can paste
@@ -809,12 +913,17 @@ def describe_chain(profile: ToolProfile, inputs: VisualizerInputs,
     cfg = (inputs.cfg or psetup.cfg).strip()
     steps: List[str] = []
 
-    setup = f"{psetup.executable} {psetup.proj_flag} {proj}"
-    if cfg:
-        setup += f" {psetup.cfg_flag} {cfg}"
-    if inputs.ward.strip():
-        setup += f" {psetup.ward_flag} {inputs.ward.strip()}"
-    steps.append(setup)
+    active = detect_active_setup(profile, environ)
+    if active is not None:
+        steps.append(f"# already inside project setup ({active.describe()}); "
+                     f"{os.path.basename(psetup.executable) or 'setup'} is not run again")
+    else:
+        setup = f"{psetup.executable} {psetup.proj_flag} {proj}"
+        if cfg:
+            setup += f" {psetup.cfg_flag} {cfg}"
+        if inputs.ward.strip():
+            setup += f" {psetup.ward_flag} {inputs.ward.strip()}"
+        steps.append(setup)
 
     env = dict(profile.environment)
     licence = inputs.licence_server.strip()
@@ -835,10 +944,12 @@ def describe_chain(profile: ToolProfile, inputs: VisualizerInputs,
     return steps
 
 
-def missing_inputs(profile: ToolProfile, inputs: VisualizerInputs) -> List[str]:
+def missing_inputs(profile: ToolProfile, inputs: VisualizerInputs,
+                   environ: Optional[Mapping[str, str]] = None) -> List[str]:
     """Labels of everything still required before a launch can be attempted."""
     missing: List[str] = []
-    if not (inputs.proj or profile.psetup.proj).strip():
+    if (not (inputs.proj or profile.psetup.proj).strip()
+            and detect_active_setup(profile, environ) is None):
         missing.append("Project (-proj)")
     for entry in profile.commands.load:
         if entry.required and not (inputs.paths.get(entry.key) or "").strip():
@@ -870,14 +981,23 @@ class HealthCheck:
 
 
 def launch_health(profile: ToolProfile, inputs: VisualizerInputs,
+                  environ: Optional[Mapping[str, str]] = None,
                   ) -> List[HealthCheck]:
     """Everything that can be verified before a launch, without running anything."""
     checks: List[HealthCheck] = []
     if profile.is_template:
         checks.append(HealthCheck(
             "Profile", False, "the shipped template has placeholder executables"))
+    active = detect_active_setup(profile, environ)
     psetup = profile.psetup.executable
-    if psetup:
+    if active is not None:
+        checks.append(HealthCheck(
+            "Project setup", True,
+            f"already active ({active.describe()}); reused, not entered again"))
+        for warning in setup_mismatches(profile, inputs, active):
+            checks.append(HealthCheck(
+                "Project setup matches the form", False, warning, blocking=False))
+    elif psetup:
         ok = os.path.isfile(psetup) and os.access(psetup, os.X_OK)
         checks.append(HealthCheck(
             "Project setup wrapper", ok,
@@ -922,7 +1042,7 @@ def launch_health(profile: ToolProfile, inputs: VisualizerInputs,
             "Licence server", True, licence or "profile sets none"))
     except LaunchInputError as exc:
         checks.append(HealthCheck("Licence server", False, str(exc)))
-    if not (inputs.proj or profile.psetup.proj).strip():
+    if (not (inputs.proj or profile.psetup.proj).strip()) and active is None:
         checks.append(HealthCheck("Project (-proj)", False, "required"))
     for entry in profile.commands.load:
         label = entry.label or entry.key
