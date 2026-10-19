@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
 from .. import session
+from . import cth_models
 from ..analysis import investigate
 from ..analysis.census import build_census
 from ..analysis.findings import FINDINGS_FILE, read_findings
@@ -36,6 +37,29 @@ TOOL_LOG_FILE = "tool_calls.jsonl"
 
 #: Seconds a stopped CLI gets to exit on SIGTERM before it is killed.
 CANCEL_GRACE_S = 3.0
+
+#: Prompts longer than this (bytes) are piped to the CLI instead of passed
+#: with -p: Linux rejects any single argument over 128 KiB (E2BIG).
+ARG_PROMPT_LIMIT = 100_000
+
+
+def _signal_proc(proc: subprocess.Popen, kill: bool) -> None:
+    """Terminate (or kill) *proc*, or its whole group when it leads one.
+
+    The Cth.ai route runs copilot as a grandchild of the Cth setup, so stopping
+    only the direct child would leave the model call running.
+    """
+    if getattr(proc, "atpg_group", False):
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL if kill else signal.SIGTERM)
+            return
+        except (OSError, AttributeError):
+            pass
+    if kill:
+        proc.kill()
+    else:
+        proc.terminate()
 
 
 class AgentCancelled(Exception):
@@ -79,7 +103,7 @@ class CancelToken:
     def _terminate(proc: subprocess.Popen) -> None:
         try:
             if proc.poll() is None:
-                proc.terminate()
+                _signal_proc(proc, False)
         except OSError:
             return
 
@@ -88,7 +112,7 @@ class CancelToken:
                 proc.wait(timeout=CANCEL_GRACE_S)
             except subprocess.TimeoutExpired:
                 try:
-                    proc.kill()
+                    _signal_proc(proc, True)
                 except OSError:
                     pass
 
@@ -589,6 +613,77 @@ def follow_up_message(message: str) -> str:
     return f"{FOLLOW_UP_INSTRUCTION}\n\n{message}"
 
 
+EARLIER_CONVERSATION_HEADER = (
+    "## EARLIER CONVERSATION ON THIS REPORT\n"
+    "This continues an earlier conversation with you about the report "
+    "above. It is your own earlier work: build on it and stay consistent "
+    "with it, but re-check any claim against the evidence before relying "
+    "on it. Do not repeat it back."
+)
+
+#: Sent as-is (not as a follow-up question) to shrink the conversation.
+COMPACT_INSTRUCTION = (
+    "[Compact the conversation.] Summarise our conversation so far so that "
+    "it can replace the full history: the questions asked, your current "
+    "conclusions with the evidence behind them (fault ids, hierarchy paths, "
+    "commands and numbers copied exactly), corrections made along the way, "
+    "open questions and what was going to be checked next. Use short "
+    "Markdown bullet points. Do not add new analysis and do not call tools."
+)
+
+
+def mcp_tools_note(netlist_available: bool, follow_up: bool = False) -> str:
+    """The prompt section that introduces the ATPG MCP tools."""
+    tool_names = ", ".join(investigate.TOOL_SPECS)
+    goal = ("record what you establish with record_finding, and answer the "
+            "question below." if follow_up else
+            "Start with list_open_questions, record what you establish with "
+            "record_finding, and when you have enough evidence produce the "
+            "A-F answer.")
+    return (
+        "\n\n## AVAILABLE MCP TOOLS (server 'atpg')\n"
+        "You can call these deterministic investigation tools to gather "
+        "exact structural evidence before concluding: " + tool_names + ".\n"
+        "Use them to drill into specific faults, constraints, and paths "
+        "(e.g. list_faults(fault_class='UO'), get_fault_detail(fault=...), "
+        "why_blocked(fault=...), trace_path(from_instance=..., "
+        "to_instance=...)). Every result is Observed/Derived structural "
+        "fact. "
+        + ("The parsed netlist IS available to these tools in this "
+           "session, so scan_status / trace_path / verify_paths answer "
+           "from the design itself. " if netlist_available else
+           "The parsed netlist could not be handed to the tools in this "
+           "session; they answer from recorded evidence. ")
+        + goal + " skill_findings returns the enabled analysis skills' "
+        "results and read_guidance the engineer's guidance documents."
+        "\nIf the user has a Tessent Visualizer session open, "
+        "tessent_session_status and tessent_run reach it; every "
+        "tessent_run script needs the user's approval in the GUI.")
+
+
+def conversation_seed(report: Any, max_faults: int = 200, diagnosis: str = "",
+                      turns: Any = (), summary: str = "",
+                      agentic: bool = False) -> str:
+    """The first message of a fresh session that continues a conversation.
+
+    The report evidence comes first, then the earlier conversation: the
+    *summary* of a compacted one, else the *diagnosis*, followed by the
+    (role, text) *turns* after it.
+    """
+    labels = {"You": "User", "Agent": "You (the agent)",
+              "Tessent": "Result from the live Tessent session"}
+    parts = [build_user_payload(report, max_faults, agentic=agentic),
+             EARLIER_CONVERSATION_HEADER]
+    if summary:
+        parts.append("### Summary of the conversation so far\n\n" + summary)
+    elif diagnosis:
+        parts.append("### Your initial diagnosis\n\n" + diagnosis)
+    for role, text in turns:
+        if role in labels and (text or "").strip():
+            parts.append(f"### {labels[role]}\n\n{text.strip()}")
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Agent configuration
 # ---------------------------------------------------------------------------
@@ -644,7 +739,8 @@ class AgentConfig:
     def configured(self) -> bool:
         """True when enough is set to attempt a live LLM call."""
         if self.backend == "cli":
-            return bool(self.cli_path.strip())
+            return bool(self.cli_path.strip()
+                        or cth_models.free_model_id(self.cli_model))
         return bool(self.base_url.strip() and self.model.strip())
 
 
@@ -1517,18 +1613,27 @@ class DebugAgent:
     def chat(self, message: str, session_id: Optional[str] = None,
              history: Optional[List[dict]] = None, on_chunk=None,
              report: Any = None, skill_manager: Any = None, ctx: Any = None,
-             on_event=None, max_iterations: int = 6) -> str:
+             on_event=None, max_iterations: int = 6,
+             seed: Optional[str] = None, wrap: bool = True,
+             check: bool = True) -> str:
         """Send a follow-up message and return the reply.
 
         CLI backend: resumes the prior CLI session (``session_id``) so the model
         keeps the full analysis context, and re-attaches the MCP tool server
         when this agent holds a live :class:`McpSession` -- so a follow-up can
-        investigate, not just recall. HTTP backend: replays ``history`` (a
+        investigate, not just recall. With *seed* (see
+        :func:`conversation_seed`) it instead starts the new session
+        ``session_id`` from that context, then asks *message*; given *ctx*
+        and no live session, it first opens the MCP tool server for it.
+        HTTP backend:
+        replays ``history`` (a
         full OpenAI messages list already including the new user turn); when
         *skill_manager* and *ctx* are given the turn runs through the same
         tool loop as the first answer.
 
-        When *report* is given the reply gets the same guardrail correction
+        *wrap* False sends *message* without the follow-up instruction.
+        When *report* is given (and *check*) the reply gets the same
+        guardrail correction
         as the first answer -- follow-ups are where "how much would that
         recover?" lands.
         """
@@ -1543,22 +1648,40 @@ class DebugAgent:
             if not session_id:
                 raise RuntimeError(
                     "No CLI session to resume — run the agent first.")
+            if (seed and ctx is not None and self.mcp_session is None
+                    and self.config.cli_use_mcp):
+                try:
+                    self.open_mcp_session(report, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    emit(f"⚠ Could not start the ATPG MCP tools ({exc}).")
             extra = self.mcp_session.extra_args() if self.mcp_session else []
             if extra:
                 emit("Follow-up turn with the ATPG MCP tools attached.")
             else:
                 emit("Follow-up turn WITHOUT tools: the model can only recall "
                      "the first answer's evidence.")
-            answer = self._call_cli("", follow_up_message(message),
-                                    session_id=session_id,
-                                    resume=True, on_chunk=on_chunk,
-                                    extra_args=extra or None)
+            text = follow_up_message(message) if wrap else message
+            if seed:
+                emit("Starting a new agent session that carries the earlier "
+                     "conversation as context.")
+                system = AGENTIC_SYSTEM_PROMPT if extra else SYSTEM_PROMPT
+                if extra:
+                    seed += mcp_tools_note(
+                        bool(self.mcp_session.netlist_path), follow_up=True)
+                answer = self._call_cli(system, seed + "\n\n" + text,
+                                        session_id=session_id,
+                                        on_chunk=on_chunk,
+                                        extra_args=extra or None)
+            else:
+                answer = self._call_cli("", text, session_id=session_id,
+                                        resume=True, on_chunk=on_chunk,
+                                        extra_args=extra or None)
         else:
             if not history:
                 raise RuntimeError("No conversation history for HTTP chat.")
             last = history[-1]
-            if last.get("role") == "user" and isinstance(last.get("content"),
-                                                          str):
+            if (wrap and last.get("role") == "user"
+                    and isinstance(last.get("content"), str)):
                 last["content"] = follow_up_message(last["content"])
             if skill_manager is not None and ctx is not None:
                 # history is extended in place with the tool exchange.
@@ -1569,7 +1692,7 @@ class DebugAgent:
             else:
                 reply = self._post_chat(history, tools=None)
                 answer = reply.get("content") or ""
-        if report is not None:
+        if report is not None and check:
             answer = self.correct_guardrail_issues(answer, report, emit)
         return answer
 
@@ -1649,6 +1772,24 @@ class DebugAgent:
         cache entry) lets those tools run the real structural machinery.
         The owner of the conversation closes it.
         """
+        sess = self.open_mcp_session(report, ctx)
+        cfg_path, netlist_pkl = sess.config_path, sess.netlist_path
+        tool_names = ", ".join(investigate.TOOL_SPECS)
+        payload = build_user_payload(report, self.config.max_faults,
+                                     agentic=True)
+        payload += mcp_tools_note(bool(netlist_pkl))
+        payload += _regression_note(getattr(ctx, "compare", None))
+
+        emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")
+        emit("Netlist handed to the tools: "
+             + (netlist_pkl or "NO (tools answer from recorded evidence)"))
+        return self._call_cli(
+            AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
+            extra_args=["--additional-mcp-config", "@" + cfg_path],
+            on_chunk=on_chunk)
+
+    def open_mcp_session(self, report: Any, ctx: Any) -> "McpSession":
+        """Write the evidence and the MCP server config; keep the session."""
         if self.mcp_session is not None:
             self.mcp_session.close()
         sources = dict(getattr(report, "sources", None) or {})
@@ -1699,40 +1840,7 @@ class DebugAgent:
         self.mcp_session = McpSession(work_dir=work_dir, config_path=cfg_path,
                                       evidence_path=ev_path,
                                       netlist_path=netlist_pkl)
-
-        tool_names = ", ".join(investigate.TOOL_SPECS)
-        payload = build_user_payload(report, self.config.max_faults,
-                                     agentic=True)
-        payload += (
-            "\n\n## AVAILABLE MCP TOOLS (server 'atpg')\n"
-            "You can call these deterministic investigation tools to gather "
-            "exact structural evidence before concluding: " + tool_names + ".\n"
-            "Use them to drill into specific faults, constraints, and paths "
-            "(e.g. list_faults(fault_class='UO'), get_fault_detail(fault=...), "
-            "why_blocked(fault=...), trace_path(from_instance=..., "
-            "to_instance=...)). Every result is Observed/Derived structural "
-            "fact. "
-            + ("The parsed netlist IS available to these tools in this "
-               "session, so scan_status / trace_path / verify_paths answer "
-               "from the design itself. " if netlist_pkl else
-               "The parsed netlist could not be handed to the tools in this "
-               "session; they answer from recorded evidence. ")
-            + "Start with list_open_questions, record what you establish with "
-            "record_finding, and when you have enough evidence produce the "
-            "A-F answer. skill_findings returns the enabled analysis skills' "
-            "results and read_guidance the engineer's guidance documents."
-            "\nIf the user has a Tessent Visualizer session open, "
-            "tessent_session_status and tessent_run reach it; every "
-            "tessent_run script needs the user's approval in the GUI.")
-        payload += _regression_note(getattr(ctx, "compare", None))
-
-        emit(f"Launching Copilot CLI with ATPG MCP tools: {tool_names}")
-        emit("Netlist handed to the tools: "
-             + (netlist_pkl or "NO (tools answer from recorded evidence)"))
-        return self._call_cli(
-            AGENTIC_SYSTEM_PROMPT, payload, session_id=session_id,
-            extra_args=["--additional-mcp-config", "@" + cfg_path],
-            on_chunk=on_chunk)
+        return self.mcp_session
 
     def _call_cli(self, system_prompt: str, user_payload: str,
                   session_id: Optional[str] = None,
@@ -1754,11 +1862,13 @@ class DebugAgent:
                         ``user_payload`` (the prior context is already in the
                         session), enabling multi-turn conversation.
         """
+        free_id = cth_models.free_model_id(self.config.cli_model)
         exe = self.config.cli_path.strip()
-        if not exe:
-            raise RuntimeError("No Copilot CLI path configured.")
-        if not os.path.isfile(exe):
-            raise RuntimeError(f"Copilot CLI not found at: {exe}")
+        if free_id is None:
+            if not exe:
+                raise RuntimeError("No Copilot CLI path configured.")
+            if not os.path.isfile(exe):
+                raise RuntimeError(f"Copilot CLI not found at: {exe}")
 
         if resume:
             prompt = user_payload
@@ -1779,26 +1889,49 @@ class DebugAgent:
             env["COPILOT_GITHUB_TOKEN"] = self.config.cli_token.strip()
 
         scratch = tempfile.mkdtemp(prefix="atpg_cop_")
-        cmd = [
-            exe, "-p", prompt, "-s", "--no-color", "--allow-all-tools",
+        prompt_file = None
+        if len(prompt.encode("utf-8")) > ARG_PROMPT_LIMIT:
+            prompt_file = os.path.join(scratch, "prompt.txt")
+            with open(prompt_file, "w", encoding="utf-8") as fh:
+                fh.write(prompt)
+        args = ([] if prompt_file else ["-p", prompt]) + [
+            "-s", "--no-color", "--allow-all-tools",
             "--no-remote", "--log-level", "error", "-C", scratch,
         ]
         if resume and session_id:
-            cmd += ["--resume", session_id]
+            args += ["--resume", session_id]
         elif session_id:
-            cmd += ["--session-id", session_id]
-        if self.config.cli_model.strip():
-            cmd += ["--model", self.config.cli_model.strip()]
+            args += ["--session-id", session_id]
+        if free_id is None and self.config.cli_model.strip():
+            args += ["--model", self.config.cli_model.strip()]
         if extra_args:
-            cmd += list(extra_args)
+            args += list(extra_args)
+
+        out_filter = None
+        stdin_path = prompt_file
+        if free_id is None:
+            cmd = [exe] + args
+        else:
+            # The wrapper picks its own COPILOT_HOME and authenticates with
+            # the Autobots token, so the GitHub settings do not apply.
+            env.pop("COPILOT_GITHUB_TOKEN", None)
+            cth_models.headless_env(env)
+            cmd, via_psetup = cth_models.build_command(
+                free_id, args, scratch, env, stdin_path=prompt_file)
+            out_filter = cth_models.OutputFilter(wait_for_marker=via_psetup)
+            if via_psetup:
+                stdin_path = None
 
         # Every CLI call goes through Popen so a Stop can terminate it; the
         # non-streaming path simply collects instead of forwarding chunks.
         self.cancel.raise_if_cancelled()
-        return self._call_cli_streaming(cmd, env, scratch, on_chunk)
+        return self._call_cli_streaming(cmd, env, scratch, on_chunk,
+                                        out_filter=out_filter,
+                                        stdin_path=stdin_path)
 
     def _call_cli_streaming(self, cmd: List[str], env: dict, scratch: str,
-                            on_chunk=None) -> str:
+                            on_chunk=None, out_filter=None,
+                            stdin_path: Optional[str] = None) -> str:
         """Run the CLI with :class:`subprocess.Popen`, emitting stdout as it
         arrives via *on_chunk* (when given), and return the full text.
 
@@ -1807,27 +1940,49 @@ class DebugAgent:
         :class:`AgentCancelled` so the caller can keep what arrived.
         """
         parts: List[str] = []
+        free = out_filter is not None
+        timeout = self.config.timeout + (cth_models.PSETUP_OVERHEAD_S
+                                         if free else 0)
+
+        def emit(text: str) -> None:
+            if text:
+                parts.append(text)
+                if on_chunk is not None:
+                    on_chunk(text)
+
         try:
-            proc = subprocess.Popen(
-                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1)
+            stdin = (open(stdin_path, "rb") if stdin_path
+                     else subprocess.DEVNULL)
+            try:
+                proc = subprocess.Popen(
+                    cmd, env=env, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, stdin=stdin,
+                    text=True, bufsize=1, start_new_session=free)
+            finally:
+                if stdin_path:
+                    stdin.close()
         except FileNotFoundError as exc:
             shutil.rmtree(scratch, ignore_errors=True)
             raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+        except OSError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise RuntimeError(
+                f"Copilot CLI could not be started: {exc}") from exc
+        proc.atpg_group = free
         self.cancel.attach(proc)
         try:
             assert proc.stdout is not None
             for chunk in iter(lambda: proc.stdout.read(80), ""):
                 if chunk:
-                    parts.append(chunk)
-                    if on_chunk is not None:
-                        on_chunk(chunk)
+                    emit(out_filter.feed(chunk) if free else chunk)
+            if free:
+                emit(out_filter.finish())
             try:
-                proc.wait(timeout=self.config.timeout)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                proc.kill()
+                _signal_proc(proc, True)
                 raise RuntimeError(
-                    f"Copilot CLI timed out after {self.config.timeout}s") from exc
+                    f"Copilot CLI timed out after {timeout}s") from exc
             err = (proc.stderr.read() if proc.stderr else "") or ""
         finally:
             self.cancel.attach(None)
@@ -1835,10 +1990,24 @@ class DebugAgent:
 
         if self.cancel.cancelled:
             raise AgentCancelled("".join(parts).strip())
-        if proc.returncode not in (0, None):
+        rc = proc.returncode
+        if free and out_filter.rc is not None:
+            rc = out_filter.rc
+        elif free and not out_filter.started:
+            rc = rc or 1  # the Cth setup failed before the model call started
+        if rc not in (0, None):
             detail = (err or "".join(parts)).strip()
+            if free:
+                # The wrapper reports on stdout, the Cth setup on stderr.
+                detail = "\n".join(s.strip() for s in (
+                    "".join(parts), out_filter.preamble, err) if s.strip())
+                hint = cth_models.explain_error(detail)
+                if hint == cth_models.LOGIN_NEEDED:
+                    raise cth_models.CthLoginRequired(hint)
+                if hint:
+                    raise RuntimeError(hint)
             raise RuntimeError(
-                f"Copilot CLI exited {proc.returncode}: {detail[:800]}")
+                f"Copilot CLI exited {rc}: {detail[-800:] if free else detail[:800]}")
         out = "".join(parts).strip()
         if not out:
             raise RuntimeError(

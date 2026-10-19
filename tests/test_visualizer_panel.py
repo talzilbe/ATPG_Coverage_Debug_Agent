@@ -180,9 +180,35 @@ def test_unlinking_the_fault_list_re_enables_the_row(panel, files):
 
 def test_the_run_directory_field_only_shows_in_that_mode(panel):
     # isVisibleTo, not isVisible: the panel itself is never shown here.
-    assert not panel.run_dir_widget.isVisibleTo(panel)
-    panel.mode_run_dir.setChecked(True)
+    assert panel.mode_run_dir.isChecked(), "run-directory mode is the default"
     assert panel.run_dir_widget.isVisibleTo(panel)
+    panel.mode_individual.setChecked(True)
+    assert not panel.run_dir_widget.isVisibleTo(panel)
+
+
+def test_the_analysis_fault_list_fills_the_paths_by_default(panel, tmp_path):
+    run, faults = _run_dir(tmp_path)
+    panel.set_analysis_faults(str(faults))
+    assert panel.run_dir_row.path() == str(run)
+    assert panel._path_rows["icl"].path() == str(run / "icl" / "core.icl")
+    other, other_faults = _run_dir(tmp_path / "second")
+    panel.set_analysis_faults(str(other_faults))
+    assert panel.run_dir_row.path() == str(other), \
+        "a derived run directory follows a new fault list"
+
+
+def test_the_dofile_editor_opens_from_a_button_and_flags_edits(panel, files):
+    for key, path in files.items():
+        panel._path_rows[key].set_path(path)
+    assert not panel.commands_dialog.isVisible()
+    panel.edit_commands_btn.click()
+    assert panel.commands_dialog.isVisible()
+    panel.commands_view.appendPlainText("report_statistics")
+    assert panel._dofile_edited
+    assert "(edited)" in panel.edit_commands_btn.text()
+    panel.refresh_preview()
+    assert "(edited)" not in panel.edit_commands_btn.text()
+    panel.commands_dialog.close()
 
 
 def _run_dir(tmp_path, with_icl=True):

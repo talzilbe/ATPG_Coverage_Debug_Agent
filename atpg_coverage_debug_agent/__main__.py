@@ -20,7 +20,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    return launch()
+    args = sys.argv[1:]
+    restore = None
+    if len(args) >= 2 and args[0] == "--restore":
+        restore = args[1]
+    return launch(restore)
 
 
 if __name__ == "__main__":

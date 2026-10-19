@@ -15,13 +15,14 @@ import logging
 import os
 import shutil
 import time
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QProcess, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
     QWidget,
 )
@@ -39,6 +40,7 @@ from ..launcher.visualizer import (
     read_launch_config, write_launch_config,
 )
 from ..launcher.profiles import import_profile_file, user_profile_dir
+from ..launcher.live_session import TOKEN_FILE
 from . import theme
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,7 @@ class VisualizerPanel(QWidget):
         self._analysis_faults = ""
         self._dofile_edited = False
         self._last_generated = ""
+        self._auto_run_dir = ""
         self._script_dir = ""
         self._log_path = ""
         self._log_offset = 0
@@ -155,7 +158,8 @@ class VisualizerPanel(QWidget):
         intro = QLabel(
             "Open the vendor viewer on this same design, to confirm a "
             "structural finding in the tool that owns the authoritative "
-            "answer. The commands are shown before they run.")
+            "answer. To see or change the Tessent commands before they run, "
+            "click 'Edit Tessent commands'.")
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
@@ -163,7 +167,7 @@ class VisualizerPanel(QWidget):
         outer.addWidget(self._build_setup_box())
         outer.addWidget(self._build_inputs_box())
         outer.addWidget(self._build_health_box())
-        outer.addWidget(self._build_commands_box(), 1)
+        self.commands_dialog = self._build_commands_dialog()
         outer.addLayout(self._build_button_row())
 
         self.status_label = QLabel("")
@@ -311,7 +315,7 @@ class VisualizerPanel(QWidget):
         mode_row = QHBoxLayout()
         self.mode_individual = QRadioButton("Enter each path")
         self.mode_run_dir = QRadioButton("Derive from an ATPG run directory")
-        self.mode_individual.setChecked(True)
+        self.mode_run_dir.setChecked(True)
         self.mode_group = QButtonGroup(self)
         self.mode_group.addButton(self.mode_individual)
         self.mode_group.addButton(self.mode_run_dir)
@@ -336,7 +340,6 @@ class VisualizerPanel(QWidget):
         run_holder = QWidget()
         run_holder.setLayout(run_row)
         run_form.addRow("Run directory:", run_holder)
-        self.run_dir_widget.setVisible(False)
         layout.addWidget(self.run_dir_widget)
 
         self.paths_widget = QWidget()
@@ -401,14 +404,18 @@ class VisualizerPanel(QWidget):
                 "detached, so it keeps running if this window closes.")
         return checks
 
-    def _build_commands_box(self) -> QGroupBox:
-        box = QGroupBox("Commands that will run")
-        layout = QVBoxLayout(box)
+    def _build_commands_dialog(self) -> QDialog:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Tessent commands (dofile)")
+        dialog.resize(800, 500)
+        layout = QVBoxLayout(dialog)
 
         note = QLabel(
-            "This is the dofile, verbatim. Edit it to change what runs — an "
-            "edited dofile is used exactly as written and is not re-checked "
-            "against the inputs above.")
+            "These are the commands Tessent runs when you press Launch "
+            "(the dofile). You only need to change them for something "
+            "special — an edited dofile is used exactly as written and is "
+            "not re-checked against the form. Your edits are kept when you "
+            "close this window.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -419,8 +426,8 @@ class VisualizerPanel(QWidget):
         layout.addWidget(self.commands_view, 1)
 
         row = QHBoxLayout()
-        regen = QPushButton("Regenerate")
-        regen.setToolTip("Rebuild the dofile from the inputs, discarding edits.")
+        regen = QPushButton("Undo my edits")
+        regen.setToolTip("Rebuild the dofile from the form, discarding edits.")
         regen.clicked.connect(self.refresh_preview)
         row.addWidget(regen)
         copy_btn = QPushButton("Copy commands")
@@ -435,8 +442,21 @@ class VisualizerPanel(QWidget):
         clear_extra.clicked.connect(self.clear_extra_commands)
         row.addWidget(clear_extra)
         row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        row.addWidget(close_btn)
         layout.addLayout(row)
-        return box
+        return dialog
+
+    def on_edit_commands(self) -> None:
+        self.commands_dialog.show()
+        self.commands_dialog.raise_()
+        self.commands_dialog.activateWindow()
+
+    def _update_edit_button(self) -> None:
+        self.edit_commands_btn.setText(
+            "Edit Tessent commands… (edited)" if self._dofile_edited
+            else "Edit Tessent commands…")
 
     def _build_button_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -446,6 +466,13 @@ class VisualizerPanel(QWidget):
             "so it keeps running if this window closes.")
         self.launch_btn.clicked.connect(self.on_launch)
         row.addWidget(self.launch_btn)
+
+        self.edit_commands_btn = QPushButton("Edit Tessent commands…")
+        self.edit_commands_btn.setToolTip(
+            "Optional. See or change the commands Tessent runs on launch "
+            "(the dofile), or copy them to run by hand.")
+        self.edit_commands_btn.clicked.connect(self.on_edit_commands)
+        row.addWidget(self.edit_commands_btn)
 
         self.open_dir_btn = QPushButton("Open script folder")
         self.open_dir_btn.setEnabled(False)
@@ -610,6 +637,10 @@ class VisualizerPanel(QWidget):
         """Tell the panel which fault list the analysis ran on."""
         self._analysis_faults = (path or "").strip()
         self._apply_analysis_faults()
+        run_dir = self.run_dir_row.path()
+        if (self._analysis_faults and self.mode_run_dir.isChecked()
+                and (not run_dir or run_dir == self._auto_run_dir)):
+            self.prefill_run_dir()
 
     def _apply_analysis_faults(self) -> None:
         row = self._path_rows.get("faults")
@@ -649,6 +680,7 @@ class VisualizerPanel(QWidget):
             return False
         guess = guess_run_dir(profile, faults)
         self.run_dir_row.set_path(guess)
+        self._auto_run_dir = guess
         return self.on_fill_from_run_dir(from_guess=True)
 
     def _on_input_changed(self, *_args: Any) -> None:
@@ -657,6 +689,7 @@ class VisualizerPanel(QWidget):
 
     def _on_commands_edited(self) -> None:
         self._dofile_edited = self.commands_view.toPlainText() != self._generated_text
+        self._update_edit_button()
 
     def current_inputs(self) -> VisualizerInputs:
         paths = {key: row.path() for key, row in self._path_rows.items()
@@ -733,6 +766,7 @@ class VisualizerPanel(QWidget):
         self.commands_view.setPlainText(text)
         self.commands_view.blockSignals(False)
         self._dofile_edited = False
+        self._update_edit_button()
         self.refresh_health()
 
     def add_fault_commands(self, fault_path: str, stuck_value: str = "") -> bool:
@@ -1097,6 +1131,48 @@ class VisualizerPanel(QWidget):
     def has_live_session(self) -> bool:
         return self._session is not None and self._session_ready
 
+    def export_live_session(self) -> Optional[Dict[str, Any]]:
+        """Where another window can re-attach to the session (no secrets)."""
+        bundle = getattr(self, "_bundle", None)
+        if self._session is None or bundle is None or not bundle.port_file:
+            return None
+        return {"directory": bundle.directory,
+                "port_file": bundle.port_file,
+                "log_path": bundle.log_path or "",
+                "heavy": bool(getattr(bundle, "heavy", False)),
+                "agent_eval": bool(getattr(bundle, "agent_eval", False)),
+                "job_file": getattr(bundle, "job_file", "") or "",
+                "launch_form": dict(getattr(self, "_launch_form", None)
+                                    or {})}
+
+    def attach_live_session(self, data: Dict[str, Any]) -> bool:
+        """Take over a session another window launched (see export)."""
+        directory = str(data.get("directory") or "")
+        port_file = str(data.get("port_file") or "")
+        try:
+            with open(os.path.join(directory, TOKEN_FILE), "r",
+                      encoding="utf-8") as fh:
+                token = fh.read().strip()
+        except OSError:
+            return False
+        if not token or not port_file:
+            return False
+        heavy = bool(data.get("heavy"))
+        bundle = SimpleNamespace(
+            directory=directory, port_file=port_file, token=token,
+            log_path=str(data.get("log_path") or ""), heavy=heavy,
+            agent_eval=bool(data.get("agent_eval")),
+            job_file=str(data.get("job_file") or "") if heavy else "")
+        self._begin_session(bundle)
+        if data.get("launch_form"):
+            self._launch_form = dict(data["launch_form"])
+        self._enable_script_folder(directory)
+        if bundle.log_path:
+            self._start_log_tail(bundle.log_path)
+        self._set_session_label(
+            "Re-attaching to the session the previous window launched…")
+        return True
+
     def agent_target(self) -> Optional[Dict[str, Any]]:
         """What the AI agent may reach: the session, its log and its inputs."""
         if self._session is None:
@@ -1385,10 +1461,10 @@ class VisualizerPanel(QWidget):
         self.licence_edit.setText(str(cfg.get("licence_server", "")))
         self._fill_licence_default()
         self.run_dir_row.set_path(str(cfg.get("run_dir", "")))
-        if str(cfg.get("mode", "")) == "run_dir":
-            self.mode_run_dir.setChecked(True)
-        else:
+        if str(cfg.get("mode", "")) == "individual":
             self.mode_individual.setChecked(True)
+        else:
+            self.mode_run_dir.setChecked(True)
         self.use_analysis_faults.setChecked(
             bool(cfg.get("use_analysis_faults", True)))
         self.heavy_check.setChecked(bool(cfg.get("heavy_mode", False)))

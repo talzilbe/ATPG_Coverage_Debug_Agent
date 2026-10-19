@@ -26,6 +26,8 @@ def _isolated_user_profile_dir(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     # Setting a netlist would otherwise search real disks around it.
     monkeypatch.setenv("ATPG_INPUT_DISCOVERY", "0")
+    # The shared Cth.ai catalogue would add the free models to every panel.
+    monkeypatch.setenv("ATPG_CTHAI_CATALOG", str(tmp_path / "no_cthai.json"))
 
 
 @pytest.fixture

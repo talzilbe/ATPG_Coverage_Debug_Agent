@@ -321,6 +321,9 @@ def detect_active_setup(profile: ToolProfile,
         except ValueError:
             words = command.split()
         active.proj = _flag_value(words, psetup.proj_flag)
+        if psetup.proj_flag and not active.proj:
+            # A setup without a project (e.g. Cth.ai's own) lacks the tool.
+            return None
         active.cfg = _flag_value(words, psetup.cfg_flag)
         active.ward = _flag_value(words, psetup.ward_flag)
     if psetup.ward_env and str(env.get(psetup.ward_env, "")).strip():
@@ -483,7 +486,11 @@ def build_psetup_script(profile: ToolProfile, inputs: VisualizerInputs,
             parts.extend([psetup.ward_flag, quote_shell(ward)])
         parts.extend(psetup.extra_args)
         parts.extend([psetup.command_flag, quote_shell(inner)])
-        header = ""
+        # The setup refuses to start inside another one (e.g. Cth.ai's).
+        markers = [n for n in [*psetup.active_env, psetup.setup_cmd_env,
+                               psetup.ward_env]
+                   if n and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", n)]
+        header = ("unsetenv " + " ".join(markers)) if markers else ""
         run_line = " ".join(parts)
         failure = "Project setup exited with status $rc."
 

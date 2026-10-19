@@ -92,6 +92,22 @@ def test_any_single_marker_is_enough(parts):
     assert active is not None and active.proj == ""
 
 
+def test_a_setup_without_a_project_is_not_this_profiles(parts, tmp_path):
+    # Cth.ai's own setup sets the same markers but enters no project.
+    profile, inputs, term = parts
+    env = {"DEMO_SESSION_ID": "me_1_2", "DEMO_WORKAREA": "/tmp/ai",
+           "DEMO_SETUP_CMD": "/x/bin/setup -cfg_ov /tmp/c -ward /tmp/ai "
+                             "-cmd /tmp/ai/reopen.sh"}
+    assert detect_active_setup(profile, env) is None
+    bundle = write_launch_bundle(profile, inputs, str(tmp_path / "b"), term,
+                                 environ=env)
+    outer = _read(bundle.psetup_script_path)
+    assert not bundle.setup_reused
+    assert ("unsetenv DEMO_SESSION_ID DEMO_ENV_INDICATOR DEMO_SETUP_CMD "
+            "DEMO_WORKAREA\n") in outer
+    assert outer.index("unsetenv") < outer.index("'/bin/echo' -proj")
+
+
 def test_the_outer_script_runs_the_inner_script_without_entering_setup(parts):
     profile, inputs, _ = parts
     active = detect_active_setup(profile, INSIDE)

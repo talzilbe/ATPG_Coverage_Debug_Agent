@@ -1,0 +1,11 @@
+{
+  "description": "Site settings for the free Cth.ai models (Gemini and open-source) offered in the AI agent's model list. Point $ATPG_CTHAI_CONFIG at your own copy to change them; when the setup command or the catalogue does not exist on a host, the free group is simply not shown.",
+  "setup_command": "/p/hdk/bin/cth_psetup",
+  "command_flag": "-cmd",
+  "catalog": "/p/hdk/cad/autobots_config/latest/cthai-copilot-org-config.json",
+  "tool_versions": {
+    "autobots_sdk": "3.4.8",
+    "cth.ai": "2026.09.p017",
+    "vscode_cth": "1.135.0"
+  }
+}

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -54,17 +55,22 @@ from ..agent.debug_agent import (
     AgentCancelled,
     AgentConfig,
     AGENTIC_SYSTEM_PROMPT,
+    COMPACT_INSTRUCTION,
     CancelToken,
     DebugAgent,
     SYSTEM_PROMPT,
     build_user_payload,
+    conversation_seed,
+    follow_up_message,
     is_cli_auth_error,
 )
 from ..agent import answer_format
 from ..agent import cli_models
+from ..agent import cth_models
 from ..analysis import investigate
 from ..config import credentials
 from ..launcher import agent_bridge
+from ..launcher import terminals
 from ..launcher.live_session import LiveSessionError
 from ..skills.base import AnalysisContext
 from . import theme
@@ -90,6 +96,27 @@ _BUSY_TICK_MS = 200
 # hard-coded here goes stale as soon as a new model ships. The combo stays
 # editable so an id the CLI has not advertised can still be typed in.
 _CLI_MODEL_CHOICES = ["auto"]
+
+#: How often, and for how long, the token file is looked for after Log in….
+_LOGIN_POLL_MS = 2000
+_LOGIN_POLL_LIMIT = 450
+
+#: Context meter: a rough characters-per-token ratio, and the window assumed
+#: when the model does not advertise one.
+_CHARS_PER_TOKEN = 4
+_DEFAULT_CONTEXT_TOKENS = 128_000
+#: Meter colours: green below the first share, orange below the second.
+_CONTEXT_WARN = 0.6
+_CONTEXT_FULL = 0.85
+
+
+def _start_detached(argv: List[str]) -> bool:
+    result = QProcess.startDetached(argv[0], argv[1:])
+    return bool(result[0] if isinstance(result, tuple) else result)
+
+
+def _tokens_k(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n < 10_000 else f"{n // 1000:,}k"
 
 # Inline style for every chat paragraph. Chat content is English technical
 # text, so the direction and alignment are pinned rather than inherited from
@@ -297,7 +324,8 @@ class _ChatWorker(QObject):
     trace = Signal(str)
 
     def __init__(self, agent: DebugAgent, message, session_id, history,
-                 report=None, skill_manager=None, ctx=None) -> None:
+                 report=None, skill_manager=None, ctx=None, seed=None,
+                 wrap=True, check=True) -> None:
         super().__init__()
         self._agent = agent
         self._message = message
@@ -306,6 +334,9 @@ class _ChatWorker(QObject):
         self._report = report
         self._skill_manager = skill_manager
         self._ctx = ctx
+        self._seed = seed
+        self._wrap = wrap
+        self._check = check
 
     def cancel(self) -> None:
         self._agent.cancel.cancel()
@@ -318,7 +349,8 @@ class _ChatWorker(QObject):
                 on_chunk=lambda c: self.token.emit(c),
                 report=self._report,
                 skill_manager=self._skill_manager, ctx=self._ctx,
-                on_event=lambda m: self.trace.emit(m))
+                on_event=lambda m: self.trace.emit(m),
+                seed=self._seed, wrap=self._wrap, check=self._check)
         except AgentCancelled as exc:
             self.cancelled.emit(str(exc))
             return
@@ -364,6 +396,8 @@ class AgentPanel(QWidget):
     run_completed = Signal()
     #: The start-up sign-in check finished: (ok, message).
     auto_auth_finished = Signal(bool, str)
+    #: The user asked to reopen the app inside Cth.ai (free models faster).
+    reopen_in_cthai_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -408,6 +442,13 @@ class AgentPanel(QWidget):
         self._tool_log_calls: int = 0
         self._live_agent = None
         self._busy_chat: bool = False
+        # A conversation carried into a fresh session on the next message
+        # (restored or compacted), the session id that message starts, and
+        # the estimated size of what the model holds.
+        self._chat_seed: Optional[str] = None
+        self._pending_session: Optional[str] = None
+        self._compacting: bool = False
+        self._ctx_chars: int = 0
         # Tessent bridge: who provides the live session, requests already
         # handled, those waiting for the user, and the one on screen.
         self._tessent_provider = None
@@ -480,16 +521,27 @@ class AgentPanel(QWidget):
 
         self.cli_model_combo = QComboBox()
         self.cli_model_combo.setEditable(True)
-        self.cli_model_combo.addItems(_CLI_MODEL_CHOICES)
-        self.cli_model_combo.setCurrentText("auto")
+        self._free_models = cth_models.load_free_models()
+        self._cth_wrapper = cth_models.find_wrapper()
+        self._copilot_models: list = []
+        # Token mtime when a free-model call last reported the login invalid.
+        self._cth_stale_mtime: Optional[float] = None
+        self._login_timer = QTimer(self)
+        self._login_timer.setInterval(_LOGIN_POLL_MS)
+        self._login_timer.timeout.connect(self._poll_cthai_login)
+        self._login_polls = 0
+        self._fill_model_combo("auto")
         self.cli_model_combo.lineEdit().setPlaceholderText(
             "Model id for the CLI ('auto' lets Copilot choose)")
         self.cli_model_combo.setToolTip(
             "Pick a model for the GitHub Copilot CLI, or type any model id your "
-            "account supports. 'auto' lets Copilot choose automatically.")
+            "account supports. 'auto' lets Copilot choose automatically.\n"
+            "Models in the Free group run through Cth.ai and are not counted "
+            "toward your Copilot premium budget.")
         self.cli_model_combo.currentTextChanged.connect(
-            self._notify_config_changed)
+            self._on_cli_model_changed)
         model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
         model_row.addWidget(self.cli_model_combo, 1)
         self.cli_model_refresh_btn = QPushButton("Refresh")
         self.cli_model_refresh_btn.setToolTip(
@@ -497,7 +549,28 @@ class AgentPanel(QWidget):
             "automatically each time the GUI starts.")
         self.cli_model_refresh_btn.clicked.connect(self.refresh_models)
         model_row.addWidget(self.cli_model_refresh_btn)
-        self.cli_model_row_widget = self._wrap(model_row)
+        model_box = QVBoxLayout()
+        model_box.setContentsMargins(0, 0, 0, 0)
+        model_box.addWidget(self._wrap(model_row))
+        self.cli_model_note = QLabel("")
+        self.cli_model_note.setTextFormat(Qt.RichText)
+        self.cli_model_note.setWordWrap(True)
+        self.cli_model_note.setVisible(False)
+        model_box.addWidget(self.cli_model_note)
+        self.cthai_reopen_btn = QPushButton("Reopen in Cth.ai (faster)…")
+        self.cthai_reopen_btn.setToolTip(
+            "Close this window and reopen the app inside Cth.ai, so free "
+            "models answer without entering the Cth.ai setup each time.\n"
+            "Your report, partitions and agent work are carried over.")
+        self.cthai_reopen_btn.clicked.connect(
+            self.reopen_in_cthai_requested.emit)
+        self.cthai_reopen_btn.setVisible(False)
+        reopen_row = QHBoxLayout()
+        reopen_row.setContentsMargins(0, 0, 0, 0)
+        reopen_row.addWidget(self.cthai_reopen_btn)
+        reopen_row.addStretch(1)
+        model_box.addLayout(reopen_row)
+        self.cli_model_row_widget = self._wrap(model_box)
         form.addRow("CLI model:", self.cli_model_row_widget)
 
         self.cli_mcp_check = QCheckBox(
@@ -795,6 +868,26 @@ class AgentPanel(QWidget):
         chat_layout.addWidget(self.chat_view, 1)
 
         chat_layout.addWidget(self._build_tessent_box())
+
+        meter_row = QHBoxLayout()
+        meter_row.setContentsMargins(0, 0, 0, 0)
+        self.context_title = QLabel("Context:")
+        meter_row.addWidget(self.context_title)
+        self.context_bar = QProgressBar()
+        self.context_bar.setRange(0, 100)
+        self.context_bar.setTextVisible(True)
+        self.context_bar.setMaximumHeight(16)
+        meter_row.addWidget(self.context_bar, 1)
+        self.compact_btn = QPushButton("Compact")
+        self.compact_btn.setToolTip(
+            "Ask the agent to summarise the conversation, then continue in a "
+            "fresh session that starts from the report and that summary. "
+            "Frees context when the meter fills up. Same as typing /compact.")
+        self.compact_btn.clicked.connect(self.compact_chat)
+        meter_row.addWidget(self.compact_btn)
+        self.context_row_widget = self._wrap(meter_row)
+        self.context_row_widget.setVisible(False)
+        chat_layout.addWidget(self.context_row_widget)
 
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit()
@@ -1104,20 +1197,182 @@ class AgentPanel(QWidget):
         """Repopulate the model combo from *models*, keeping the selection."""
         if not models:
             return
-        current = self.cli_model_combo.currentText().strip()
-        ids = cli_models.model_ids(models)
+        current = self.cli_model_selection()
+        self._copilot_models = list(models)
         self.cli_model_combo.blockSignals(True)
-        self.cli_model_combo.clear()
-        self.cli_model_combo.addItems(ids)
-        by_id = {m.model_id: m for m in models}
-        for row, mid in enumerate(ids):
+        self._fill_model_combo(current or "auto")
+        self.cli_model_combo.blockSignals(False)
+
+    def _fill_model_combo(self, selection: str) -> None:
+        """Free Cth.ai group first, then the Copilot models; select *selection*."""
+        combo = self.cli_model_combo
+        combo.clear()
+        slow = not self._cth_wrapper
+        if self._free_models:
+            header = ("\u2500\u2500 Free \u00b7 Cth.ai \u2014 not counted "
+                      "toward your Copilot budget"
+                      + (" (slower: app not opened from a Cth.ai shell)"
+                         if slow else "") + " \u2500\u2500")
+            self._add_model_header(header)
+            for m in self._free_models:
+                combo.addItem(f"{m.name}  (free)", m.selection)
+                tip = m.tooltip() + ("\n\n" + cth_models.SLOW_NOTE
+                                     if slow else "")
+                combo.setItemData(combo.count() - 1, tip, Qt.ToolTipRole)
+            self._add_model_header(
+                "\u2500\u2500 GitHub Copilot \u00b7 premium requests "
+                "\u2500\u2500")
+        by_id = {m.model_id: m for m in self._copilot_models}
+        ids = (cli_models.model_ids(self._copilot_models)
+               if self._copilot_models else list(_CLI_MODEL_CHOICES))
+        for mid in ids:
+            combo.addItem(mid)
             info = by_id.get(mid)
             if info is not None and info.name:
-                self.cli_model_combo.setItemData(row, info.label(), Qt.ToolTipRole)
+                combo.setItemData(combo.count() - 1, info.label(),
+                                  Qt.ToolTipRole)
         # A model the user picked earlier may have been retired; keep the text
         # anyway (the combo is editable) so nothing silently switches models.
-        self.cli_model_combo.setCurrentText(current or "auto")
-        self.cli_model_combo.blockSignals(False)
+        self.set_cli_model_selection(selection)
+
+    def _add_model_header(self, text: str) -> None:
+        combo = self.cli_model_combo
+        combo.addItem(text)
+        item = combo.model().item(combo.count() - 1)
+        if item is not None:
+            item.setEnabled(False)
+            item.setSelectable(False)
+
+    def cli_model_selection(self) -> str:
+        """The model value for AgentConfig (``cth.ai:<id>`` for a free one)."""
+        combo = self.cli_model_combo
+        text = combo.currentText().strip()
+        idx = combo.currentIndex()
+        if idx >= 0 and combo.itemText(idx).strip() == text:
+            data = combo.itemData(idx)
+            if isinstance(data, str) and data:
+                return data
+        return text
+
+    def set_cli_model_selection(self, value: str) -> None:
+        combo = self.cli_model_combo
+        idx = combo.findData(value) if value else -1
+        if idx < 0 and value:
+            idx = combo.findText(value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentText(value or "auto")
+
+    def selected_free_model(self):
+        """The selected :class:`cth_models.FreeModel`, or None."""
+        if self._current_backend() != "cli":
+            return None
+        mid = cth_models.free_model_id(self.cli_model_selection())
+        if mid is None:
+            return None
+        for m in self._free_models:
+            if m.model_id == mid:
+                return m
+        return cth_models.FreeModel(model_id=mid, name=mid)
+
+    def _model_display(self) -> str:
+        free = self.selected_free_model()
+        if free is not None:
+            return f"{free.name} (free, Cth.ai)"
+        return self.cli_model_combo.currentText().strip() or "auto"
+
+    def _on_cli_model_changed(self, *args) -> None:
+        self._update_model_note()
+        self._update_context_meter()
+        self._notify_config_changed()
+
+    def _update_model_note(self) -> None:
+        free = self.selected_free_model()
+        self.cthai_reopen_btn.setVisible(
+            free is not None and not self._cth_wrapper
+            and bool(cth_models.setup_command()))
+        if free is None:
+            self.cli_model_note.setVisible(False)
+            return
+        parts = ["<b>Free model via Cth.ai</b> \u2014 not counted toward "
+                 "your Copilot premium budget. "
+                 + html.escape(cth_models.LIMITS_NOTE)]
+        if not self._cth_wrapper:
+            parts.append("<span style='color:#a05000;'>"
+                         + html.escape(cth_models.SLOW_NOTE) + "</span>")
+        if not self.cthai_login_ok(free):
+            parts.append("<span style='color:#c62828;'><b>One-time login "
+                         "needed</b> \u2014 click <b>Log in\u2026</b> on the "
+                         "readiness line above.</span>")
+        theme.set_label(self.cli_model_note, "<br>".join(parts))
+        self.cli_model_note.setVisible(True)
+
+    # -- free Cth.ai models: one-time login ------------------------------------
+
+    def cthai_login_ok(self, free=None) -> bool:
+        """True when the Autobots token for *free* (or the selection) exists
+        and was not reported invalid by the last call."""
+        free = free or self.selected_free_model()
+        scope = free.scope_group if free else cth_models.DEFAULT_SCOPE
+        path = cth_models.token_path(scope)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return False
+        return self._cth_stale_mtime is None or mtime != self._cth_stale_mtime
+
+    def start_cthai_login(self) -> None:
+        """Open a terminal that runs the one-time ``autobots login``."""
+        command = cth_models.login_command_text()
+        term = terminals.find_terminal()
+        started = False
+        if term is not None and terminals.display_available():
+            argv = term.wrap(cth_models.login_argv(),
+                             title="Cth.ai one-time login")
+            started = _start_detached(argv)
+        if started:
+            self.status_label.setText(
+                "A terminal opened for the one-time Cth.ai login: open the link "
+                "it shows, enter the code and sign in. This line turns green "
+                "by itself when the login is done.")
+        else:
+            QApplication.clipboard().setText(command)
+            self.status_label.setText(
+                "Could not open a terminal. The login command was copied to "
+                "the clipboard; paste it into any terminal: " + command)
+        self._login_polls = 0
+        self._login_timer.start()
+
+    def _poll_cthai_login(self) -> None:
+        self._login_polls += 1
+        if self.cthai_login_ok():
+            self._login_timer.stop()
+            self._cth_stale_mtime = None
+            self.status_label.setText(
+                "Cth.ai login done \u2014 the free models are ready to use.")
+            self._update_model_note()
+            self.refresh_readiness()
+        elif self._login_polls >= _LOGIN_POLL_LIMIT:
+            self._login_timer.stop()
+
+    def _note_cthai_failure(self, message: str) -> bool:
+        """Flag the login as needed when *message* says so; True if it did."""
+        if cth_models.LOGIN_NEEDED not in (message or ""):
+            return False
+        free = self.selected_free_model()
+        path = cth_models.token_path(
+            free.scope_group if free else cth_models.DEFAULT_SCOPE)
+        try:
+            self._cth_stale_mtime = path.stat().st_mtime
+        except OSError:
+            self._cth_stale_mtime = None
+        self._update_model_note()
+        self.refresh_readiness()
+        self.status_label.setText(
+            "The free Cth.ai model needs the one-time login \u2014 click "
+            "Log in\u2026 on the readiness line.")
+        return True
 
     def refresh_models(self) -> None:
         """Re-read the model list from the Copilot CLI in the background."""
@@ -1171,7 +1426,22 @@ class AgentPanel(QWidget):
     def readiness_items(self) -> list:
         """[(label, state, detail, fix_action)] with state ok|fail|unknown."""
         items = []
-        if self._current_backend() == "cli":
+        free = self.selected_free_model()
+        if free is not None:
+            if self._cth_wrapper:
+                items.append(("Cth.ai", "ok", "this is a Cth.ai shell", ""))
+            elif os.path.isfile(cth_models.setup_command()):
+                items.append(("Cth.ai", "ok",
+                              "entered per request (slower)", ""))
+            else:
+                items.append(("Cth.ai", "fail",
+                              "Cth setup command not found on this host", ""))
+            login = self.cthai_login_ok(free)
+            items.append(("Cth.ai login", "ok" if login else "fail",
+                          "done" if login else "one-time login needed",
+                          "cthai_login"))
+            items.append(("Model", "ok", self._model_display(), ""))
+        elif self._current_backend() == "cli":
             exe = self.cli_path_edit.text().strip()
             found = bool(exe) and os.path.isfile(exe) and os.access(exe, os.X_OK)
             items.append(("Copilot CLI", "ok" if found else "fail",
@@ -1239,7 +1509,7 @@ class AgentPanel(QWidget):
                         head + " &nbsp;·&nbsp; ".join(parts))
         labels = {"browse_cli": "Find the CLI…", "check_auth": "Check sign-in",
                   "auth_tab": "Sign in…", "edit_connection": "Edit connection",
-                  "need_report": "How?",
+                  "need_report": "How?", "cthai_login": "Log in…",
                   "open_visualizer": "Open Tessent Visualizer…"}
         self._readiness_action = first_gap or first_hint or "check_auth"
         self.readiness_btn.setText(labels.get(self._readiness_action,
@@ -1269,6 +1539,8 @@ class AgentPanel(QWidget):
                 "works on that report.")
         elif action == "open_visualizer":
             self.open_visualizer_requested.emit()
+        elif action == "cthai_login":
+            self.start_cthai_login()
 
     def _current_backend(self) -> str:
         return self.backend_combo.currentData() or "http"
@@ -1288,6 +1560,7 @@ class AgentPanel(QWidget):
         for w in (self.temp_spin, self.maxtok_spin):
             w.setEnabled(not is_cli)
             w.setToolTip(na_tip if is_cli else "")
+        self._update_model_note()
         self.config_changed.emit()
         self.refresh_readiness()
 
@@ -1377,6 +1650,10 @@ class AgentPanel(QWidget):
         self._compare = None
         self._session_id = None
         self._chat_messages = []
+        self._chat_seed = None
+        self._pending_session = None
+        self._compacting = False
+        self._ctx_reset(0)
         self._findings = []
         self._fix_edits = []
         self._chat_ctx = None
@@ -1431,7 +1708,14 @@ class AgentPanel(QWidget):
         self.findings_changed.emit(list(self._findings))
         self._fix_edits = [dict(e) for e in (data.get("fix_plan_edits") or [])]
         self.fix_plan_changed.emit(list(self._fix_edits))
-        if diagnosis or data.get("chat"):
+        if (diagnosis or data.get("chat")) and self._report is not None:
+            self._seed_from_transcript(diagnosis, list(self._chat_turns))
+            self._set_chat_enabled(True)
+            self.status_label.setText(
+                "Loaded the saved investigation. Ask a follow-up: the agent "
+                "continues in a new session with this conversation as "
+                "context.")
+        elif diagnosis or data.get("chat"):
             self.status_label.setText(
                 "Loaded saved investigation (view-only transcript). Press Run "
                 "to continue the conversation on this report.")
@@ -1486,8 +1770,7 @@ class AgentPanel(QWidget):
 
     def _update_connection_summary(self) -> None:
         if self._current_backend() == "cli":
-            model = self.cli_model_combo.currentText().strip() or "auto"
-            text = f"Connection: GitHub Copilot CLI · model {model}"
+            text = f"Connection: GitHub Copilot CLI · model {self._model_display()}"
         else:
             model = self.model_edit.text().strip() or "(unset)"
             url = self.base_url_edit.text().strip() or "(no URL)"
@@ -1521,7 +1804,7 @@ class AgentPanel(QWidget):
             max_faults=int(self.maxfaults_spin.value()),
             cli_path=self.cli_path_edit.text().strip(),
             cli_home=self.cli_home_edit.text().strip(),
-            cli_model=self.cli_model_combo.currentText().strip(),
+            cli_model=self.cli_model_selection(),
             cli_token=self.auth_token_edit.text(),
             cli_use_mcp=self.cli_mcp_check.isChecked(),
         )
@@ -1536,7 +1819,7 @@ class AgentPanel(QWidget):
             "model": self.model_edit.text().strip(),
             "cli_path": self.cli_path_edit.text().strip(),
             "cli_home": self.cli_home_edit.text().strip(),
-            "cli_model": self.cli_model_combo.currentText().strip(),
+            "cli_model": self.cli_model_selection(),
             "cli_use_mcp": self.cli_mcp_check.isChecked(),
             "temperature": float(self.temp_spin.value()),
             "max_tokens": int(self.maxtok_spin.value()),
@@ -1559,7 +1842,7 @@ class AgentPanel(QWidget):
             self.cli_path_edit.setText(cfg["cli_path"])
         if cfg.get("cli_home"):
             self.cli_home_edit.setText(cfg["cli_home"])
-        self.cli_model_combo.setCurrentText(cfg.get("cli_model", "") or "auto")
+        self.set_cli_model_selection(cfg.get("cli_model", "") or "auto")
         self.cli_mcp_check.setChecked(bool(cfg.get("cli_use_mcp", True)))
         self.base_url_edit.setText(cfg.get("base_url", ""))
         self.model_edit.setText(cfg.get("model", "") or "")
@@ -1830,9 +2113,12 @@ class AgentPanel(QWidget):
 
     def _current_mcp_session(self):
         """The live MCP session: the running agent's, else the panel's."""
-        agent = self._live_agent
-        live = getattr(agent, "mcp_session", None) if agent is not None else None
-        return live or self._mcp_session
+        for holder in (self._live_agent,
+                       getattr(self._chat_worker, "_agent", None)):
+            live = getattr(holder, "mcp_session", None)
+            if live is not None:
+                return live
+        return self._mcp_session
 
     def _poll_tool_log(self) -> None:
         """Append any new MCP tool calls to the trace pane.
@@ -1846,6 +2132,9 @@ class AgentPanel(QWidget):
         path = getattr(sess, "tool_log_path", None) if sess else None
         if not path or not os.path.isfile(path):
             return
+        if path != getattr(self, "_tool_log_path", None):
+            self._tool_log_path = path
+            self._tool_log_offset = 0
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 fh.seek(self._tool_log_offset)
@@ -1862,6 +2151,8 @@ class AgentPanel(QWidget):
             except json.JSONDecodeError:
                 continue
             self._tool_log_calls += 1
+            self._ctx_add(int(row.get("chars") or 0)
+                          + len(json.dumps(row.get("args") or {})))
             args = ", ".join(f"{k}={v}" for k, v in (row.get("args") or {}).items())
             flags = "" if row.get("ok", True) else " ⚠ error"
             if row.get("truncated"):
@@ -2323,6 +2614,9 @@ class AgentPanel(QWidget):
     def _on_chat_cancelled(self, partial: str) -> None:
         """A follow-up reply was stopped by the user."""
         elapsed = self._stop_busy()
+        self._adopt_chat_mcp_session()
+        self._pending_session = None
+        self._compacting = False
         self._collect_agent_output()
         text = (partial or getattr(self, "_chat_stream_buf", "") or "").strip()
         self._chat_turns.append(
@@ -2385,6 +2679,7 @@ class AgentPanel(QWidget):
         self._live_agent = None
         self._collect_agent_output()
         final = text or getattr(self, "_stream_buf", "")
+        self._ctx_add(len(final))
         final = self._audit_answer(final)
         self._set_response(final)
         tools_note = ""
@@ -2398,7 +2693,7 @@ class AgentPanel(QWidget):
             "click a fault to focus it, or Verify." + tools_note)
         self.run_btn.setEnabled(True)
         self._set_stop_enabled(False)
-        if self._chat_backend == "cli":
+        if self._chat_backend == "cli" and self.selected_free_model() is None:
             self._auth_state = "ok"
             self.refresh_readiness()
         # The backend works now; give its settings' space to the answer.
@@ -2421,7 +2716,9 @@ class AgentPanel(QWidget):
         self._set_response(f"[ERROR] {message}")
         self.run_btn.setEnabled(True)
         self._set_stop_enabled(False)
-        if is_cli_auth_error(message):
+        if self._note_cthai_failure(message):
+            pass
+        elif is_cli_auth_error(message):
             self._auth_state = "fail"
             self.refresh_readiness()
             self.status_label.setText(
@@ -2441,6 +2738,16 @@ class AgentPanel(QWidget):
     def _cleanup(self) -> None:
         self._thread = None
         self._worker = None
+
+    def is_busy(self) -> bool:
+        """True while an agent run or a chat turn is in flight."""
+        for thread in (self._thread, self._chat_thread):
+            try:
+                if thread is not None and thread.isRunning():
+                    return True
+            except RuntimeError:
+                pass
+        return False
 
     def shutdown(self, timeout_ms: int = 5000) -> None:
         """Stop background workers and wait for them. Safe to call repeatedly.
@@ -2494,17 +2801,21 @@ class AgentPanel(QWidget):
         self._chat_agentic = agentic
         self._chat_ctx = None
         self._session_id = str(uuid.uuid4())
+        self._chat_seed = None
+        self._pending_session = None
+        self._compacting = False
         self._chat_backend = config.backend
         self.chat_view.clear()
         self._chat_turns = []
         self._chat_stub = False
         self._set_chat_enabled(False)
+        system = AGENTIC_SYSTEM_PROMPT if agentic else SYSTEM_PROMPT
+        payload = build_user_payload(self._report, config.max_faults,
+                                     agentic=agentic)
+        self._ctx_reset(len(system) + len(payload))
         if config.backend == "cli":
             self._chat_messages = []
         else:
-            system = AGENTIC_SYSTEM_PROMPT if agentic else SYSTEM_PROMPT
-            payload = build_user_payload(self._report, config.max_faults,
-                                         agentic=agentic)
             self._chat_messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": payload},
@@ -2514,8 +2825,11 @@ class AgentPanel(QWidget):
         self.chat_input.setEnabled(enabled)
         self.chat_send_btn.setEnabled(enabled)
         self.chat_input.setPlaceholderText(
-            "Ask a follow-up question about the diagnosis…" if enabled
+            "Ask a follow-up question…  (/compact shrinks the conversation)"
+            if enabled
             else "Run the agent first, then ask a follow-up question…")
+        if hasattr(self, "compact_btn"):
+            self.compact_btn.setEnabled(enabled and self._has_conversation())
 
     def _chat_view_reset(self) -> None:
         self.chat_view.clear()
@@ -2523,9 +2837,10 @@ class AgentPanel(QWidget):
     def _render_turn(self, role: str, text: str) -> None:
         """Render one chat turn into the view (no bookkeeping)."""
         colour = {"You": "#0a7", "Agent": "#036", "Error": "#c0392b",
-                  "Tessent": "#8e44ad"}.get(role, "#555")
+                  "Tessent": "#8e44ad", "Summary": "#555"}.get(role, "#555")
         label = f'<b style="color:{colour};">{html.escape(role)}:</b>'
-        if role == "Agent" and not answer_format.is_single_paragraph(text):
+        if (role in ("Agent", "Summary")
+                and not answer_format.is_single_paragraph(text)):
             # A structured reply (lists, tables, evidence) keeps its layout.
             self._append_html(self.chat_view,
                               f'<p dir="ltr" style="{_LTR_STYLE}">{label}</p>')
@@ -2534,7 +2849,7 @@ class AgentPanel(QWidget):
                 f'<div dir="ltr" style="{_LTR_STYLE}">'
                 f'{answer_format.markdown_to_html(text, self._linkify)}</div>')
             return
-        if role == "Agent":
+        if role in ("Agent", "Summary"):
             body = answer_format.inline_lines(text, self._linkify)
         elif role == "Tessent":
             body = ('<span style="font-family:monospace;">'
@@ -2774,7 +3089,7 @@ class AgentPanel(QWidget):
             return ""
         backend = self._chat_backend or self._current_backend()
         if backend == "cli":
-            model = self.cli_model_combo.currentText().strip() or "auto"
+            model = self._model_display()
         else:
             model = self.model_edit.text().strip() or "(unset)"
         lines = [
@@ -2901,10 +3216,15 @@ class AgentPanel(QWidget):
         msg = self.chat_input.text().strip()
         if not msg:
             return
+        if msg.lower() == "/compact":
+            self.chat_input.clear()
+            self.compact_chat()
+            return
         if self._chat_thread is not None:
             self.status_label.setText("Agent is still replying — please wait.")
             return
-        if self._chat_backend == "cli" and not self._session_id:
+        if (self._chat_backend == "cli" and not self._session_id
+                and not self._chat_seed):
             self.status_label.setText(
                 "Run the agent first to start a conversation.")
             return
@@ -2917,13 +3237,16 @@ class AgentPanel(QWidget):
 
         self.chat_input.clear()
         self._append_chat("You", msg)
+        self._start_chat_turn(config, msg)
 
+    def _start_chat_turn(self, config: AgentConfig, msg: str,
+                         compact: bool = False) -> None:
         # A follow-up turn re-attaches the same tools the first answer had:
         # the on-disk MCP session (CLI) or the in-process tool loop (HTTP).
         tools_ctx = self._chat_ctx if self._chat_agentic else None
         tools_mgr = (self._skill_manager
                      if (self._chat_agentic and self._chat_backend != "cli"
-                         and tools_ctx is not None)
+                         and tools_ctx is not None and not compact)
                      else None)
 
         history = None
@@ -2934,8 +3257,16 @@ class AgentPanel(QWidget):
             history = (self._chat_messages if tools_mgr is not None
                        else list(self._chat_messages))
 
+        seed = None
+        session_id = self._session_id
+        if self._chat_backend == "cli" and self._chat_seed:
+            seed = self._chat_seed
+            session_id = self._pending_session = str(uuid.uuid4())
+        self._ctx_add(len(msg) if compact else len(follow_up_message(msg)))
+
         self._set_chat_enabled(False)
-        self._start_busy("Agent is replying", chat=True)
+        self._start_busy("Compacting the conversation" if compact
+                         else "Agent is replying", chat=True)
         self._chat_stream_buf = ""
         # Live streaming cue appended below the You turn; replaced on finish.
         self._append_html(
@@ -2943,14 +3274,13 @@ class AgentPanel(QWidget):
             f'<p dir="ltr" style="{_LTR_STYLE}">'
             '<b style="color:#036;">Agent:</b> </p>')
 
-        # A follow-up turn re-attaches the same tools the first answer had:
-        # the on-disk MCP session (CLI) or the in-process tool loop (HTTP).
         agent = DebugAgent(config, mcp_session=self._mcp_session)
         self._chat_thread = QThread()
         self._chat_worker = _ChatWorker(
-            agent, msg, self._session_id, history,
+            agent, msg, session_id, history,
             report=self._report, skill_manager=tools_mgr,
-            ctx=tools_ctx if tools_mgr is not None else None)
+            ctx=tools_ctx if (tools_mgr is not None or seed) else None,
+            seed=seed, wrap=not compact, check=not compact)
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_thread.started.connect(self._chat_worker.run)
         self._chat_worker.token.connect(self._on_chat_token)
@@ -2975,6 +3305,15 @@ class AgentPanel(QWidget):
         elapsed = self._stop_busy()
         self._collect_agent_output()
         final = text or getattr(self, "_chat_stream_buf", "")
+        self._adopt_chat_mcp_session()
+        if self._pending_session:
+            self._session_id = self._pending_session
+            self._pending_session = None
+            self._chat_seed = None
+        self._ctx_add(len(final))
+        if self._compacting:
+            self._finish_compact(final, elapsed)
+            return
         # Follow-up answers get the same guardrail check as the first one.
         # They are in fact the likelier place for an unmeasured claim, since
         # "so how much would that recover?" is a natural follow-up question.
@@ -2993,11 +3332,16 @@ class AgentPanel(QWidget):
 
     def _on_chat_failed(self, message: str) -> None:
         self._stop_busy()
+        self._adopt_chat_mcp_session()
+        self._pending_session = None
+        self._compacting = False
         self._chat_turns.append(("Error", (message or "").strip()))
         self._rebuild_chat_view()
         self._set_chat_enabled(True)
         self._set_stop_enabled(False)
-        if is_cli_auth_error(message):
+        if self._note_cthai_failure(message):
+            pass
+        elif is_cli_auth_error(message):
             self.status_label.setText(
                 "Copilot CLI is not authenticated — see the Authentication tab.")
             self.tabs.setCurrentIndex(self.tabs.count() - 1)
@@ -3007,6 +3351,169 @@ class AgentPanel(QWidget):
     def _chat_cleanup(self) -> None:
         self._chat_thread = None
         self._chat_worker = None
+
+    # -- carrying a conversation into a new session; context meter -----------
+
+    def _chat_tools_live(self) -> bool:
+        if not self._chat_agentic:
+            return False
+        if self._current_backend() == "cli":
+            sess = self._mcp_session
+            return sess is not None and sess.alive
+        return self._chat_ctx is not None
+
+    def _adopt_chat_mcp_session(self) -> None:
+        """Keep the tool server a seeded follow-up opened for later turns."""
+        worker = self._chat_worker
+        sess = getattr(getattr(worker, "_agent", None), "mcp_session", None)
+        if sess is not None and sess is not self._mcp_session:
+            self._close_mcp_session()
+            self._mcp_session = sess
+
+    def _want_chat_tools(self) -> bool:
+        """Tools for a carried-over conversation follow the agent mode."""
+        if self.mode_combo.currentData() != "agentic":
+            return False
+        if self._current_backend() == "cli":
+            return self.cli_mcp_check.isChecked()
+        return self._skill_manager is not None
+
+    def _seed_from_transcript(self, diagnosis: str, turns: list) -> None:
+        """Let the next message continue *turns* in a fresh agent session."""
+        summary = ""
+        for i in range(len(turns) - 1, -1, -1):
+            if turns[i][0] == "Summary":
+                summary, turns = turns[i][1], turns[i + 1:]
+                break
+        self._seed_conversation(diagnosis, turns, summary)
+
+    def _seed_conversation(self, diagnosis: str = "", turns=(),
+                           summary: str = "") -> None:
+        config = self.current_config()
+        self._chat_agentic = self._chat_tools_live() or self._want_chat_tools()
+        if self._chat_agentic and self._chat_ctx is None:
+            self._chat_ctx = self._build_context()
+        tools = self._chat_agentic and self._chat_ctx is not None
+        system = AGENTIC_SYSTEM_PROMPT if tools else SYSTEM_PROMPT
+        self._chat_backend = config.backend
+        self._pending_session = None
+        if config.backend == "cli":
+            self._chat_seed = conversation_seed(
+                self._report, config.max_faults, diagnosis, turns, summary,
+                agentic=tools)
+            self._session_id = None
+            self._ctx_reset(len(system) + len(self._chat_seed))
+            return
+        self._chat_seed = None
+        payload = build_user_payload(self._report, config.max_faults,
+                                     agentic=tools)
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": payload}]
+        if summary:
+            msgs.append({"role": "assistant", "content":
+                         "Summary of our conversation so far:\n\n" + summary})
+        elif diagnosis:
+            msgs.append({"role": "assistant", "content": diagnosis})
+        for role, text in turns:
+            if role == "You":
+                msgs.append({"role": "user", "content": text})
+            elif role == "Agent":
+                msgs.append({"role": "assistant", "content": text})
+            elif role == "Tessent":
+                msgs.append({"role": "user", "content":
+                             "Result from the live Tessent session:\n" + text})
+        self._chat_messages = msgs
+        self._ctx_reset(sum(len(m["content"]) for m in msgs))
+
+    def _has_conversation(self) -> bool:
+        if self._chat_backend == "cli":
+            return bool(self._session_id or self._chat_seed)
+        return len(self._chat_messages) > 2
+
+    def compact_chat(self) -> None:
+        """Summarise the conversation and continue from the summary."""
+        if self._chat_thread is not None or self._thread is not None:
+            self.status_label.setText(
+                "Wait for the agent to finish before compacting.")
+            return
+        if self._report is None or not self._has_conversation():
+            self.status_label.setText(
+                "Nothing to compact yet \u2014 run the agent first.")
+            return
+        config = self.current_config()
+        if not config.configured:
+            self.status_label.setText(
+                "Backend is not configured \u2014 cannot compact.")
+            return
+        self._compacting = True
+        self._append_chat("You", "/compact")
+        self._start_chat_turn(config, COMPACT_INSTRUCTION, compact=True)
+
+    def _finish_compact(self, summary: str, elapsed: float) -> None:
+        self._compacting = False
+        before = self._ctx_chars // _CHARS_PER_TOKEN
+        summary = (summary or "").strip()
+        if not summary:
+            self._chat_turns.append(
+                ("Error", "Compacting returned no summary; the conversation "
+                          "was left as it was."))
+        else:
+            self._chat_turns.append(("Summary", summary))
+            self._seed_conversation(summary=summary)
+        self._rebuild_chat_view()
+        self._set_chat_enabled(True)
+        self._set_stop_enabled(False)
+        after = self._ctx_chars // _CHARS_PER_TOKEN
+        self.status_label.setText(
+            f"Conversation compacted in {self._format_elapsed(elapsed)}: "
+            f"\u2248{_tokens_k(before)} \u2192 \u2248{_tokens_k(after)} tokens. "
+            "The next question starts a fresh session from the summary."
+            if summary else "Compacting failed \u2014 see the chat.")
+        self.chat_input.setFocus()
+
+    def _context_window(self) -> Tuple[int, bool]:
+        free = self.selected_free_model()
+        if free is not None and free.context_length:
+            return free.context_length, True
+        return _DEFAULT_CONTEXT_TOKENS, False
+
+    def _ctx_reset(self, chars: int) -> None:
+        self._ctx_chars = max(0, int(chars))
+        self._update_context_meter()
+
+    def _ctx_add(self, chars: int) -> None:
+        self._ctx_chars += max(0, int(chars))
+        self._update_context_meter()
+
+    def _update_context_meter(self) -> None:
+        bar = getattr(self, "context_bar", None)
+        if bar is None:
+            return
+        self.context_row_widget.setVisible(self._ctx_chars > 0)
+        used = self._ctx_chars // _CHARS_PER_TOKEN
+        window, known = self._context_window()
+        share = used / window if window else 0.0
+        bar.setValue(min(100, int(round(share * 100))))
+        bar.setFormat(f"\u2248 {_tokens_k(used)} of {_tokens_k(window)} tokens "
+                      f"({share:.0%})" + ("" if known else " \u2014 window assumed"))
+        colour = ("#2e7d32" if share < _CONTEXT_WARN else
+                  "#ef6c00" if share < _CONTEXT_FULL else "#c62828")
+        bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background-color: {colour}; }}")
+        tip = ("Estimated size of the conversation the agent holds: the "
+               "report evidence, every question and answer, and the tool "
+               f"results it read (about {_CHARS_PER_TOKEN} characters per "
+               "token). The CLI's own built-in instructions are not counted.\n")
+        tip += (f"Context window of this model: {window:,} tokens."
+                if known else
+                f"This model does not advertise its window; "
+                f"{window:,} tokens is assumed.")
+        if share >= _CONTEXT_WARN:
+            tip += ("\nThe conversation is getting large: answers may slow "
+                    "down or lose early details. Click Compact or type "
+                    "/compact.")
+        bar.setToolTip(tip)
+        self.compact_btn.setEnabled(self._has_conversation())
 
     # -- authentication (Copilot CLI) ----------------------------------------
 

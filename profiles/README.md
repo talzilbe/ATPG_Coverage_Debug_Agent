@@ -90,3 +90,19 @@ Each `commands.load[]` entry:
 
 The generated command is `<command> {<path>} <switches...>` — the path is always
 brace-quoted so Tcl performs no substitution on it.
+
+## `cthai/free_models.json` — free Cth.ai models
+
+Site settings for the **Free · Cth.ai** group in the AI agent's model list. It
+lives in a sub-folder so the launch-profile loader never reads it. Point
+`$ATPG_CTHAI_CONFIG` at your own copy to change it.
+
+| Field | Meaning |
+| --- | --- |
+| `setup_command` | The Cth setup command entered when the GUI was not started from a Cth.ai shell. |
+| `command_flag` | How the setup runs the call. `-cmd` (default) exits afterwards; `-x` would leave a Cth.ai shell behind, and that shell opens a VS Code window on every call. |
+| `catalog` | The shared Cth.ai model catalogue. Only model ids, names and login scopes are read from it, never its provider keys. |
+| `tool_versions` | `[toolversion]` pins written into the `-cfg_ov` file; they must provide `copilot --cth.model`. `$ATPG_CTHAI_CFG_OV` replaces the whole file. |
+
+When the setup command or the catalogue is missing on a host, the free group is
+not shown.

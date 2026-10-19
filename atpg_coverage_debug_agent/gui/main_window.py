@@ -6,8 +6,10 @@ import html as html_mod
 import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,12 +30,13 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget,
+    QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSplitter, QStatusBar, QTabWidget,
     QTableWidget, QTableWidgetItem, QTextBrowser, QToolButton, QVBoxLayout,
     QWidget,
 )
 
 from ..app import AnalysisInputs, PartitionInputs, _design_name
+from ..agent import cth_models
 from ..analysis import investigate, regression, report_edit
 from ..analysis.input_discovery import InputDiscovery, discover_inputs
 from ..config.settings import AppSettings
@@ -54,7 +57,7 @@ from .find_bar import FindBar
 from .getting_started import GettingStarted
 from .input_check import CHECKS, ERROR, OK, WARN, InputCheck, classify_file
 from .preferences import PreferencesDialog
-from . import shortcuts, theme
+from . import reopen, shortcuts, theme
 from .toast import Toast
 from .triage_panel import TriagePanel
 from .visualizer_panel import VisualizerPanel
@@ -759,6 +762,70 @@ settings</b> to fold it yourself. The choice is remembered.</p>
 <div class="warn">On a headless host with no keychain, the browser login can
 succeed but fail to <b>save</b> the token &mdash; use Option A there. Use
 <b>Check authentication</b> to confirm you are signed in.</div>
+
+<h3>Free Cth.ai models (Gemini and open-source) &mdash; no Copilot cost</h3>
+<p>The <b>CLI model</b> list starts with a <b>Free &middot; Cth.ai</b> group:
+Gemini Flash and Argon, Qwen, MiniMax, DeepSeek and Kimi. They are served by
+Intel's Cth.ai service, have passed Infosec review, and are <b>not</b> counted
+toward your GitHub Copilot premium budget. The list is read from the shared
+Cth.ai catalogue each time the GUI starts, so new models appear on their own.
+Hover over a model for its context size and what it is best at
+(<i>Gemini 3.8 Flash</i> for everyday and agentic use, <i>Qwen</i> for long,
+token-heavy runs). They are limited to <b>50 calls per minute and 2000 per
+day</b>. Free models do <b>not</b> need the GitHub sign-in of Step&nbsp;2;
+they need the one-time login below instead.</p>
+<p><b>Where you start the app matters for speed.</b> Opened from a Cth.ai
+shell, the free models run directly. Opened anywhere else (a plain terminal,
+or a VS&nbsp;Code that was not started through Cth.ai), every request first
+enters the Cth.ai setup in the background, which adds roughly 5&ndash;15
+seconds per answer; the model list and the note under it say so. Both ways
+work.</p>
+<p><b>Switch without losing your work.</b> In the slow case the note under the
+model has a <b class="k">Reopen in Cth.ai (faster)&hellip;</b> button. After
+you confirm, a new window opens inside the Cth.ai setup (about a minute; the
+CTH.ai splash shows once) and loads everything from this one: the report and
+all partitions, edits and waivers, the agent's diagnosis, chat, trace,
+findings and fix-plan edits, inputs, settings, layout, model and open tab.
+A Tessent Visualizer session you launched stays open and the new window
+re-attaches to it, so right-click &ldquo;Open signal&rdquo; and the agent's
+Tessent tools keep working without relaunching it.
+The old window stays open until the new one is ready, then closes; if the new
+one fails to open, nothing is lost. Undo history is not carried over. The
+agent continues the conversation in a new session that starts from the
+report and the earlier chat, so follow-ups pick up where you left off. While an analysis or agent run is going the button asks you to
+wait for it to finish first.</p>
+<a name="cthai_login"></a>
+<p><b>One-time login (once per user).</b> The free models are paid for by
+Intel, so you sign in once with your Intel account:</p>
+<ol>
+  <li class="step">Pick any model from the Free group. If the login is still
+      needed, the readiness line shows a red <b>&#10007; Cth.ai login:
+      one-time login needed</b>, the note under the model says the same, and
+      the readiness button becomes <b class="k">Log in&hellip;</b>.</li>
+  <li class="step">Click <b class="k">Log in&hellip;</b>. A terminal window
+      opens and runs <code>autobots login --device-code</code> inside the
+      Cth.ai setup.</li>
+  <li class="step">Open the link it shows in a browser, enter the code, and
+      sign in with your Intel account. Press Enter to close the terminal.</li>
+  <li class="step">The readiness line turns green (<b>&#10003; Cth.ai login:
+      done</b>) by itself within a few seconds. Run the agent as usual.</li>
+</ol>
+<p>If no terminal can be opened, the login command is copied to the
+clipboard instead; paste it into any terminal. Already in a Cth.ai shell?
+Just run <code>autobots login --device-code</code> there. The token is kept in
+<code>~/.autobots_tokens/</code> and renewed automatically on every call, so
+you normally never log in again. If a run reports that the login expired, the
+indicator turns red again &mdash; repeat the steps.</p>
+<div class="warn"><b>HTTP 403</b> from a free model usually means a
+<code>no_proxy</code> setting in <code>~/.cshrc</code>,
+<code>~/.cshrc.$USER</code> or <code>~/.aliases</code> is missing the Cth.ai
+hosts: remove it, or make sure it includes <code>.intel.com</code>,
+<code>.openai.azure.com</code>, <code>.azure-api.net</code>,
+<code>.services.ai.azure.com</code> and <code>.p.googleapis.com</code>. The
+setup command, model catalogue and pinned Cth.ai tool versions are site data in
+<code>profiles/cthai/free_models.json</code>; if the pinned versions ever stop
+working, point <code>$ATPG_CTHAI_CFG_OV</code> at your own <code>-cfg_ov</code>
+file.</div>
 <p>The <b>readiness line</b> at the top of the agent tab shows, at a glance,
 whether the CLI was found, whether you are signed in, which model is used and
 whether a report is loaded. Its button jumps straight to the first thing
@@ -1055,6 +1122,21 @@ follow-up turn, including turns removed from view by <b class="k">Clear
 chat</b>, which only clears the display. <b>Right-click</b> a hierarchy path
 in a reply to <b class="k">Open</b> it <b class="k">in Tessent
 Visualizer</b> (see section&nbsp;7) or copy it.</p>
+<p><b>Context meter and /compact.</b> The bar above the chat box estimates how
+much of the model's context window the conversation fills: the report
+evidence, every question and answer, and the tool results the agent read
+(roughly four characters per token; the CLI's own built-in instructions are
+not counted). It turns orange at 60% and red at 85%. When it gets full, click
+<b class="k">Compact</b> or type <code>/compact</code>: the agent summarises
+the conversation (conclusions, evidence, open questions), and the next
+question starts a fresh session from the report and that summary. The summary
+appears in the chat as a <b>Summary</b> turn. Models that do not advertise a
+window are measured against an assumed 128k tokens.</p>
+<p><b>Continuing a saved conversation.</b> When a saved report is loaded (or
+the app reopens itself inside Cth.ai), its chat is restored and you can keep
+asking: the agent continues in a new session that starts from the report and
+the earlier conversation (or its latest summary). In Deep investigation mode
+that session gets the investigation tools again.</p>
 <p><b>Follow-ups keep the tools.</b> After an agentic run the investigation
 tools stay attached for every follow-up question: with the Copilot CLI the
 local MCP server (and the parsed netlist handed to it) lives for the whole
@@ -1154,8 +1236,9 @@ config or workarea differs from the form, it is still used, with a warning.</p>
     site licence list shipped in the profile, so nobody has to know or type
     it. Change it only if told to; <b class="k">Use site default</b> puts the
     shared list back. Must be <code>port@host</code>, colon separated.</td></tr>
-<tr><td><b class="k">Design inputs</b></td><td>Either type each path, or switch
-    to <b>Derive from an ATPG run directory</b>. The run directory starts as
+<tr><td><b class="k">Design inputs</b></td><td>By default the paths are
+    <b>derived from an ATPG run directory</b>; switch to <b>Enter each
+    path</b> to type them yourself. The run directory starts as
     the one the analysed fault list came from (for
     <code>&lt;run&gt;/faultlist/x.faults.gz</code> that is
     <code>&lt;run&gt;</code>) and the paths are filled at once &mdash; the
@@ -1221,10 +1304,12 @@ setup you were last using. Selecting a saved configuration overwrites the form
 with it, so save your current setup first if you want to keep it.</p>
 
 <h3>Seeing what will run, before it runs</h3>
-<p>The <b>Commands that will run</b> box shows the dofile verbatim. You can
+<p><b class="k">Edit Tessent commands&hellip;</b>, next to <b>Launch
+Visualizer</b>, opens the dofile verbatim. Most users never need it. You can
 edit it &mdash; an edited dofile is used exactly as written, and is
-deliberately <i>not</i> re-checked against the fields above. <b class="k">
-Regenerate</b> rebuilds it and discards the edits.</p>
+deliberately <i>not</i> re-checked against the fields above; the button then
+reads <i>(edited)</i>. <b class="k">Undo my edits</b> rebuilds it from the
+form.</p>
 <p><b class="k">Copy commands</b> puts the entire chain on the clipboard so you
 can run it by hand. This is the fallback whenever the launch itself is
 unavailable &mdash; for instance on a host with no terminal emulator.</p>
@@ -2182,6 +2267,8 @@ class MainWindow(QMainWindow):
         self.agent_panel.run_completed.connect(
             lambda: self._gs_mark("agent"))
         self.agent_panel.auto_auth_finished.connect(self._on_auto_auth)
+        self.agent_panel.reopen_in_cthai_requested.connect(
+            self.on_reopen_in_cthai)
         self.visualizer_panel.launched.connect(
             lambda: self._gs_mark("visualizer"))
         self._advanced_tabs = [self._logs_tab, self.skills_panel,
@@ -4535,14 +4622,212 @@ class MainWindow(QMainWindow):
             result["unknown"] = unknown
         return result
 
+    # ------------------------------------------------------------------
+    # Reopen inside Cth.ai (free models without the per-call setup)
+    # ------------------------------------------------------------------
+    REOPEN_POLL_MS = 1000
+
+    def on_reopen_in_cthai(self) -> None:
+        if ((self._thread is not None and self._thread.isRunning())
+                or self.agent_panel.is_busy()):
+            QMessageBox.information(
+                self, "Reopen in Cth.ai",
+                "An analysis or agent run is still going. Wait for it to "
+                "finish (or stop it), then try again.")
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Reopen in Cth.ai")
+        box.setText("Reopen the app inside Cth.ai so free models answer "
+                    "faster?")
+        box.setInformativeText(
+            "A new window opens inside the Cth.ai setup. This takes about a "
+            "minute and shows the CTH.ai splash screen once. This window "
+            "stays open until the new one has loaded your work, then it "
+            "closes.\n\n"
+            "Carried over: the report and all partitions, your edits and "
+            "waivers, the agent's diagnosis, chat, trace, findings and "
+            "fix-plan edits, the input files, settings, window layout, the "
+            "selected model, the open tab, and the connection to a running "
+            "Tessent Visualizer session (it stays open).\n\n"
+            "Not carried over: undo history. The agent continues the "
+            "conversation in a new session with the earlier chat as "
+            "context.")
+        go = box.addButton("Reopen in Cth.ai", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is not go:
+            return
+        self._start_reopen()
+
+    def _start_reopen(self) -> None:
+        if self._report is not None:
+            self._report.investigation = (
+                self.agent_panel.export_investigation())
+        self.save_layout()
+        self._save_settings()
+        manifest = None
+        try:
+            ward = cth_models.ward_dir()
+            manifest = reopen.write_snapshot(
+                ward, self._partitions, self._active_idx, self._report,
+                self._base_report,
+                self.tabs.tabText(self.tabs.currentIndex()).replace("&&", "&"),
+                visualizer=self.visualizer_panel.export_live_session())
+            argv = cth_models.reopen_argv(
+                str(manifest), sys.executable, _REPO_ROOT,
+                os.environ.get("COPILOT_HOME", ""))
+            log_path = ward / "reopen.log"
+            with open(log_path, "wb") as log:
+                proc = subprocess.Popen(
+                    argv, stdin=subprocess.DEVNULL, stdout=log,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+        except (OSError, ValueError) as exc:
+            if manifest is not None:
+                reopen.discard(manifest)
+            self._error(f"Could not start the Cth.ai setup:\n{exc}")
+            return
+        dialog = QProgressDialog("Opening the app inside Cth.ai…",
+                                 "Cancel", 0, 0, self)
+        dialog.setWindowTitle("Reopen in Cth.ai")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        timer = QTimer(self)
+        timer.setInterval(self.REOPEN_POLL_MS)
+        self._reopen_state = {"proc": proc, "manifest": manifest,
+                              "log": log_path, "dialog": dialog,
+                              "timer": timer, "start": time.monotonic()}
+        dialog.canceled.connect(self._cancel_reopen)
+        timer.timeout.connect(self._poll_reopen)
+        timer.start()
+        dialog.show()
+
+    def _end_reopen(self) -> Optional[dict]:
+        st = getattr(self, "_reopen_state", None)
+        self._reopen_state = None
+        if st is None:
+            return None
+        st["timer"].stop()
+        st["dialog"].canceled.disconnect(self._cancel_reopen)
+        st["dialog"].close()
+        return st
+
+    @staticmethod
+    def _stop_reopen_proc(proc) -> None:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    def _cancel_reopen(self) -> None:
+        st = self._end_reopen()
+        if st is None:
+            return
+        self._stop_reopen_proc(st["proc"])
+        reopen.discard(st["manifest"])
+        self.statusBar().showMessage("Reopen in Cth.ai cancelled.")
+
+    def _poll_reopen(self) -> None:
+        st = getattr(self, "_reopen_state", None)
+        if st is None:
+            return
+        manifest = st["manifest"]
+        if reopen.is_ready(manifest):
+            self._end_reopen()
+            reopen.discard(manifest)
+            self.close()
+            return
+        failed = reopen.failure(manifest)
+        rc = st["proc"].poll()
+        waited = time.monotonic() - st["start"]
+        started = reopen.is_started(manifest)
+        if failed is None and rc is None and (started
+                                              or waited < reopen.TIMEOUT_S):
+            st["dialog"].setLabelText(
+                (f"The new window is open and loading your work… "
+                 f"{int(waited)}s\nLarge reports can take a few minutes."
+                 if started else
+                 f"Opening the app inside Cth.ai… {int(waited)}s")
+                + "\nThis window closes once the new one has loaded your "
+                "work.")
+            return
+        self._end_reopen()
+        self._stop_reopen_proc(st["proc"])
+        reopen.discard(manifest)
+        if failed is not None:
+            why = "The new window could not load your work:\n" + failed
+        elif rc is not None:
+            why = (f"The new window closed (exit status {rc}) before it had "
+                   "loaded your work." if started else
+                   f"The Cth.ai setup ended (exit status {rc}) before the "
+                   "new window opened.")
+        else:
+            why = (f"The new window did not open within "
+                   f"{reopen.TIMEOUT_S // 60} minutes.")
+        self._error(why + "\n\nNothing was lost: keep working here.\n\n"
+                    f"Log: {st['log']}\n" + reopen.log_tail(st["log"]))
+
+    def restore_snapshot(self, manifest: str) -> bool:
+        """Load the work the previous window handed over, then tell it."""
+        t0 = time.monotonic()
+        try:
+            reopen.note("loading the saved work")
+            snap = reopen.read_snapshot(manifest)
+            reopen.note(f"read {len(snap['partitions'])} report(s) in "
+                        f"{time.monotonic() - t0:.1f}s")
+            self._restore_work(snap)
+        except Exception as exc:  # noqa: BLE001 - the old window must hear
+            logger.exception("Could not restore the handed-over work")
+            reopen.mark_failed(manifest, f"{type(exc).__name__}: {exc}")
+            QTimer.singleShot(0, self.close)
+            return False
+        reopen.note(f"restored in {time.monotonic() - t0:.1f}s")
+        reopen.mark_ready(manifest)
+        if cth_models.find_wrapper():
+            self.notify("Reopened inside Cth.ai — free models now answer "
+                        "without the extra setup delay.", "ok", msec=8000)
+        else:
+            self.notify("Reopened, but the Cth.ai 'copilot' command was not "
+                        "found, so free models still enter the setup on "
+                        "each call.", "warn", msec=12000)
+        return True
+
+    def _restore_work(self, snap: dict) -> None:
+        parts = snap["partitions"]
+        if parts:
+            self._clear_undo()
+            if snap["multi"]:
+                self._partitions = parts
+                self._active_idx = -1
+                self._populate_partition_selector()
+                self._set_active_partition(min(snap["active"], len(parts) - 1))
+            else:
+                self._reset_partitions()
+                self._base_report = parts[0]["base_report"]
+                self._apply_report(parts[0]["report"])
+            self._after_new_report()
+        vis = snap.get("visualizer")
+        if vis:
+            attached = self.visualizer_panel.attach_live_session(vis)
+            reopen.note("re-attached to the running Tessent session"
+                        if attached else
+                        "could not re-attach to the Tessent session")
+        if snap["tab"]:
+            self._switch_to_tab(snap["tab"])
+
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
 
 
-def run() -> int:
+def run(restore: Optional[str] = None) -> int:
     app = QApplication.instance() or QApplication([])
     # The whole UI is English text; never mirror it because of an RTL locale.
     app.setLayoutDirection(Qt.LeftToRight)
+    if restore:
+        reopen.note("building the window")
     window = MainWindow()
     # Reopen where the user left it; first launch starts maximised because on
     # remote displays a broken title-bar maximise button leaves it small.
@@ -4550,5 +4835,9 @@ def run() -> int:
         window.show()
     else:
         window.showMaximized()
+    if restore:
+        reopen.note("window shown")
+        reopen.mark_started(restore)
+        QTimer.singleShot(0, lambda: window.restore_snapshot(restore))
     QTimer.singleShot(800, window.auto_check_sign_in)
     return app.exec()
